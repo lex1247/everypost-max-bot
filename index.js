@@ -13,19 +13,14 @@ const PORT = process.env.PORT || 3000;
 const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-if (!MAX_BOT_TOKEN) {
-  throw new Error("MAX_BOT_TOKEN is not set");
-}
+const BOT_USERNAME = "id190206555510_3_bot";
 
-if (!DATABASE_URL) {
-  throw new Error("DATABASE_URL is not set");
-}
+if (!MAX_BOT_TOKEN) throw new Error("MAX_BOT_TOKEN is not set");
+if (!DATABASE_URL) throw new Error("DATABASE_URL is not set");
 
 const pool = new Pool({
   connectionString: DATABASE_URL
 });
-
-// ---------- DATABASE ----------
 
 async function initDatabase() {
   await pool.query(`
@@ -58,14 +53,15 @@ function createProposalCode() {
   return crypto.randomBytes(12).toString("hex");
 }
 
-// ---------- MAX API ----------
-
-async function maxGet(path) {
+async function maxRequest(path, options = {}) {
   const response = await fetch(
     `https://platform-api2.max.ru${path}`,
     {
+      ...options,
       headers: {
-        Authorization: MAX_BOT_TOKEN
+        Authorization: MAX_BOT_TOKEN,
+        "Content-Type": "application/json",
+        ...(options.headers || {})
       }
     }
   );
@@ -73,15 +69,23 @@ async function maxGet(path) {
   const text = await response.text();
 
   if (!response.ok) {
-    throw new Error(
-      `MAX API ${response.status}: ${text}`
-    );
+    throw new Error(`MAX API ${response.status}: ${text}`);
   }
 
-  return JSON.parse(text);
+  return text ? JSON.parse(text) : {};
 }
 
-// ---------- SERVER ----------
+async function sendToUser(userId, text) {
+  return maxRequest(
+    `/messages?user_id=${encodeURIComponent(userId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        text
+      })
+    }
+  );
+}
 
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -91,15 +95,12 @@ app.get("/", (req, res) => {
 });
 
 app.post("/webhook", async (req, res) => {
-  // MAX быстро получает подтверждение
   res.sendStatus(200);
 
   try {
     const update = req.body;
 
     console.log("UPDATE TYPE:", update.update_type);
-
-    // ---------- BOT ADDED TO CHANNEL ----------
 
     if (
       update.update_type === "bot_added" &&
@@ -114,16 +115,13 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      const channel = await maxGet(
-        `/chats/${chatId}`
-      );
+      const channel = await maxRequest(`/chats/${chatId}`);
 
       const title =
         channel.title ??
         channel.name ??
         "Без названия";
 
-      // Сохраняем пользователя
       await pool.query(
         `
         INSERT INTO users (
@@ -144,8 +142,6 @@ app.post("/webhook", async (req, res) => {
         ]
       );
 
-      // Если канал уже был зарегистрирован,
-      // сохраняем существующий proposal_code.
       const existingChannel = await pool.query(
         `
         SELECT proposal_code
@@ -159,7 +155,6 @@ app.post("/webhook", async (req, res) => {
         existingChannel.rows[0]?.proposal_code ??
         createProposalCode();
 
-      // Сохраняем канал
       await pool.query(
         `
         INSERT INTO channels (
@@ -186,20 +181,29 @@ app.post("/webhook", async (req, res) => {
         ]
       );
 
+      const proposalLink =
+        `https://max.ru/${BOT_USERNAME}?start=${proposalCode}`;
+
       console.log(
         "CHANNEL SAVED:",
         JSON.stringify({
           chat_id: chatId,
           title,
-          owner_user_id: ownerUserId,
-          proposal_code: proposalCode
+          owner_user_id: ownerUserId
         })
       );
 
+      await sendToUser(
+        ownerUserId,
+        `✅ Канал «${title}» подключён к EveryPost.\n\n` +
+        `📥 Ссылка для предложки:\n${proposalLink}\n\n` +
+        `Разместите эту ссылку в своём канале. По ней подписчики смогут присылать новости, фото и видео.`
+      );
+
+      console.log("PROPOSAL LINK SENT");
+
       return;
     }
-
-    // ---------- BOT REMOVED ----------
 
     if (
       update.update_type === "bot_removed" &&
@@ -208,23 +212,15 @@ app.post("/webhook", async (req, res) => {
       await pool.query(
         `
         UPDATE channels
-        SET
-          active = FALSE,
-          updated_at = NOW()
+        SET active = FALSE, updated_at = NOW()
         WHERE max_chat_id = $1
         `,
         [update.chat_id]
       );
 
-      console.log(
-        "CHANNEL DISABLED:",
-        update.chat_id
-      );
-
+      console.log("CHANNEL DISABLED:", update.chat_id);
       return;
     }
-
-    // ---------- DEEP LINK START ----------
 
     if (update.update_type === "bot_started") {
       console.log(
@@ -237,8 +233,6 @@ app.post("/webhook", async (req, res) => {
 
       return;
     }
-
-    // ---------- MESSAGE ----------
 
     if (update.update_type === "message_created") {
       console.log(
@@ -254,23 +248,15 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ---------- START ----------
-
 async function start() {
   try {
     await initDatabase();
 
     app.listen(PORT, () => {
-      console.log(
-        `EveryPost MAX started on port ${PORT}`
-      );
+      console.log(`EveryPost MAX started on port ${PORT}`);
     });
   } catch (error) {
-    console.error(
-      "STARTUP ERROR:",
-      error
-    );
-
+    console.error("STARTUP ERROR:", error);
     process.exit(1);
   }
 }
