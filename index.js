@@ -46,6 +46,25 @@ async function initDatabase() {
     );
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS proposal_sessions (
+      max_user_id BIGINT PRIMARY KEY,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS submissions (
+      id BIGSERIAL PRIMARY KEY,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      sender_user_id BIGINT NOT NULL,
+      max_message_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'new',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   console.log("DATABASE READY");
 }
 
@@ -80,9 +99,7 @@ async function sendToUser(userId, text) {
     `/messages?user_id=${encodeURIComponent(userId)}`,
     {
       method: "POST",
-      body: JSON.stringify({
-        text
-      })
+      body: JSON.stringify({ text })
     }
   );
 }
@@ -102,6 +119,10 @@ app.post("/webhook", async (req, res) => {
 
     console.log("UPDATE TYPE:", update.update_type);
 
+    // ---------------------------
+    // БОТА ДОБАВИЛИ В КАНАЛ
+    // ---------------------------
+
     if (
       update.update_type === "bot_added" &&
       update.is_channel === true
@@ -110,10 +131,7 @@ app.post("/webhook", async (req, res) => {
       const user = update.user;
       const ownerUserId = user?.user_id;
 
-      if (!chatId || !ownerUserId) {
-        console.log("bot_added without chat_id or user_id");
-        return;
-      }
+      if (!chatId || !ownerUserId) return;
 
       const channel = await maxRequest(`/chats/${chatId}`);
 
@@ -142,7 +160,7 @@ app.post("/webhook", async (req, res) => {
         ]
       );
 
-      const existingChannel = await pool.query(
+      const existing = await pool.query(
         `
         SELECT proposal_code
         FROM channels
@@ -152,7 +170,7 @@ app.post("/webhook", async (req, res) => {
       );
 
       const proposalCode =
-        existingChannel.rows[0]?.proposal_code ??
+        existing.rows[0]?.proposal_code ??
         createProposalCode();
 
       await pool.query(
@@ -184,26 +202,157 @@ app.post("/webhook", async (req, res) => {
       const proposalLink =
         `https://max.ru/${BOT_USERNAME}?start=${proposalCode}`;
 
-      console.log(
-        "CHANNEL SAVED:",
-        JSON.stringify({
-          chat_id: chatId,
-          title,
-          owner_user_id: ownerUserId
-        })
-      );
-
       await sendToUser(
         ownerUserId,
         `✅ Канал «${title}» подключён к EveryPost.\n\n` +
-        `📥 Ссылка для предложки:\n${proposalLink}\n\n` +
-        `Разместите эту ссылку в своём канале. По ней подписчики смогут присылать новости, фото и видео.`
+        `📥 Ссылка для предложки:\n${proposalLink}`
       );
 
+      console.log("CHANNEL SAVED:", chatId);
       console.log("PROPOSAL LINK SENT");
 
       return;
     }
+
+    // ---------------------------
+    // ПОДПИСЧИК ОТКРЫЛ ССЫЛКУ
+    // ---------------------------
+
+    if (update.update_type === "bot_started") {
+      const userId = update.user?.user_id;
+      const payload = update.payload;
+
+      if (!userId || !payload) return;
+
+      const channelResult = await pool.query(
+        `
+        SELECT id, title
+        FROM channels
+        WHERE proposal_code = $1
+          AND active = TRUE
+        `,
+        [payload]
+      );
+
+      if (channelResult.rowCount === 0) {
+        await sendToUser(
+          userId,
+          "Эта ссылка предложки недействительна."
+        );
+        return;
+      }
+
+      const channel = channelResult.rows[0];
+
+      await pool.query(
+        `
+        INSERT INTO proposal_sessions (
+          max_user_id,
+          channel_id,
+          updated_at
+        )
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (max_user_id)
+        DO UPDATE SET
+          channel_id = EXCLUDED.channel_id,
+          updated_at = NOW()
+        `,
+        [userId, channel.id]
+      );
+
+      await sendToUser(
+        userId,
+        `📥 Предложка для канала «${channel.title}».\n\n` +
+        `Отправьте сюда текст, фото или видео.`
+      );
+
+      console.log(
+        "PROPOSAL SESSION STARTED:",
+        userId,
+        "CHANNEL:",
+        channel.id
+      );
+
+      return;
+    }
+
+    // ---------------------------
+    // ПОЛУЧИЛИ ПРЕДЛОЖКУ
+    // ---------------------------
+
+    if (update.update_type === "message_created") {
+      const message = update.message;
+      const senderUserId = message?.sender?.user_id;
+      const mid = message?.body?.mid;
+
+      if (!senderUserId || !mid) {
+        console.log("MESSAGE WITHOUT USER OR MID");
+        return;
+      }
+
+      const sessionResult = await pool.query(
+        `
+        SELECT
+          ps.channel_id,
+          c.title,
+          c.owner_user_id
+        FROM proposal_sessions ps
+        JOIN channels c
+          ON c.id = ps.channel_id
+        WHERE ps.max_user_id = $1
+          AND c.active = TRUE
+        `,
+        [senderUserId]
+      );
+
+      // Пользователь написал боту не через предложку.
+      if (sessionResult.rowCount === 0) {
+        console.log(
+          "MESSAGE WITHOUT PROPOSAL SESSION:",
+          senderUserId
+        );
+        return;
+      }
+
+      const session = sessionResult.rows[0];
+
+      await pool.query(
+        `
+        INSERT INTO submissions (
+          channel_id,
+          sender_user_id,
+          max_message_id,
+          status
+        )
+        VALUES ($1, $2, $3, 'new')
+        `,
+        [
+          session.channel_id,
+          senderUserId,
+          mid
+        ]
+      );
+
+      console.log(
+        "SUBMISSION SAVED:",
+        JSON.stringify({
+          channel_id: session.channel_id,
+          sender_user_id: senderUserId,
+          mid
+        })
+      );
+
+      await sendToUser(
+        senderUserId,
+        "✅ Предложка получена."
+      );
+
+      return;
+    }
+
+    // ---------------------------
+    // БОТА УДАЛИЛИ ИЗ КАНАЛА
+    // ---------------------------
 
     if (
       update.update_type === "bot_removed" &&
@@ -219,27 +368,6 @@ app.post("/webhook", async (req, res) => {
       );
 
       console.log("CHANNEL DISABLED:", update.chat_id);
-      return;
-    }
-
-    if (update.update_type === "bot_started") {
-      console.log(
-        "BOT STARTED:",
-        JSON.stringify({
-          user_id: update.user?.user_id,
-          payload: update.payload ?? null
-        })
-      );
-
-      return;
-    }
-
-    if (update.update_type === "message_created") {
-      console.log(
-        "MESSAGE RECEIVED:",
-        update.message?.body?.mid ?? "no-mid"
-      );
-
       return;
     }
 
