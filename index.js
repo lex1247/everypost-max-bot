@@ -4,14 +4,17 @@ import crypto from "node:crypto";
 import https from "node:https";
 import tls from "node:tls";
 
-// EveryPost: предложка, анонимная публикация, редактор, постинг и доступ по каналам.
+// EveryPost: предложка, анонимная публикация, редактор, постинг, права и сохранённые черновики.
+// Черновики сохраняются в PostgreSQL. Медиа остаются вложениями MAX по токенам;
+// эта версия не создаёт собственную бессрочную резервную копию медиафайлов.
+// Оригинальная предложка не удаляется при сохранении или удалении её черновика.
 // Назначения относятся только к EveryPost, права в самом MAX не изменяются.
 // ИИ не подключён. Режим модерации на этой версии только manual.
 // Режим администратора открывается командой /menu в личном чате с ботом.
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "channel-admins-2";
+const VERSION = "drafts-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -268,6 +271,26 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE ep_posts ADD COLUMN IF NOT EXISTS is_saved BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE ep_posts ADD COLUMN IF NOT EXISTS saved_at TIMESTAMPTZ;
+    ALTER TABLE ep_posts ADD COLUMN IF NOT EXISTS draft_revision INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE ep_posts ADD COLUMN IF NOT EXISTS source_submission_id BIGINT REFERENCES submissions(id);
+    ALTER TABLE ep_composer_sessions ADD COLUMN IF NOT EXISTS restore_snapshot JSONB;
+    CREATE UNIQUE INDEX IF NOT EXISTS ep_post_source_once
+      ON ep_posts(source_submission_id)
+      WHERE source_submission_id IS NOT NULL
+        AND status IN ('draft', 'publishing', 'needs_check', 'published');
+    CREATE INDEX IF NOT EXISTS ep_saved_drafts
+      ON ep_posts(channel_id, saved_at DESC) WHERE is_saved = TRUE AND status = 'draft';
+    CREATE TABLE IF NOT EXISTS ep_draft_delete_intents (
+      nonce TEXT PRIMARY KEY,
+      post_id BIGINT NOT NULL REFERENCES ep_posts(id),
+      actor_user_id BIGINT NOT NULL,
+      expected_revision INTEGER NOT NULL,
+      access_version INTEGER NOT NULL,
+      used BOOLEAN NOT NULL DEFAULT FALSE,
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '10 minutes')
+    );
     CREATE TABLE IF NOT EXISTS ep_composer_inputs (
       max_message_id TEXT PRIMARY KEY,
       actor_user_id BIGINT NOT NULL,
@@ -443,7 +466,8 @@ function controlsBody(submissionId, title, accessVersion = 0) {
     text: `📥 Предложка #${submissionId}\nКанал: «${shortTitle(title)}»`,
     attachments: keyboard([
       [action("publish", "🚀 Опубликовать"), action("edit", "✏️ Редактировать")],
-      [action("preview", "👁 Предпросмотр"), action("reject", "🗑 Отклонить")]
+      [action("preview", "👁 Предпросмотр"), action("reject", "🗑 Отклонить")],
+      [action("savedraft", "💾 Сохранить черновик")]
     ])
   };
 }
@@ -746,6 +770,7 @@ function draftControls(session, title) {
       `Выше показан вариант для публикации. В канал он ещё не отправлен.`,
     attachments: keyboard([
       [editorButton("draftpublish", session, "🚀 Опубликовать этот вариант")],
+      [editorButton("editsave", session, "💾 Сохранить черновик")],
       [editorButton("again", session, "✏️ Изменить ещё"),
        editorButton("cancel", session, "↩️ Отменить правку")]
     ])
@@ -1062,12 +1087,13 @@ async function handleCallback(update) {
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
   if (await handleAccessCallback(update)) return;
+  if (await handleSavedDraftCallback(update)) return;
   if (await handleAdminCallback(update)) return;
   const callback = update.callback;
   const userId = callback?.user?.user_id;
   const payload = typeof callback?.payload === "string" ? callback.payload : "";
-  const basic = payload.match(/^(publish|reject|edit|preview)_(\d+)(?:_a(\d+))?$/);
-  const draft = payload.match(/^(draftpublish|again|cancel|draftpreview)_(\d+)_([a-f0-9]{24})$/);
+  const basic = payload.match(/^(publish|reject|edit|preview|savedraft)_(\d+)(?:_a(\d+))?$/);
+  const draft = payload.match(/^(draftpublish|again|cancel|draftpreview|editsave)_(\d+)_([a-f0-9]{24})$/);
   if ((!basic && !draft) || userId == null) return;
   const [, action, id] = draft || basic;
   const row = await getSubmission(id);
@@ -1095,6 +1121,7 @@ async function handleCallback(update) {
     }
     const labels = {
       published: "уже опубликована", rejected: "отклонена",
+      drafted: "сохранена в разделе «Черновики»",
       publishing: "публикуется", needs_check: "нужно проверить результат в канале"
     };
     await notify(userId,
@@ -1139,7 +1166,9 @@ async function handleCallback(update) {
       await notify(userId, "Сначала нужен успешно показанный предпросмотр. Публикация не выполнена.");
       return;
     }
-    await publishPrepared(row, userId, callback.callback_id, session.draft_body, session);
+    if (action === "editsave") {
+      await saveSubmissionDraft(row, userId, callback.callback_id, session);
+    } else await publishPrepared(row, userId, callback.callback_id, session.draft_body, session);
     return;
   }
 
@@ -1168,6 +1197,10 @@ async function handleCallback(update) {
     return;
   }
 
+  if (action === "savedraft") {
+    await saveSubmissionDraft(row, userId, callback.callback_id);
+    return;
+  }
   let body;
   try {
     body = buildAnonymousPost(await loadSubmissionSource(row));
@@ -1493,11 +1526,23 @@ async function confirmAccessChange(nonce, ownerId) {
       `, [intent.target_user_id, c.id]);
     }
     if (["revoke", "deny_posts"].includes(intent.action)) {
-      // Убираем сессию, но не удаляем материалы и историю публикаций.
+      // Сохранённый черновик возвращается к версии до незавершённой правки.
+      await client.query(`
+        UPDATE ep_posts AS p SET body = e.restore_snapshot->'body',
+          source_message = e.restore_snapshot->'source_message',
+          input_mid = e.restore_snapshot->>'input_mid', preview_mid = NULL,
+          controls_mid = NULL, updated_at = NOW()
+        FROM ep_composer_sessions e WHERE e.post_id = p.id AND e.actor_user_id = $1
+          AND p.channel_id = $2 AND p.status = 'draft' AND p.is_saved = TRUE
+          AND e.restore_snapshot IS NOT NULL
+          AND ($3 = 'revoke' OR p.source_submission_id IS NULL)
+      `, [intent.target_user_id, c.id, intent.action]);
+      // Запрет собственных постов не отнимает отдельное право на предложку.
       await client.query(`
         DELETE FROM ep_composer_sessions WHERE actor_user_id = $1
-          AND post_id IN (SELECT id FROM ep_posts WHERE channel_id = $2)
-      `, [intent.target_user_id, c.id]);
+          AND post_id IN (SELECT id FROM ep_posts WHERE channel_id = $2
+            AND ($3 = 'revoke' OR source_submission_id IS NULL))
+      `, [intent.target_user_id, c.id, intent.action]);
     }
     await audit(c.id, ownerId, `access_${intent.action}`, intent.target_user_id,
       { version: changed.version, can_create_posts: changed.can_create_posts }, client);
@@ -1537,7 +1582,9 @@ async function showAccessLog(channelId, ownerId, page = 0) {
     access_allow_posts: "Разрешены свои посты", access_deny_posts: "Запрещены свои посты",
     edit_started: "Открыта правка", edit_saved: "Сохранена правка",
     submission_published: "Предложка опубликована", submission_rejected: "Предложка отклонена",
-    own_post_published: "Собственный пост опубликован", owner_notifications: "Уведомления владельцу"};
+    own_post_published: "Собственный пост опубликован", owner_notifications: "Уведомления владельцу",
+    draft_saved: "Черновик сохранён", draft_deleted: "Черновик удалён",
+    submission_draft_saved: "Предложка сохранена в черновик"};
   const rows = result.rows.slice(0, ADMIN_PAGE_SIZE);
   const nav = [];
   if (page > 0) nav.push(button("◀️ Назад", `access_log_${c.id}_${page - 1}`));
@@ -1695,8 +1742,18 @@ async function hasOwnChannel(userId) {
 }
 
 async function canUseOwnPost(row, userId) {
-  return Boolean(row && String(row.author_user_id) === String(userId) &&
-    await channelAccess(row.channel_id, userId, "create"));
+  if (!row || userId == null) return false;
+  const access = await channelAccess(row.channel_id, userId,
+    row.source_submission_id ? "moderate" : "create");
+  // Владелец может продолжить черновик своего сотрудника.
+  // Сотрудник видит только собственные черновики разрешённых ему каналов.
+  if (!access || (!access.owner && String(row.author_user_id) !== String(userId))) return false;
+  if (row.source_submission_id) {
+    const source = await getSubmission(row.source_submission_id);
+    if (!source || String(source.channel_id) !== String(row.channel_id) ||
+        source.status !== "drafted") return false;
+  }
+  return true;
 }
 
 function adminMenuBody(canCreate = true) {
@@ -1706,6 +1763,7 @@ function adminMenuBody(canCreate = true) {
       "Без подтверждения ничего не публикуется.",
     attachments: keyboard([
       ...(canCreate ? [[button("➕ Создать пост", "menu_create")]] : []),
+      [button("📝 Черновики", "menu_drafts_0")],
       [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")]
     ])
   };
@@ -1874,13 +1932,16 @@ async function sendComposerPrompt(session) {
 
 function ownPostControls(session, row) {
   return {
-    text: `👁 Новый пост #${row.id}\nКанал: «${shortTitle(row.title)}»\n\n` +
+    text: `👁 ${row.is_saved ? "Черновик" : "Новый пост"} #${row.id}\nКанал: «${shortTitle(row.title)}»\n\n` +
       "Выше показан вариант для публикации. Он ещё не отправлен в канал.",
     attachments: keyboard([
-      [button("🚀 Опубликовать", `cpublish_${session.nonce}`)],
+      [button("🚀 Опубликовать", `cpublish_${session.nonce}`),
+       button("💾 Сохранить черновик", `csave_${session.nonce}`)],
       [button("✏️ Изменить текст", `ctext_${session.nonce}`),
        button("📎 Заменить материал", `creplace_${session.nonce}`)],
-      [button("↩️ Отменить пост", `ccancel_${session.nonce}`)]
+      ...(row.is_saved ? [[button("🗑 Удалить черновик", `ddelete_${session.nonce}`)]] : []),
+      [button(row.is_saved ? "↩️ Закрыть без сохранения" : "↩️ Отменить пост",
+        `ccancel_${session.nonce}`)]
     ])
   };
 }
@@ -1928,6 +1989,7 @@ async function resumeComposer(session) {
   if (session.stage === "choose_channel") { await showChannelPicker(session); return; }
   const row = await getOwnPost(session.post_id);
   if (!row || row.status !== "draft" || !(await canUseOwnPost(row, session.actor_user_id))) {
+    await restoreSavedComposer(session);
     await pool.query(
       "DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2",
       [session.actor_user_id, session.nonce]);
@@ -1956,13 +2018,11 @@ async function rememberComposerInput(message, session = null) {
 }
 
 async function cancelComposer(session, message = null) {
-  if (session.post_id) {
-    const post = await getOwnPost(session.post_id);
-    if (post && post.status !== "draft") {
-      if (message) await rememberComposerInput(message, session);
-      await resumeComposer(session);
-      return false;
-    }
+  const post = session.post_id ? await getOwnPost(session.post_id) : null;
+  if (post && post.status !== "draft") {
+    if (message) await rememberComposerInput(message, session);
+    await resumeComposer(session);
+    return false;
   }
   const client = await pool.connect();
   let deleted;
@@ -1974,24 +2034,26 @@ async function cancelComposer(session, message = null) {
         VALUES ($1, $2, $3, $4) ON CONFLICT (max_message_id) DO NOTHING
       `, [message.body.mid, session.actor_user_id, session.nonce, session.post_id]);
     }
+    await restoreSavedComposer(session, client);
     deleted = await client.query(`
       DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2 RETURNING post_id
     `, [session.actor_user_id, session.nonce]);
     if (deleted.rowCount && deleted.rows[0].post_id) {
       await client.query(`
         UPDATE ep_posts SET status = 'cancelled', updated_at = NOW()
-        WHERE id = $1 AND author_user_id = $2 AND status = 'draft'
+        WHERE id = $1 AND author_user_id = $2 AND status = 'draft' AND is_saved = FALSE
       `, [deleted.rows[0].post_id, session.actor_user_id]);
     }
     await client.query("COMMIT");
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw error;
+    await client.query("ROLLBACK").catch(() => {}); throw error;
   } finally { client.release(); }
   if (!deleted.rowCount) return false;
-  await notify(session.actor_user_id, "Создание поста отменено. Ничего в канал не отправлено.");
+  await notify(session.actor_user_id, post?.is_saved
+    ? "Правка закрыта без сохранения. Прежний черновик остаётся в разделе «Черновики». В канал ничего не отправлено."
+    : "Создание поста отменено. Ничего в канал не отправлено.");
   await showAdminMenu(session.actor_user_id, true);
-  console.log("POST CANCELLED:", session.post_id ?? "selection");
+  console.log(post?.is_saved ? "SAVED DRAFT EDIT CANCELLED:" : "POST CANCELLED:", session.post_id ?? "selection");
   return true;
 }
 
@@ -2020,6 +2082,11 @@ async function handleComposerMessage(message) {
   if (isCommand && ["/menu", "/start", "меню"].includes(command)) {
     await rememberComposerInput(message);
     await showAdminMenu(userId, true);
+    return true;
+  }
+  if (isCommand && ["/drafts", "черновики"].includes(command)) {
+    await rememberComposerInput(message);
+    await listSavedDrafts(userId);
     return true;
   }
   if (isCommand && ["/newpost", "/new"].includes(command)) {
@@ -2099,7 +2166,10 @@ async function handleComposerMessage(message) {
         const changed = await client.query(`
           UPDATE ep_posts SET source_message = $3::jsonb, body = $4::jsonb, input_mid = $5,
             preview_mid = NULL, controls_mid = NULL, last_error = NULL, updated_at = NOW()
-          WHERE id = $1 AND author_user_id = $2 AND status = 'draft' RETURNING id
+          WHERE id = $1 AND status = 'draft'
+      AND (author_user_id = $2 OR EXISTS (
+        SELECT 1 FROM channels c WHERE c.id = ep_posts.channel_id AND c.owner_user_id = $2))
+    RETURNING id
         `, [row.id, userId, JSON.stringify(source), JSON.stringify(postBody), mid]);
         if (changed.rowCount) {
           next = await client.query(`
@@ -2123,62 +2193,93 @@ async function handleComposerMessage(message) {
 
 async function publishOwnPost(session, row, callbackId) {
   if (!(await canUseOwnPost(row, session.actor_user_id))) {
-    await notify(session.actor_user_id, "Публикация остановлена: доступ к каналу изменился.");
-    return;
+    await notify(session.actor_user_id, "Публикация остановлена: доступ к каналу изменился."); return;
   }
-  // Публикуем ровно сохранённый предпросмотр. Нет forward, sender и чужих кнопок.
-  // Уникальный nonce делает кнопки старой редакции недействительными.
-  const claimed = await pool.query(`
-    UPDATE ep_posts SET status = 'publishing', published_body = body, updated_at = NOW()
-    WHERE id = $1 AND author_user_id = $2 AND status = 'draft'
-      AND body IS NOT NULL AND preview_mid IS NOT NULL AND controls_mid IS NOT NULL
-      AND EXISTS (SELECT 1 FROM ep_composer_sessions e
-        WHERE e.post_id = ep_posts.id AND e.actor_user_id = $2
-          AND e.nonce = $3 AND e.stage = 'preview')
-      AND EXISTS (SELECT 1 FROM channels c WHERE c.id = ep_posts.channel_id
-        AND c.active = TRUE AND c.moderation_mode = 'manual'
-        AND (c.owner_user_id = $2 OR EXISTS (
-          SELECT 1 FROM ep_channel_admins a WHERE a.channel_id = c.id
-            AND a.max_user_id = $2 AND a.active = TRUE AND a.can_create_posts = TRUE)))
-    RETURNING *
-  `, [row.id, session.actor_user_id, session.nonce]);
+  const client = await pool.connect();
+  let claimed;
+  try {
+    await client.query("BEGIN");
+    claimed = await client.query(`
+      UPDATE ep_posts SET status = 'publishing', published_body = body, updated_at = NOW()
+      WHERE id = $1 AND status = 'draft' AND body IS NOT NULL
+        AND preview_mid IS NOT NULL AND controls_mid IS NOT NULL
+        AND (author_user_id = $2 OR EXISTS (
+          SELECT 1 FROM channels c WHERE c.id = ep_posts.channel_id AND c.owner_user_id = $2))
+        AND EXISTS (SELECT 1 FROM ep_composer_sessions e
+          WHERE e.post_id = ep_posts.id AND e.actor_user_id = $2 AND e.nonce = $3 AND e.stage = 'preview')
+        AND EXISTS (SELECT 1 FROM channels c WHERE c.id = ep_posts.channel_id
+          AND c.active = TRUE AND c.moderation_mode = 'manual'
+          AND (c.owner_user_id = $2 OR EXISTS (
+            SELECT 1 FROM ep_channel_admins a WHERE a.channel_id = c.id AND a.max_user_id = $2
+              AND a.active = TRUE AND (a.can_create_posts = TRUE OR ep_posts.source_submission_id IS NOT NULL))))
+        AND (source_submission_id IS NULL OR EXISTS (
+          SELECT 1 FROM submissions s WHERE s.id = ep_posts.source_submission_id AND s.status = 'drafted'))
+      RETURNING *
+    `, [row.id, session.actor_user_id, session.nonce]);
+    if (claimed.rowCount && row.source_submission_id) {
+      const sourceClaim = await client.query(`
+        UPDATE submissions SET status = 'publishing', published_body = $2::jsonb
+        WHERE id = $1 AND status = 'drafted' RETURNING id
+      `, [row.source_submission_id, JSON.stringify(claimed.rows[0].published_body)]);
+      if (!sourceClaim.rowCount) throw new Error("Source submission state changed before publishing");
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {}); throw error;
+  } finally { client.release(); }
   if (!claimed.rowCount) {
-    await notify(session.actor_user_id,
-      "Публикация не выполнена: версия поста уже изменилась или предпросмотр не завершён.");
+    await notify(session.actor_user_id, "Публикация не выполнена: версия, статус или доступ изменились. Откройте последний предпросмотр.");
     return;
   }
   let accepted = false;
   try {
     const sent = await sendMessage("chat_id", row.max_chat_id, claimed.rows[0].published_body);
     accepted = true;
-    await pool.query(`
-      UPDATE ep_posts SET status = 'published', published_mid = $2,
-        last_error = NULL, updated_at = NOW() WHERE id = $1
-    `, [row.id, messageId(sent)]);
+    const mid = messageId(sent);
+    const finish = await pool.connect();
+    try {
+      await finish.query("BEGIN");
+      await finish.query(`UPDATE ep_posts SET status = 'published', published_mid = $2,
+        last_error = NULL, updated_at = NOW() WHERE id = $1`, [row.id, mid]);
+      if (row.source_submission_id) {
+        await finish.query(`UPDATE submissions SET status = 'published', published_mid = $2,
+          last_error = NULL, decision_actor_id = $3, decision_kind = 'human', decided_at = NOW()
+          WHERE id = $1`, [row.source_submission_id, mid, session.actor_user_id]);
+      }
+      await finish.query("DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2",
+        [session.actor_user_id, session.nonce]);
+      await audit(row.channel_id, session.actor_user_id,
+        row.source_submission_id ? "submission_published" : "own_post_published",
+        row.source_submission_id || row.id, { draft_id: row.id }, finish);
+      await finish.query("COMMIT");
+    } catch (error) {
+      await finish.query("ROLLBACK").catch(() => {}); throw error;
+    } finally { finish.release(); }
   } catch (error) {
     const definiteRejection = !accepted && error.status >= 400 && error.status < 500 && error.status !== 408;
-    await pool.query(`
-      UPDATE ep_posts SET status = $2, last_error = $3, updated_at = NOW() WHERE id = $1
-    `, [row.id, definiteRejection ? "draft" : "needs_check", error.message.slice(0, 1000)]);
-    if (!definiteRejection) {
-      await pool.query("DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2",
-        [session.actor_user_id, session.nonce]);
-    }
+    const failed = await pool.connect();
+    try {
+      await failed.query("BEGIN");
+      await failed.query(`UPDATE ep_posts SET status = $2, last_error = $3, updated_at = NOW() WHERE id = $1`,
+        [row.id, definiteRejection ? "draft" : "needs_check", error.message.slice(0, 1000)]);
+      if (row.source_submission_id) await failed.query(
+        "UPDATE submissions SET status = $2, last_error = $3 WHERE id = $1",
+        [row.source_submission_id, definiteRejection ? "drafted" : "needs_check", error.message.slice(0, 1000)]);
+      if (!definiteRejection) await failed.query(
+        "DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2", [session.actor_user_id, session.nonce]);
+      await failed.query("COMMIT");
+    } catch (e) {
+      await failed.query("ROLLBACK").catch(() => {}); throw e;
+    } finally { failed.release(); }
     await notify(session.actor_user_id, definiteRejection
-      ? `MAX не принял пост #${row.id}. Он сохранён; можно повторить после устранения ошибки. Ошибка есть в Logs.`
+      ? `MAX не принял пост #${row.id}. Черновик сохранён; причина есть в Logs.`
       : `Результат публикации #${row.id} не подтверждён. Проверьте канал. ` +
         "Повторная отправка остановлена, чтобы не создать дубль. Для меню отправьте /menu.");
-    console.error("POST PUBLISH ERROR:", error.message);
-    return;
+    console.error("POST PUBLISH ERROR:", error.message); return;
   }
-  await pool.query("DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2",
-    [session.actor_user_id, session.nonce]);
-  await answerCallback(callbackId,
-    `✅ Пост #${row.id} опубликован в канале «${shortTitle(row.title)}».`, true);
-  await notify(session.actor_user_id,
-    `✅ Пост #${row.id} опубликован в канале «${shortTitle(row.title)}».`);
-  await audit(row.channel_id, session.actor_user_id, "own_post_published", row.id);
-  console.log("OWN POST PUBLISHED:", row.id);
+  await answerCallback(callbackId, `✅ Пост #${row.id} опубликован в канале «${shortTitle(row.title)}».`, true);
+  await notify(session.actor_user_id, `✅ Пост #${row.id} опубликован в канале «${shortTitle(row.title)}».`);
+  console.log(row.source_submission_id ? "DRAFT SUBMISSION PUBLISHED:" : "OWN POST PUBLISHED:", row.id);
   await showAdminMenu(session.actor_user_id, true);
 }
 
@@ -2190,7 +2291,7 @@ async function handleAdminCallback(update) {
   const menu = payload.match(/^menu_(main|create|channels_\d+|inbox_\d+)$/);
   const inbox = payload.match(/^inboxopen_(\d+)$/);
   const pick = payload.match(/^c(pick|page)_([a-f0-9]{24})_(\d+)$/);
-  const action = payload.match(/^c(publish|text|replace|cancel|refresh|back)_([a-f0-9]{24})$/);
+  const action = payload.match(/^c(publish|text|replace|cancel|refresh|back|save)_([a-f0-9]{24})$/);
   if (!menu && !inbox && !pick && !action) return false;
   await answerCallback(callback.callback_id);
 
@@ -2221,8 +2322,11 @@ async function handleAdminCallback(update) {
     return true;
   }
   if (action?.[1] === "cancel") {
+    const savedPost = session.post_id ? await getOwnPost(session.post_id) : null;
     if (await cancelComposer(session)) {
-      await answerCallback(callback.callback_id, "Создание поста отменено.", true);
+      await answerCallback(callback.callback_id,
+        savedPost?.is_saved ? "Правка закрыта. Сохранённый черновик не изменён."
+          : "Создание поста отменено.", true);
     }
     return true;
   }
@@ -2235,6 +2339,10 @@ async function handleAdminCallback(update) {
   const row = await getOwnPost(session.post_id);
   if (!(await canUseOwnPost(row, userId)) || row.status !== "draft") {
     await resumeComposer(session);
+    return true;
+  }
+  if (action[1] === "save") {
+    await saveComposerDraft(session, row, callback.callback_id);
     return true;
   }
   if (action[1] === "publish") {
@@ -2264,6 +2372,334 @@ async function handleAdminCallback(update) {
       await pool.query("UPDATE ep_posts SET controls_mid = NULL WHERE id = $1", [row.id]);
       await showOwnPostPreview(next.rows[0]);
     } else await sendComposerPrompt(next.rows[0]);
+  }
+  return true;
+}
+
+
+// ---------- Сохранённые черновики ----------
+// Черновик не является новой предложкой. Ссылка на исходную предложку
+// нужна только в БД; в публичное сообщение она никогда не передаётся.
+
+function composerSnapshot(row) {
+  return { body: row.body, source_message: row.source_message, input_mid: row.input_mid ?? null };
+}
+
+async function restoreSavedComposer(session, client = pool) {
+  await client.query(`
+    UPDATE ep_posts AS p SET body = e.restore_snapshot->'body',
+      source_message = e.restore_snapshot->'source_message',
+      input_mid = e.restore_snapshot->>'input_mid', preview_mid = NULL,
+      controls_mid = NULL, updated_at = NOW()
+    FROM ep_composer_sessions e
+    WHERE e.post_id = p.id AND e.actor_user_id = $1 AND e.nonce = $2
+      AND p.status = 'draft' AND p.is_saved = TRUE AND e.restore_snapshot IS NOT NULL
+  `, [session.actor_user_id, session.nonce]);
+}
+
+async function saveComposerDraft(session, row, callbackId) {
+  if (!(await canUseOwnPost(row, session.actor_user_id))) {
+    await notify(session.actor_user_id, "Доступ изменился. Черновик не сохранён.");
+    return;
+  }
+  if (session.stage !== "preview" || !row.body || !row.preview_mid || !row.controls_mid) {
+    await notify(session.actor_user_id, "Сначала завершите предпросмотр. В канал ничего не отправлено.");
+    return;
+  }
+  const client = await pool.connect();
+  let saved;
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(`
+      SELECT * FROM ep_composer_sessions WHERE actor_user_id = $1
+        AND nonce = $2 AND post_id = $3 AND stage = 'preview' FOR UPDATE
+    `, [session.actor_user_id, session.nonce, row.id]);
+    if (locked.rowCount) {
+      saved = await client.query(`
+        UPDATE ep_posts SET is_saved = TRUE, saved_at = NOW(),
+          draft_revision = draft_revision + 1, preview_mid = NULL,
+          controls_mid = NULL, last_error = NULL, updated_at = NOW()
+        WHERE id = $1 AND status = 'draft' AND body IS NOT NULL
+          AND preview_mid IS NOT NULL AND controls_mid IS NOT NULL
+          AND (author_user_id = $2 OR EXISTS (
+            SELECT 1 FROM channels c WHERE c.id = ep_posts.channel_id AND c.owner_user_id = $2))
+        RETURNING *
+      `, [row.id, session.actor_user_id]);
+      if (saved.rowCount) {
+        await client.query("DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2",
+          [session.actor_user_id, session.nonce]);
+        await audit(row.channel_id, session.actor_user_id, "draft_saved", row.id, {}, client);
+      }
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {}); throw error;
+  } finally { client.release(); }
+  if (!saved?.rowCount) {
+    await notify(session.actor_user_id, "Карточка устарела. Откройте /menu; повторное сохранение не выполнено.");
+    return;
+  }
+  await answerCallback(callbackId, `💾 Черновик #${row.id} сохранён. В канал ничего не отправлено.`, true);
+  await notify(session.actor_user_id,
+    `💾 Черновик #${row.id} сохранён для канала «${shortTitle(row.title)}».\n` +
+    "Откройте /menu → «Черновики», когда будете готовы продолжить.");
+  console.log("DRAFT SAVED:", row.id);
+  await showAdminMenu(session.actor_user_id, true);
+}
+
+async function saveSubmissionDraft(row, userId, callbackId, session = null) {
+  if (!(await canEdit(row, userId))) {
+    await notify(userId, "Предложка недоступна или уже обработана."); return;
+  }
+  if (await getComposer(userId)) {
+    await notify(userId, "Сначала сохраните или закройте открытый пост."); return;
+  }
+  const currentEditor = await getEditorSession(userId);
+  if (currentEditor && (!session || currentEditor.nonce !== session.nonce)) {
+    await notify(userId, "Завершите открытую правку. Для её сохранения используйте последний предпросмотр.");
+    return;
+  }
+  if (session && (session.stage !== "preview" || !session.preview_mid || !session.draft_body)) {
+    await notify(userId, "Сначала нужен предпросмотр исправленной предложки."); return;
+  }
+  let source, body;
+  try {
+    source = await loadSubmissionSource(row);
+    body = session ? session.draft_body : buildAnonymousPost(source);
+  } catch (error) {
+    await notify(userId, `Не удалось сохранить черновик. ${error.message}`); return;
+  }
+  const client = await pool.connect();
+  let post;
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query("SELECT * FROM submissions WHERE id = $1 FOR UPDATE", [row.id]);
+    const editLock = await client.query(
+      "SELECT * FROM ep_editor_sessions WHERE submission_id = $1 FOR UPDATE", [row.id]);
+    const validEdit = session
+      ? editLock.rows[0]?.nonce === session.nonce &&
+        String(editLock.rows[0]?.actor_user_id) === String(userId) &&
+        editLock.rows[0]?.stage === "preview" && Boolean(editLock.rows[0]?.preview_mid)
+      : editLock.rowCount === 0;
+    if (locked.rows[0]?.status === "new" && validEdit) {
+      const saved = await client.query(`
+        INSERT INTO ep_posts(channel_id, author_user_id, status, source_message, body,
+          source_submission_id, is_saved, saved_at, draft_revision)
+        VALUES ($1, $2, 'draft', $3::jsonb, $4::jsonb, $5, TRUE, NOW(), 1) RETURNING *
+      `, [row.channel_id, userId, JSON.stringify(source), JSON.stringify(body), row.id]);
+      post = saved.rows[0];
+      await client.query("UPDATE submissions SET status = 'drafted' WHERE id = $1 AND status = 'new'", [row.id]);
+      if (session) await client.query(
+        "DELETE FROM ep_editor_sessions WHERE actor_user_id = $1 AND nonce = $2", [userId, session.nonce]);
+      await audit(row.channel_id, userId, "submission_draft_saved", row.id, { draft_id: post.id }, client);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {}); throw error;
+  } finally { client.release(); }
+  if (!post) {
+    await notify(userId, "Предложка уже изменилась или её редактирует другой админ. Сохранение не выполнено.");
+    return;
+  }
+  await answerCallback(callbackId, `💾 Сохранён черновик #${post.id}.`, true);
+  await notify(userId,
+    `💾 Черновик #${post.id} для канала «${shortTitle(row.title)}» сохранён.\n` +
+    `Оригинал предложки #${row.id} не изменён. До решения по черновику её старые кнопки публикации заблокированы.\n` +
+    "Продолжить: /menu → «Черновики».");
+  console.log("SUBMISSION DRAFT SAVED:", row.id, "POST:", post.id);
+  await showAdminMenu(userId, true);
+}
+
+async function listSavedDrafts(userId, page = 0) {
+  page = pageNumber(page);
+  const channels = await accessibleChannels(userId, "moderate");
+  const ids = channels.map(c => c.id);
+  const createIds = channels.filter(c => c.can_create).map(c => c.id);
+  const result = await pool.query(`
+    SELECT p.id, p.source_submission_id, p.saved_at, c.title,
+      EXISTS (SELECT 1 FROM ep_composer_sessions e WHERE e.post_id = p.id) AS in_work
+    FROM ep_posts p JOIN channels c ON c.id = p.channel_id
+    WHERE p.channel_id = ANY($2::bigint[]) AND p.status = 'draft' AND p.is_saved = TRUE
+      AND (p.author_user_id = $1 OR c.owner_user_id = $1)
+      AND (p.source_submission_id IS NOT NULL OR p.channel_id = ANY($3::bigint[]))
+    ORDER BY p.saved_at DESC NULLS LAST, p.id DESC LIMIT $4 OFFSET $5
+  `, [userId, ids, createIds, ADMIN_PAGE_SIZE + 1, page * ADMIN_PAGE_SIZE]);
+  const rows = result.rows.slice(0, ADMIN_PAGE_SIZE);
+  const nav = [];
+  if (page > 0) nav.push(button("◀️ Назад", `menu_drafts_${page - 1}`));
+  if (result.rowCount > ADMIN_PAGE_SIZE) nav.push(button("Далее ▶️", `menu_drafts_${page + 1}`));
+  await sendToUser(userId, {
+    text: "📝 Черновики\n\n" + (rows.length
+      ? "Выберите материал. Владелец видит черновики своих каналов; админ — свои в разрешённых ему каналах.\n" +
+        "💬 — из предложки, ✍️ — собственный пост, 🔒 — сейчас в работе."
+      : "На этой странице нет доступных сохранённых черновиков.\n" +
+        "Подготовьте пост или откройте предложку и нажмите «Сохранить черновик»."),
+    attachments: keyboard([
+      ...rows.map(p => [button(`${p.in_work ? "🔒 " : ""}${p.source_submission_id ? "💬" : "✍️"} #${p.id} · ${shortTitle(p.title)}`,
+        `dopen_${p.id}`)]),
+      ...(nav.length ? [nav] : []), [button("↩️ Меню", "menu_main")]
+    ])
+  });
+}
+
+async function openSavedDraft(postId, userId) {
+  const row = await getOwnPost(postId);
+  if (!row?.is_saved || row.status !== "draft" || !(await canUseOwnPost(row, userId))) {
+    await notify(userId, "Черновик недоступен, удалён или уже опубликован."); return;
+  }
+  const editing = await getEditorSession(userId);
+  if (editing) {
+    await notify(userId, "Сначала сохраните или отмените открытую правку предложки.");
+    await resumeEditor(editing); return;
+  }
+  const current = await getComposer(userId);
+  if (current) {
+    if (String(current.post_id) !== String(postId)) {
+      await notify(userId, "Сначала сохраните или закройте текущий пост. Одновременно открыт один редактор.");
+    }
+    await resumeComposer(current); return;
+  }
+  const client = await pool.connect();
+  let session;
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(`
+      SELECT * FROM ep_posts WHERE id = $1 AND status = 'draft' AND is_saved = TRUE FOR UPDATE
+    `, [postId]);
+    const fresh = locked.rows[0];
+    if (fresh && fresh.body) {
+      const made = await client.query(`
+        INSERT INTO ep_composer_sessions(actor_user_id, post_id, nonce, stage, restore_snapshot)
+        VALUES ($1, $2, $3, 'preview', $4::jsonb)
+        ON CONFLICT DO NOTHING RETURNING *
+      `, [userId, postId, newEditNonce(), JSON.stringify(composerSnapshot(fresh))]);
+      session = made.rows[0];
+      if (session) {
+        await client.query("UPDATE ep_posts SET preview_mid = NULL, controls_mid = NULL WHERE id = $1", [postId]);
+        await client.query("DELETE FROM proposal_sessions WHERE max_user_id = $1", [userId]);
+      }
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {}); throw error;
+  } finally { client.release(); }
+  if (!session) {
+    await notify(userId, "Черновик уже в работе у другого администратора или его статус изменился."); return;
+  }
+  await showOwnPostPreview(session);
+}
+
+async function requestDraftDeletion(session, row, callbackId) {
+  // Удаление начинается из открытого предпросмотра, поэтому канал и материал
+  // уже видны. До подтверждения не удаляем ни черновик, ни исходную предложку.
+  if (!row?.is_saved || row.status !== "draft" || !(await canUseOwnPost(row, session.actor_user_id))) {
+    await notify(session.actor_user_id, "Черновик недоступен."); return;
+  }
+  const access = await channelAccess(row.channel_id, session.actor_user_id,
+    row.source_submission_id ? "moderate" : "create");
+  if (!access) return;
+  const nonce = newEditNonce();
+  await pool.query(`
+    INSERT INTO ep_draft_delete_intents(nonce, post_id, actor_user_id, expected_revision, access_version)
+    VALUES ($1, $2, $3, $4, $5)
+  `, [nonce, row.id, session.actor_user_id, row.draft_revision, access.version]);
+  await sendToUser(session.actor_user_id, {
+    text: `Удалить черновик #${row.id}?\nКанал: «${shortTitle(row.title)}»\n\n` +
+      (row.source_submission_id
+        ? `Правки этого черновика будут удалены. Исходная предложка #${row.source_submission_id} останется ` +
+          "и вернётся в раздел «Предложки»."
+        : "Будет удалён только этот неопубликованный черновик. Сообщения в канале не изменятся."),
+    attachments: keyboard([
+      [button("🗑 Удалить черновик", `dconfirm_${nonce}`)],
+      [button("↩️ Не удалять", `dkeep_${nonce}`)]
+    ])
+  });
+}
+
+async function confirmDraftDeletion(nonce, userId, callbackId) {
+  const intent = (await pool.query(`
+    SELECT * FROM ep_draft_delete_intents WHERE nonce = $1 AND actor_user_id = $2
+      AND used = FALSE AND expires_at > NOW()
+  `, [nonce, userId])).rows[0];
+  if (!intent) {
+    await notify(userId, "Это подтверждение уже использовано или устарело."); return;
+  }
+  const row = await getOwnPost(intent.post_id);
+  if (!row?.is_saved || row.status !== "draft" || !(await canUseOwnPost(row, userId))) {
+    await notify(userId, "Нет доступа к удалению этого черновика."); return;
+  }
+  const access = await channelAccess(row.channel_id, userId,
+    row.source_submission_id ? "moderate" : "create");
+  if (!access || access.version !== Number(intent.access_version)) {
+    await notify(userId, "Права изменились. Откройте черновик заново."); return;
+  }
+  const client = await pool.connect();
+  let removed = false;
+  try {
+    await client.query("BEGIN");
+    const consumed = await client.query(`
+      UPDATE ep_draft_delete_intents SET used = TRUE WHERE nonce = $1 AND actor_user_id = $2
+        AND used = FALSE AND expires_at > NOW() RETURNING *
+    `, [nonce, userId]);
+    const locked = await client.query("SELECT * FROM ep_posts WHERE id = $1 FOR UPDATE", [row.id]);
+    const sessions = await client.query("SELECT * FROM ep_composer_sessions WHERE post_id = $1 FOR UPDATE", [row.id]);
+    const fresh = locked.rows[0];
+    const heldByOther = sessions.rows.some(e => String(e.actor_user_id) !== String(userId));
+    if (consumed.rowCount && fresh?.status === "draft" && fresh.is_saved &&
+        Number(fresh.draft_revision) === Number(intent.expected_revision) && !heldByOther) {
+      await client.query(`
+        UPDATE ep_posts SET status = 'deleted', is_saved = FALSE, draft_revision = draft_revision + 1,
+          preview_mid = NULL, controls_mid = NULL, updated_at = NOW() WHERE id = $1
+      `, [row.id]);
+      await client.query("DELETE FROM ep_composer_sessions WHERE post_id = $1", [row.id]);
+      if (row.source_submission_id) {
+        await client.query("UPDATE submissions SET status = 'new' WHERE id = $1 AND status = 'drafted'",
+          [row.source_submission_id]);
+      }
+      await audit(row.channel_id, userId, "draft_deleted", row.id,
+        { source_submission_id: row.source_submission_id }, client);
+      removed = true;
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {}); throw error;
+  } finally { client.release(); }
+  if (!removed) {
+    await notify(userId, "Черновик изменился или его открыл другой админ. Удаление не выполнено."); return;
+  }
+  await answerCallback(callbackId, `Черновик #${row.id} удалён.`, true);
+  await notify(userId, `🗑 Черновик #${row.id} удалён.` +
+    (row.source_submission_id ? ` Исходная предложка #${row.source_submission_id} снова доступна в «Предложках».` : ""));
+  console.log("DRAFT DELETED:", row.id);
+  await listSavedDrafts(userId);
+}
+
+async function handleSavedDraftCallback(update) {
+  const cb = update.callback;
+  const userId = cb?.user?.user_id;
+  const value = typeof cb?.payload === "string" ? cb.payload : "";
+  if (userId == null) return false;
+  const listing = value.match(/^menu_drafts_(\d+)$/);
+  const opening = value.match(/^dopen_(\d+)$/);
+  const deletion = value.match(/^ddelete_([a-f0-9]{24})$/);
+  const confirmation = value.match(/^(dconfirm|dkeep)_([a-f0-9]{24})$/);
+  if (!listing && !opening && !deletion && !confirmation) return false;
+  await answerCallback(cb.callback_id);
+  if (listing) await listSavedDrafts(userId, listing[1]);
+  else if (opening) await openSavedDraft(opening[1], userId);
+  else if (deletion) {
+    const session = await getComposer(userId);
+    if (!session || session.nonce !== deletion[1]) {
+      await notify(userId, "Карточка устарела. Откройте черновик заново.");
+    } else await requestDraftDeletion(session, await getOwnPost(session.post_id), cb.callback_id);
+  } else if (confirmation[1] === "dconfirm") {
+    await confirmDraftDeletion(confirmation[2], userId, cb.callback_id);
+  } else {
+    await pool.query(`UPDATE ep_draft_delete_intents SET used = TRUE
+      WHERE nonce = $1 AND actor_user_id = $2 AND used = FALSE`, [confirmation[2], userId]);
+    await answerCallback(cb.callback_id, "Черновик не удалён.", true);
+    const session = await getComposer(userId);
+    if (session) await resumeComposer(session); else await listSavedDrafts(userId);
   }
   return true;
 }
