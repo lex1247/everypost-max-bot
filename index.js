@@ -4,11 +4,12 @@ import crypto from "node:crypto";
 import https from "node:https";
 import tls from "node:tls";
 
-// EveryPost: предложка, анонимная публикация, правка текста и предпросмотр.
+// EveryPost: предложка, анонимная публикация, редактор и собственные посты.
+// Режим администратора открывается командой /menu в личном чате с ботом.
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "edit-preview-1";
+const VERSION = "create-post-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -227,6 +228,40 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS ep_posts (
+      id BIGSERIAL PRIMARY KEY,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      author_user_id BIGINT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft',
+      source_message JSONB,
+      body JSONB,
+      input_mid TEXT,
+      preview_mid TEXT,
+      controls_mid TEXT,
+      published_mid TEXT,
+      published_body JSONB,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS ep_composer_sessions (
+      actor_user_id BIGINT PRIMARY KEY,
+      post_id BIGINT UNIQUE REFERENCES ep_posts(id),
+      nonce TEXT UNIQUE NOT NULL,
+      stage TEXT NOT NULL CHECK (stage IN (
+        'choose_channel', 'waiting_content', 'waiting_text', 'preview'
+      )),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS ep_composer_inputs (
+      max_message_id TEXT PRIMARY KEY,
+      actor_user_id BIGINT NOT NULL,
+      session_nonce TEXT,
+      post_id BIGINT REFERENCES ep_posts(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS ep_posts_owner_status ON ep_posts(author_user_id, status);
     CREATE TABLE IF NOT EXISTS ep_editor_inputs (
       max_message_id TEXT PRIMARY KEY,
       actor_user_id BIGINT NOT NULL,
@@ -287,7 +322,8 @@ async function handleBotAdded(update) {
   const row = saved.rows[0];
   await sendToUser(userId, {
     text: `✅ Канал «${row.title}» подключён.\n\n📥 Ссылка для предложки:\n` +
-      `https://max.ru/${BOT_USERNAME}?start=${row.proposal_code}`
+      `https://max.ru/${BOT_USERNAME}?start=${row.proposal_code}\n\n` +
+      `Для управления каналом отправьте /menu в этот чат.`
   });
   console.log("CHANNEL SAVED:", chatId);
 }
@@ -295,6 +331,17 @@ async function handleBotAdded(update) {
 async function handleStart(update) {
   const userId = update.user?.user_id;
   if (userId == null) return;
+  if (typeof update.payload !== "string" || !update.payload) {
+    await showAdminMenu(userId, true);
+    return;
+  }
+  const composing = await getComposer(userId);
+  if (composing) {
+    await notify(userId,
+      "Сейчас открыто создание собственного поста. Завершите его или отправьте /cancel, " +
+      "затем откройте ссылку предложки ещё раз.");
+    return;
+  }
   const editing = await getEditorSession(userId);
   if (editing) {
     await notify(userId,
@@ -347,23 +394,29 @@ async function handleMessage(update) {
   if (!sender || sender.is_bot || sender.user_id == null || !mid) return;
   const chatType = message.recipient?.chat_type;
   if (chatType && chatType !== "dialog") return;
-  // Сообщение редактора сначала направляем в его активную правку,
-  // даже если у него осталась собственная сессия предложки.
-  if (await handleEditorMessage(message)) return;
-  // При повторной доставке используем уже сохранённый канал, не новую сессию.
+  // Повторная доставка уже записанной предложки сохраняет прежнее назначение.
   let found = await pool.query(`
     SELECT s.*, c.title, c.owner_user_id, c.max_chat_id, c.active
     FROM submissions s JOIN channels c ON c.id = s.channel_id
     WHERE s.max_message_id = $1 ORDER BY s.id LIMIT 1
   `, [mid]);
   if (!found.rowCount) {
+    // Собственные посты и правки обрабатываются до входящих предложок.
+    if (await handleComposerMessage(message)) return;
+    if (await handleEditorMessage(message)) return;
     const sessionResult = await pool.query(`
       SELECT ps.channel_id FROM proposal_sessions ps
       JOIN channels c ON c.id = ps.channel_id
       WHERE ps.max_user_id = $1 AND c.active = TRUE
     `, [sender.user_id]);
     if (!sessionResult.rowCount) {
-      await notify(sender.user_id, "Откройте ссылку предложки из нужного канала и отправьте сообщение ещё раз.");
+      if (await hasOwnChannel(sender.user_id)) {
+        await notify(sender.user_id,
+          "Для своего поста нажмите «Создать пост». Это сообщение не опубликовано и не сохранено как предложка.");
+        await showAdminMenu(sender.user_id);
+      } else {
+        await notify(sender.user_id, "Откройте ссылку предложки из нужного канала и отправьте сообщение ещё раз.");
+      }
       return;
     }
     const saved = await pool.query(`
@@ -704,6 +757,12 @@ async function resumeEditor(session) {
 }
 
 async function beginEdit(row, userId) {
+  const composing = await getComposer(userId);
+  if (composing) {
+    await notify(userId, "Сначала завершите создание собственного поста или отправьте /cancel.");
+    await resumeComposer(composing);
+    return;
+  }
   let session = await getEditorSession(userId);
   if (session) {
     if (String(session.submission_id) !== String(row.id)) {
@@ -934,6 +993,7 @@ async function publishPrepared(row, userId, callbackId, body, session = null) {
 }
 
 async function handleCallback(update) {
+  if (await handleAdminCallback(update)) return;
   const callback = update.callback;
   const userId = callback?.user?.user_id;
   const payload = typeof callback?.payload === "string" ? callback.payload : "";
@@ -949,6 +1009,13 @@ async function handleCallback(update) {
   }
   // Снимаем ожидание кнопки. Саму карточку уберём только после завершения.
   await answerCallback(callback.callback_id);
+  const composing = await getComposer(userId);
+  if (composing && action !== "reject") {
+    await notify(userId,
+      "Сейчас открыто создание собственного поста. Завершите его или отправьте /cancel, " +
+      "затем вернитесь к предложке. Предложка не опубликована.");
+    return;
+  }
   if (!row.active || !(await checkAdministrator(row.max_chat_id, userId))) {
     await notify(userId, "Канал отключён или у вас больше нет прав администратора.");
     return;
@@ -1046,6 +1113,623 @@ async function handleCallback(update) {
   }
   await publishPrepared(row, userId, callback.callback_id, body);
 }
+
+// ---------- Меню администратора и собственные посты ----------
+// Собственные посты хранятся отдельно от предложок.
+// В один момент у администратора либо редактор предложки, либо создание поста.
+
+const ADMIN_PAGE_SIZE = 6;
+const shortTitle = title => String(title || "Без названия").slice(0, 70);
+const button = (text, payload) => ({ type: "callback", text, payload });
+
+async function getComposer(userId) {
+  const result = await pool.query(
+    "SELECT * FROM ep_composer_sessions WHERE actor_user_id = $1", [userId]);
+  return result.rows[0] || null;
+}
+
+async function getOwnPost(postId) {
+  const result = await pool.query(`
+    SELECT p.*, c.title, c.max_chat_id, c.owner_user_id, c.active
+    FROM ep_posts p JOIN channels c ON c.id = p.channel_id WHERE p.id = $1
+  `, [postId]);
+  return result.rows[0] || null;
+}
+
+async function hasOwnChannel(userId) {
+  const result = await pool.query(`
+    SELECT 1 FROM channels WHERE owner_user_id = $1 AND active = TRUE LIMIT 1
+  `, [userId]);
+  return result.rowCount > 0;
+}
+
+async function canUseOwnPost(row, userId) {
+  return Boolean(row && row.active &&
+    String(row.author_user_id) === String(userId) &&
+    String(row.owner_user_id) === String(userId) &&
+    await checkAdministrator(row.max_chat_id, userId));
+}
+
+function adminMenuBody() {
+  return {
+    text: "EveryPost · Управление каналами\n\n" +
+      "Создайте публикацию или откройте предложки. " +
+      "В канал ничего не отправляется без вашего подтверждения.",
+    attachments: keyboard([
+      [button("➕ Создать пост", "menu_create")],
+      [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")]
+    ])
+  };
+}
+
+async function showAdminMenu(userId, switchMode = false) {
+  const composer = await getComposer(userId);
+  if (composer) {
+    await resumeComposer(composer);
+    return;
+  }
+  const editor = await getEditorSession(userId);
+  if (editor) {
+    await resumeEditor(editor);
+    return;
+  }
+  if (!(await hasOwnChannel(userId))) {
+    await notify(userId,
+      "Для отправки новости откройте ссылку предложки из нужного канала.\n\n" +
+      "Для управления своим каналом добавьте EveryPost в него администратором. " +
+      "После подключения отправьте /menu.");
+    return;
+  }
+  // Только явный вход в админское меню меняет режим пользователя.
+  // Переход подписчика по ссылке предложки меню не открывает.
+  if (switchMode) {
+    await pool.query("DELETE FROM proposal_sessions WHERE max_user_id = $1", [userId]);
+  }
+  await sendToUser(userId, adminMenuBody());
+}
+
+async function listMyChannels(userId, page = 0) {
+  page = Math.max(0, Math.min(100000, Number(page) || 0));
+  const result = await pool.query(`
+    SELECT id, title, proposal_code FROM channels
+    WHERE owner_user_id = $1 AND active = TRUE
+    ORDER BY id LIMIT $2 OFFSET $3
+  `, [userId, ADMIN_PAGE_SIZE + 1, page * ADMIN_PAGE_SIZE]);
+  const rows = result.rows.slice(0, ADMIN_PAGE_SIZE);
+  let text = "📁 Мои каналы\n\n";
+  text += rows.length ? rows.map(c =>
+    `«${shortTitle(c.title)}»\nПредложка: https://max.ru/${BOT_USERNAME}?start=${c.proposal_code}`
+  ).join("\n\n") : "На этой странице нет подключённых каналов.";
+  const navigation = [];
+  if (page > 0) navigation.push(button("◀️ Назад", `menu_channels_${page - 1}`));
+  if (result.rows.length > ADMIN_PAGE_SIZE) {
+    navigation.push(button("Далее ▶️", `menu_channels_${page + 1}`));
+  }
+  await sendToUser(userId, {
+    text,
+    attachments: keyboard([
+      ...(navigation.length ? [navigation] : []),
+      [button("↩️ Меню", "menu_main")]
+    ])
+  });
+}
+
+async function listMySubmissions(userId, page = 0) {
+  page = Math.max(0, Math.min(100000, Number(page) || 0));
+  const result = await pool.query(`
+    SELECT s.id, c.title FROM submissions s
+    JOIN channels c ON c.id = s.channel_id
+    WHERE c.owner_user_id = $1 AND c.active = TRUE AND s.status = 'new'
+    ORDER BY s.id DESC LIMIT $2 OFFSET $3
+  `, [userId, ADMIN_PAGE_SIZE + 1, page * ADMIN_PAGE_SIZE]);
+  const rows = result.rows.slice(0, ADMIN_PAGE_SIZE);
+  const navigation = [];
+  if (page > 0) navigation.push(button("◀️ Назад", `menu_inbox_${page - 1}`));
+  if (result.rows.length > ADMIN_PAGE_SIZE) {
+    navigation.push(button("Далее ▶️", `menu_inbox_${page + 1}`));
+  }
+  await sendToUser(userId, {
+    text: rows.length
+      ? "📥 Новые предложки\nВыберите материал. Публикация здесь не выполняется."
+      : "📥 На этой странице нет новых предложок.",
+    attachments: keyboard([
+      ...rows.map(s => [button(`#${s.id} · ${shortTitle(s.title)}`, `inboxopen_${s.id}`)]),
+      ...(navigation.length ? [navigation] : []),
+      [button("↩️ Меню", "menu_main")]
+    ])
+  });
+}
+
+async function showChannelPicker(session, page = 0) {
+  const current = await getComposer(session.actor_user_id);
+  if (!current || current.nonce !== session.nonce || current.stage !== "choose_channel") return;
+  page = Math.max(0, Math.min(100000, Number(page) || 0));
+  const result = await pool.query(`
+    SELECT id, title FROM channels
+    WHERE owner_user_id = $1 AND active = TRUE
+    ORDER BY id LIMIT $2 OFFSET $3
+  `, [session.actor_user_id, ADMIN_PAGE_SIZE + 1, page * ADMIN_PAGE_SIZE]);
+  const rows = result.rows.slice(0, ADMIN_PAGE_SIZE);
+  const navigation = [];
+  if (page > 0) navigation.push(button("◀️ Назад", `cpage_${session.nonce}_${page - 1}`));
+  if (result.rows.length > ADMIN_PAGE_SIZE) {
+    navigation.push(button("Далее ▶️", `cpage_${session.nonce}_${page + 1}`));
+  }
+  await sendToUser(session.actor_user_id, {
+    text: "➕ Создать пост\n\n" + (rows.length
+      ? "Выберите канал для публикации. Здесь показаны только ваши подключённые каналы."
+      : "На этой странице нет активных каналов. Вернитесь назад или отмените создание."),
+    attachments: keyboard([
+      ...rows.map(c => [button(shortTitle(c.title), `cpick_${session.nonce}_${c.id}`)]),
+      ...(navigation.length ? [navigation] : []),
+      [button("↩️ Отменить создание", `ccancel_${session.nonce}`)]
+    ])
+  });
+}
+
+async function beginComposer(userId) {
+  const editor = await getEditorSession(userId);
+  if (editor) {
+    await notify(userId, "Сначала завершите правку предложки или отправьте /cancel.");
+    await resumeEditor(editor);
+    return;
+  }
+  const current = await getComposer(userId);
+  if (current) { await resumeComposer(current); return; }
+  if (!(await hasOwnChannel(userId))) { await showAdminMenu(userId); return; }
+  const created = await pool.query(`
+    INSERT INTO ep_composer_sessions(actor_user_id, nonce, stage)
+    VALUES ($1, $2, 'choose_channel')
+    ON CONFLICT (actor_user_id) DO NOTHING RETURNING *
+  `, [userId, newEditNonce()]);
+  await pool.query("DELETE FROM proposal_sessions WHERE max_user_id = $1", [userId]);
+  const session = created.rows[0] || await getComposer(userId);
+  if (session) await resumeComposer(session);
+}
+
+async function choosePostChannel(session, channelId) {
+  const selected = await pool.query(`
+    SELECT * FROM channels WHERE id = $1 AND owner_user_id = $2 AND active = TRUE
+  `, [channelId, session.actor_user_id]);
+  const channel = selected.rows[0];
+  if (!channel || !(await checkAdministrator(channel.max_chat_id, session.actor_user_id))) {
+    await notify(session.actor_user_id,
+      "Канал недоступен или у вас нет действующих прав администратора. Выберите другой канал.");
+    return;
+  }
+  const client = await pool.connect();
+  let next;
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(`
+      SELECT * FROM ep_composer_sessions WHERE actor_user_id = $1
+        AND nonce = $2 AND stage = 'choose_channel' FOR UPDATE
+    `, [session.actor_user_id, session.nonce]);
+    if (locked.rowCount) {
+      const created = await client.query(`
+        INSERT INTO ep_posts(channel_id, author_user_id) VALUES ($1, $2) RETURNING id
+      `, [channel.id, session.actor_user_id]);
+      next = await client.query(`
+        UPDATE ep_composer_sessions
+        SET post_id = $3, nonce = $4, stage = 'waiting_content', updated_at = NOW()
+        WHERE actor_user_id = $1 AND nonce = $2 RETURNING *
+      `, [session.actor_user_id, session.nonce, created.rows[0].id, newEditNonce()]);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally { client.release(); }
+  if (next?.rowCount) await sendComposerPrompt(next.rows[0]);
+}
+
+async function sendComposerPrompt(session) {
+  const row = await getOwnPost(session.post_id);
+  if (!(await canUseOwnPost(row, session.actor_user_id)) || row.status !== "draft") return;
+  const editing = session.stage === "waiting_text";
+  await sendToUser(session.actor_user_id, {
+    text: `➕ Пост #${row.id}\nКанал: «${shortTitle(row.title)}»\n\n` +
+      (editing
+        ? "Пришлите весь новый текст одним обычным сообщением. Он заменит текст или подпись. " +
+          "Фото и видео останутся прежними."
+        : "Отправьте текст или прикрепите фото, несколько фото либо видео с подписью " +
+          "одним сообщением. После этого будет предпросмотр. " +
+          "Последующие отдельные сообщения автоматически к посту не добавляются.") +
+      "\n\nВ канал пока ничего не публикуется. Отмена: /cancel.",
+    attachments: keyboard([
+      ...(row.body ? [[button("👁 Вернуться к предпросмотру", `cback_${session.nonce}`)]] : []),
+      [button("↩️ Отменить пост", `ccancel_${session.nonce}`)]
+    ])
+  });
+}
+
+function ownPostControls(session, row) {
+  return {
+    text: `👁 Новый пост #${row.id}\nКанал: «${shortTitle(row.title)}»\n\n` +
+      "Выше показан вариант для публикации. Он ещё не отправлен в канал.",
+    attachments: keyboard([
+      [button("🚀 Опубликовать", `cpublish_${session.nonce}`)],
+      [button("✏️ Изменить текст", `ctext_${session.nonce}`),
+       button("📎 Заменить материал", `creplace_${session.nonce}`)],
+      [button("↩️ Отменить пост", `ccancel_${session.nonce}`)]
+    ])
+  };
+}
+
+async function showOwnPostPreview(session) {
+  const current = await getComposer(session.actor_user_id);
+  if (!current || current.nonce !== session.nonce || current.stage !== "preview") return;
+  const row = await getOwnPost(current.post_id);
+  if (!(await canUseOwnPost(row, current.actor_user_id)) || row.status !== "draft") return;
+  if (!row.body) throw new Error("Содержимое нового поста отсутствует.");
+  try {
+    if (!row.preview_mid) {
+      const preview = await sendToUser(current.actor_user_id, row.body);
+      await pool.query(`
+        UPDATE ep_posts SET preview_mid = $2, updated_at = NOW()
+        WHERE id = $1 AND status = 'draft'
+          AND EXISTS (SELECT 1 FROM ep_composer_sessions e
+            WHERE e.post_id = ep_posts.id AND e.nonce = $3 AND e.stage = 'preview')
+      `, [row.id, messageId(preview), current.nonce]);
+    }
+    if (!row.controls_mid) {
+      const controls = await sendToUser(current.actor_user_id, ownPostControls(current, row));
+      await pool.query(`
+        UPDATE ep_posts SET controls_mid = $2, updated_at = NOW()
+        WHERE id = $1 AND status = 'draft'
+          AND EXISTS (SELECT 1 FROM ep_composer_sessions e
+            WHERE e.post_id = ep_posts.id AND e.nonce = $3 AND e.stage = 'preview')
+      `, [row.id, messageId(controls), current.nonce]);
+    }
+    console.log("POST PREVIEW READY:", row.id);
+  } catch (error) {
+    console.error("POST PREVIEW ERROR:", error.message);
+    await sendToUser(current.actor_user_id, {
+      text: `Предпросмотр поста #${row.id} не удалось показать полностью. ` +
+        "Пост сохранён, в канале ничего не опубликовано.",
+      attachments: keyboard([
+        [button("🔄 Показать предпросмотр", `crefresh_${current.nonce}`)],
+        [button("↩️ Отменить пост", `ccancel_${current.nonce}`)]
+      ])
+    });
+  }
+}
+
+async function resumeComposer(session) {
+  if (session.stage === "choose_channel") { await showChannelPicker(session); return; }
+  const row = await getOwnPost(session.post_id);
+  if (!row || row.status !== "draft" || !(await canUseOwnPost(row, session.actor_user_id))) {
+    await pool.query(
+      "DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2",
+      [session.actor_user_id, session.nonce]);
+    const statuses = {
+      published: "уже опубликован", cancelled: "отменён",
+      publishing: "отправлялся; проверьте канал, повторная отправка не выполняется",
+      needs_check: "требует проверки результата в канале"
+    };
+    await notify(session.actor_user_id, row && row.status !== "draft"
+      ? `Пост #${row.id}: ${statuses[row.status] || row.status}. Для меню отправьте /menu.`
+      : "Создание закрыто: канал недоступен или права изменились. Для меню отправьте /menu.");
+    return;
+  }
+  if (session.stage === "preview") {
+    if (row.preview_mid && row.controls_mid) {
+      await sendToUser(session.actor_user_id, ownPostControls(session, row));
+    } else await showOwnPostPreview(session);
+  } else await sendComposerPrompt(session);
+}
+
+async function rememberComposerInput(message, session = null) {
+  await pool.query(`
+    INSERT INTO ep_composer_inputs(max_message_id, actor_user_id, session_nonce, post_id)
+    VALUES ($1, $2, $3, $4) ON CONFLICT (max_message_id) DO NOTHING
+  `, [message.body.mid, message.sender.user_id, session?.nonce ?? null, session?.post_id ?? null]);
+}
+
+async function cancelComposer(session, message = null) {
+  if (session.post_id) {
+    const post = await getOwnPost(session.post_id);
+    if (post && post.status !== "draft") {
+      if (message) await rememberComposerInput(message, session);
+      await resumeComposer(session);
+      return false;
+    }
+  }
+  const client = await pool.connect();
+  let deleted;
+  try {
+    await client.query("BEGIN");
+    if (message) {
+      await client.query(`
+        INSERT INTO ep_composer_inputs(max_message_id, actor_user_id, session_nonce, post_id)
+        VALUES ($1, $2, $3, $4) ON CONFLICT (max_message_id) DO NOTHING
+      `, [message.body.mid, session.actor_user_id, session.nonce, session.post_id]);
+    }
+    deleted = await client.query(`
+      DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2 RETURNING post_id
+    `, [session.actor_user_id, session.nonce]);
+    if (deleted.rowCount && deleted.rows[0].post_id) {
+      await client.query(`
+        UPDATE ep_posts SET status = 'cancelled', updated_at = NOW()
+        WHERE id = $1 AND author_user_id = $2 AND status = 'draft'
+      `, [deleted.rows[0].post_id, session.actor_user_id]);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally { client.release(); }
+  if (!deleted.rowCount) return false;
+  await notify(session.actor_user_id, "Создание поста отменено. Ничего в канал не отправлено.");
+  await showAdminMenu(session.actor_user_id, true);
+  console.log("POST CANCELLED:", session.post_id ?? "selection");
+  return true;
+}
+
+async function handleComposerMessage(message) {
+  const userId = message.sender.user_id;
+  const mid = message.body.mid;
+  const text = typeof message.body.text === "string" ? message.body.text : "";
+  const command = text.trim().toLowerCase();
+  const oldEditorInput = await pool.query(
+    "SELECT 1 FROM ep_editor_inputs WHERE max_message_id = $1", [mid]);
+  if (oldEditorInput.rowCount) return false;
+  const receipt = await pool.query(
+    "SELECT * FROM ep_composer_inputs WHERE max_message_id = $1", [mid]);
+  if (receipt.rowCount) {
+    const session = await getComposer(userId);
+    if (session && session.stage === "preview" && session.nonce === receipt.rows[0].session_nonce) {
+      const row = await getOwnPost(session.post_id);
+      if (row?.input_mid === mid && !row.controls_mid) await showOwnPostPreview(session);
+    }
+    return true;
+  }
+
+  // Команды управления распознаются только в обычном текстовом сообщении,
+  // не в подписи к фото и не внутри пересланной новости.
+  const isCommand = !message.link && !(message.body.attachments || []).length;
+  if (isCommand && ["/menu", "/start", "меню"].includes(command)) {
+    await rememberComposerInput(message);
+    await showAdminMenu(userId, true);
+    return true;
+  }
+  if (isCommand && ["/newpost", "/new"].includes(command)) {
+    await rememberComposerInput(message);
+    await beginComposer(userId);
+    return true;
+  }
+
+  const session = await getComposer(userId);
+  if (!session) return false;
+  if (isCommand && ["/cancel", "/отмена"].includes(command)) {
+    await cancelComposer(session, message);
+    return true;
+  }
+  if (session.stage === "choose_channel") {
+    await rememberComposerInput(message, session);
+    await notify(userId, "Сначала выберите канал кнопкой. Это сообщение не сохранено как пост.");
+    await showChannelPicker(session);
+    return true;
+  }
+  const row = await getOwnPost(session.post_id);
+  if (!(await canUseOwnPost(row, userId)) || row.status !== "draft") {
+    await rememberComposerInput(message, session);
+    await resumeComposer(session);
+    return true;
+  }
+  if (session.stage === "preview") {
+    await rememberComposerInput(message, session);
+    await notify(userId,
+      `Для поста #${row.id} уже открыт предпросмотр. ` +
+      "Используйте «Изменить текст» или «Заменить материал». " +
+      "Новое сообщение не добавлено к посту и не отправлено в предложку.");
+    return true;
+  }
+
+  let postBody;
+  let source;
+  try {
+    if (session.stage === "waiting_text") {
+      if (!text.trim()) throw new Error("Отправьте непустой текст одним сообщением.");
+      if (message.link?.type === "forward") throw new Error("Нужен обычный текст, не пересылка.");
+      if (message.body.attachments != null && !Array.isArray(message.body.attachments)) {
+        throw new Error("Неизвестный формат вложений.");
+      }
+      if ((message.body.attachments || []).some(a => a?.type !== "share")) {
+        throw new Error("Здесь меняется только текст. Для замены медиа используйте «Заменить материал».");
+      }
+      source = row.source_message;
+      postBody = buildAnonymousPost(source, {
+        text, markup: Array.isArray(message.body.markup) ? message.body.markup : []
+      });
+    } else {
+      source = message;
+      postBody = buildAnonymousPost(message);
+    }
+  } catch (error) {
+    await rememberComposerInput(message, session);
+    await notify(userId, `${error.message}\nПост не опубликован. Отправьте материал ещё раз или /cancel.`);
+    return true;
+  }
+
+  const nextNonce = newEditNonce();
+  const client = await pool.connect();
+  let next;
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(`
+      SELECT * FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2
+        AND stage IN ('waiting_content', 'waiting_text') FOR UPDATE
+    `, [userId, session.nonce]);
+    if (locked.rowCount) {
+      const inserted = await client.query(`
+        INSERT INTO ep_composer_inputs(max_message_id, actor_user_id, session_nonce, post_id)
+        VALUES ($1, $2, $3, $4) ON CONFLICT (max_message_id) DO NOTHING RETURNING max_message_id
+      `, [mid, userId, nextNonce, row.id]);
+      if (inserted.rowCount) {
+        const changed = await client.query(`
+          UPDATE ep_posts SET source_message = $3::jsonb, body = $4::jsonb, input_mid = $5,
+            preview_mid = NULL, controls_mid = NULL, last_error = NULL, updated_at = NOW()
+          WHERE id = $1 AND author_user_id = $2 AND status = 'draft' RETURNING id
+        `, [row.id, userId, JSON.stringify(source), JSON.stringify(postBody), mid]);
+        if (changed.rowCount) {
+          next = await client.query(`
+            UPDATE ep_composer_sessions SET nonce = $3, stage = 'preview', updated_at = NOW()
+            WHERE actor_user_id = $1 AND nonce = $2 RETURNING *
+          `, [userId, session.nonce, nextNonce]);
+        }
+      }
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally { client.release(); }
+  if (next?.rowCount) {
+    console.log("POST CONTENT SAVED:", row.id);
+    await showOwnPostPreview(next.rows[0]);
+  }
+  return true;
+}
+
+async function publishOwnPost(session, row, callbackId) {
+  // Публикуем ровно сохранённый предпросмотр. Нет forward, sender и чужих кнопок.
+  // Уникальный nonce делает кнопки старой редакции недействительными.
+  const claimed = await pool.query(`
+    UPDATE ep_posts SET status = 'publishing', published_body = body, updated_at = NOW()
+    WHERE id = $1 AND author_user_id = $2 AND status = 'draft'
+      AND body IS NOT NULL AND preview_mid IS NOT NULL AND controls_mid IS NOT NULL
+      AND EXISTS (SELECT 1 FROM ep_composer_sessions e
+        WHERE e.post_id = ep_posts.id AND e.actor_user_id = $2
+          AND e.nonce = $3 AND e.stage = 'preview')
+      AND EXISTS (SELECT 1 FROM channels c WHERE c.id = ep_posts.channel_id
+        AND c.owner_user_id = $2 AND c.active = TRUE)
+    RETURNING *
+  `, [row.id, session.actor_user_id, session.nonce]);
+  if (!claimed.rowCount) {
+    await notify(session.actor_user_id,
+      "Публикация не выполнена: версия поста уже изменилась или предпросмотр не завершён.");
+    return;
+  }
+  let accepted = false;
+  try {
+    const sent = await sendMessage("chat_id", row.max_chat_id, claimed.rows[0].published_body);
+    accepted = true;
+    await pool.query(`
+      UPDATE ep_posts SET status = 'published', published_mid = $2,
+        last_error = NULL, updated_at = NOW() WHERE id = $1
+    `, [row.id, messageId(sent)]);
+  } catch (error) {
+    const definiteRejection = !accepted && error.status >= 400 && error.status < 500 && error.status !== 408;
+    await pool.query(`
+      UPDATE ep_posts SET status = $2, last_error = $3, updated_at = NOW() WHERE id = $1
+    `, [row.id, definiteRejection ? "draft" : "needs_check", error.message.slice(0, 1000)]);
+    if (!definiteRejection) {
+      await pool.query("DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2",
+        [session.actor_user_id, session.nonce]);
+    }
+    await notify(session.actor_user_id, definiteRejection
+      ? `MAX не принял пост #${row.id}. Он сохранён; можно повторить после устранения ошибки. Ошибка есть в Logs.`
+      : `Результат публикации #${row.id} не подтверждён. Проверьте канал. ` +
+        "Повторная отправка остановлена, чтобы не создать дубль. Для меню отправьте /menu.");
+    console.error("POST PUBLISH ERROR:", error.message);
+    return;
+  }
+  await pool.query("DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2",
+    [session.actor_user_id, session.nonce]);
+  await answerCallback(callbackId,
+    `✅ Пост #${row.id} опубликован в канале «${shortTitle(row.title)}».`, true);
+  await notify(session.actor_user_id,
+    `✅ Пост #${row.id} опубликован в канале «${shortTitle(row.title)}».`);
+  console.log("OWN POST PUBLISHED:", row.id);
+  await showAdminMenu(session.actor_user_id, true);
+}
+
+async function handleAdminCallback(update) {
+  const callback = update.callback;
+  const userId = callback?.user?.user_id;
+  const payload = typeof callback?.payload === "string" ? callback.payload : "";
+  if (userId == null) return false;
+  const menu = payload.match(/^menu_(main|create|channels_\d+|inbox_\d+)$/);
+  const inbox = payload.match(/^inboxopen_(\d+)$/);
+  const pick = payload.match(/^c(pick|page)_([a-f0-9]{24})_(\d+)$/);
+  const action = payload.match(/^c(publish|text|replace|cancel|refresh|back)_([a-f0-9]{24})$/);
+  if (!menu && !inbox && !pick && !action) return false;
+  await answerCallback(callback.callback_id);
+
+  if (menu) {
+    if (menu[1] === "main") await showAdminMenu(userId, true);
+    else if (menu[1] === "create") await beginComposer(userId);
+    else if (menu[1].startsWith("channels_")) await listMyChannels(userId, Number(menu[1].split("_")[1]));
+    else await listMySubmissions(userId, Number(menu[1].split("_")[1]));
+    return true;
+  }
+  if (inbox) {
+    const row = await getSubmission(inbox[1]);
+    if (!(await canEdit(row, userId))) {
+      await notify(userId, "Предложка недоступна или уже обработана.");
+      return true;
+    }
+    await forwardMessage("user_id", userId, row.max_message_id);
+    await sendToUser(userId, controlsBody(row.id, row.title));
+    return true;
+  }
+
+  const session = await getComposer(userId);
+  const expected = (pick || action)[2];
+  if (!session || session.nonce !== expected) {
+    await notify(userId,
+      "Эта карточка уже обработана или устарела. Используйте последний предпросмотр либо /menu.");
+    return true;
+  }
+  if (action?.[1] === "cancel") {
+    if (await cancelComposer(session)) {
+      await answerCallback(callback.callback_id, "Создание поста отменено.", true);
+    }
+    return true;
+  }
+  if (pick) {
+    if (session.stage !== "choose_channel") { await resumeComposer(session); return true; }
+    if (pick[1] === "page") await showChannelPicker(session, Number(pick[3]));
+    else await choosePostChannel(session, pick[3]);
+    return true;
+  }
+  const row = await getOwnPost(session.post_id);
+  if (!(await canUseOwnPost(row, userId)) || row.status !== "draft") {
+    await resumeComposer(session);
+    return true;
+  }
+  if (action[1] === "publish") {
+    if (session.stage !== "preview" || !row.preview_mid || !row.controls_mid || !row.body) {
+      await notify(userId, "Сначала нужен полностью показанный предпросмотр. Пост не опубликован.");
+    } else await publishOwnPost(session, row, callback.callback_id);
+    return true;
+  }
+  if (action[1] === "refresh") {
+    await showOwnPostPreview(session);
+    return true;
+  }
+  if (action[1] === "back" && !row.body) return true;
+  if (["text", "replace"].includes(action[1]) && session.stage !== "preview") {
+    await resumeComposer(session);
+    return true;
+  }
+  const stage = action[1] === "text" ? "waiting_text"
+    : action[1] === "replace" ? "waiting_content" : "preview";
+  const next = await pool.query(`
+    UPDATE ep_composer_sessions SET nonce = $3, stage = $4, updated_at = NOW()
+    WHERE actor_user_id = $1 AND nonce = $2 RETURNING *
+  `, [userId, session.nonce, newEditNonce(), stage]);
+  if (next.rowCount) {
+    if (stage === "preview") {
+      // Содержимое не менялось; показываем подтверждение с новым nonce.
+      await pool.query("UPDATE ep_posts SET controls_mid = NULL WHERE id = $1", [row.id]);
+      await showOwnPostPreview(next.rows[0]);
+    } else await sendComposerPrompt(next.rows[0]);
+  }
+  return true;
+}
+
 
 async function handleUpdate(update) {
   console.log("UPDATE TYPE:", update.update_type);
