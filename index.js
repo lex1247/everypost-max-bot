@@ -1,35 +1,302 @@
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
 import express from "express";
 import pg from "pg";
-import crypto from "crypto";
+import crypto from "node:crypto";
+import https from "node:https";
+import tls from "node:tls";
 
-const { Pool } = pg;
-
-const app = express();
-app.use(express.json());
-
-const PORT = process.env.PORT || 3000;
-const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
+// EveryPost: прототип предложки с публикацией после решения администратора.
+const VERSION = "forward-fix-3";
+const PORT = Number(process.env.PORT || 3000);
+const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
-
 const BOT_USERNAME = "id190206555510_3_bot";
+const WEBHOOK_URL = "https://everypost-max-bot.onrender.com/webhook";
+const API_URL = "https://platform-api2.max.ru";
 
-if (!MAX_BOT_TOKEN) {
-  throw new Error("MAX_BOT_TOKEN is not set");
+if (!TOKEN) throw new Error("MAX_BOT_TOKEN is not set");
+if (!DATABASE_URL) throw new Error("DATABASE_URL is not set");
+
+// Больше не отключаем проверку сертификатов для Node.js.
+if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
+  delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
 }
 
-if (!DATABASE_URL) {
-  throw new Error("DATABASE_URL is not set");
-}
+const SECRET = crypto.createHmac("sha256", TOKEN)
+  .update("EveryPost webhook v1").digest("hex");
 
-const pool = new Pool({
-  connectionString: DATABASE_URL
+const pool = new pg.Pool({
+  connectionString: DATABASE_URL,
+  max: 5,
+  connectionTimeoutMillis: 10000
 });
 
-// ======================================================
-// DATABASE
-// ======================================================
+pool.on("error", error => {
+  console.error("DATABASE ERROR:", error.message);
+});
+
+const app = express();
+app.disable("x-powered-by");
+app.use(express.json({ limit: "2mb" }));
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+let ready = false;
+let workerBusy = false;
+let maxAgent = new https.Agent({
+  keepAlive: true,
+  rejectUnauthorized: true
+});
+let certificateLoading;
+let apiTail = Promise.resolve();
+let lastApiCall = 0;
+
+// ---------- HTTPS и API ----------
+
+function httpsRequest(
+  url,
+  { method = "GET", headers = {}, body, agent } = {}
+) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      method,
+      headers,
+      agent,
+      rejectUnauthorized: true
+    }, res => {
+      const chunks = [];
+      let size = 0;
+
+      res.on("data", chunk => {
+        size += chunk.length;
+
+        if (size > 4 * 1024 * 1024) {
+          res.destroy(new Error("Response is too large"));
+        } else {
+          chunks.push(chunk);
+        }
+      });
+
+      res.on("error", error => {
+        clearTimeout(timer);
+        reject(error);
+      });
+
+      res.on("end", () => {
+        clearTimeout(timer);
+
+        resolve({
+          status: res.statusCode,
+          text: Buffer.concat(chunks).toString("utf8")
+        });
+      });
+    });
+
+    const timer = setTimeout(() => {
+      req.destroy(new Error("HTTPS request timeout"));
+    }, 12000);
+
+    req.on("error", error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+
+    req.end(body);
+  });
+}
+
+async function loadMaxCertificate() {
+  if (!certificateLoading) {
+    certificateLoading = (async () => {
+      const cached = await pool.query(
+        "SELECT value FROM ep_settings WHERE key = 'max_root_ca'"
+      );
+
+      let pem = process.env.MAX_CA_PEM || cached.rows[0]?.value;
+
+      if (!pem) {
+        // Сертификат загружается по проверяемому HTTPS,
+        // без передачи токена бота.
+        const result = await httpsRequest(
+          "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
+        );
+
+        if (result.status !== 200) {
+          throw new Error("Could not download MAX root certificate");
+        }
+
+        pem = result.text;
+      }
+
+      const cert = new crypto.X509Certificate(pem);
+
+      if (
+        !cert.ca ||
+        Date.now() < Date.parse(cert.validFrom) ||
+        Date.now() > Date.parse(cert.validTo)
+      ) {
+        throw new Error("MAX root certificate is invalid or expired");
+      }
+
+      maxAgent = new https.Agent({
+        keepAlive: true,
+        rejectUnauthorized: true,
+        ca: [...tls.rootCertificates, cert.toString()]
+      });
+
+      await pool.query(`
+        INSERT INTO ep_settings(key, value)
+        VALUES ('max_root_ca', $1)
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value
+      `, [cert.toString()]);
+
+      console.log("MAX TLS CERTIFICATE READY");
+    })().catch(error => {
+      certificateLoading = undefined;
+      throw error;
+    });
+  }
+
+  return certificateLoading;
+}
+
+async function maxRequest(path, method = "GET", body) {
+  const options = {
+    method,
+    headers: {
+      Authorization: TOKEN,
+      "Content-Type": "application/json"
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    agent: maxAgent
+  };
+
+  let result;
+
+  try {
+    result = await httpsRequest(API_URL + path, options);
+  } catch (error) {
+    const missingCA = [
+      "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+      "SELF_SIGNED_CERT_IN_CHAIN"
+    ].includes(error.code);
+
+    if (!missingCA) throw error;
+
+    await loadMaxCertificate();
+
+    // Повтор только после ошибки TLS до установления соединения.
+    result = await httpsRequest(API_URL + path, {
+      ...options,
+      agent: maxAgent
+    });
+  }
+
+  let data;
+
+  try {
+    data = result.text ? JSON.parse(result.text) : {};
+  } catch {
+    data = {};
+  }
+
+  if (
+    result.status < 200 ||
+    result.status >= 300 ||
+    data.success === false
+  ) {
+    const error = new Error(
+      `MAX API ${result.status}: ${result.text.slice(0, 1000)}`
+    );
+
+    error.status = result.status;
+    throw error;
+  }
+
+  return data;
+}
+
+// Для прототипа исходящие сообщения отправляются
+// последовательно, с паузой.
+function sendMessage(kind, id, body) {
+  const task = apiTail.catch(() => {}).then(async () => {
+    await sleep(
+      Math.max(0, 650 - (Date.now() - lastApiCall))
+    );
+
+    lastApiCall = Date.now();
+
+    return maxRequest(
+      `/messages?${kind}=${encodeURIComponent(id)}`,
+      "POST",
+      body
+    );
+  });
+
+  apiTail = task.catch(() => {});
+  return task;
+}
+
+const sendToUser = (id, body) => {
+  return sendMessage("user_id", id, body);
+};
+
+// В forward нет НИ text, НИ attachments.
+// Только ссылка на оригинальное сообщение.
+function forwardMessage(kind, id, mid) {
+  return sendMessage(kind, id, {
+    link: {
+      type: "forward",
+      mid
+    }
+  });
+}
+
+function messageId(result) {
+  const mid = result?.message?.body?.mid;
+
+  if (!mid) {
+    throw new Error(
+      "MAX returned no message ID; check delivery before retrying"
+    );
+  }
+
+  return mid;
+}
+
+async function notify(userId, text) {
+  try {
+    await sendToUser(userId, { text });
+  } catch (error) {
+    console.error("NOTIFICATION ERROR:", error.message);
+  }
+}
+
+async function answerCallback(
+  callbackId,
+  text,
+  removeButtons = false
+) {
+  if (!callbackId) return;
+
+  const body = removeButtons
+    ? { message: { text, attachments: [] } }
+    : {};
+
+  try {
+    await maxRequest(
+      `/answers?callback_id=${encodeURIComponent(callbackId)}`,
+      "POST",
+      body
+    );
+  } catch (error) {
+    console.error("CALLBACK ANSWER ERROR:", error.message);
+  }
+}
+
+// ---------- База ----------
+// Прежние таблицы, каналы и ссылки сохраняются.
 
 async function initDatabase() {
   await pool.query(`
@@ -40,9 +307,7 @@ async function initDatabase() {
       last_name TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-  `);
 
-  await pool.query(`
     CREATE TABLE IF NOT EXISTS channels (
       id BIGSERIAL PRIMARY KEY,
       max_chat_id BIGINT UNIQUE NOT NULL,
@@ -53,17 +318,13 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-  `);
 
-  await pool.query(`
     CREATE TABLE IF NOT EXISTS proposal_sessions (
       max_user_id BIGINT PRIMARY KEY,
       channel_id BIGINT NOT NULL REFERENCES channels(id),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-  `);
 
-  await pool.query(`
     CREATE TABLE IF NOT EXISTS submissions (
       id BIGSERIAL PRIMARY KEY,
       channel_id BIGINT NOT NULL REFERENCES channels(id),
@@ -72,94 +333,200 @@ async function initDatabase() {
       status TEXT NOT NULL DEFAULT 'new',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    ALTER TABLE submissions
+      ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+
+    ALTER TABLE submissions
+      ADD COLUMN IF NOT EXISTS owner_forward_mid TEXT;
+
+    ALTER TABLE submissions
+      ADD COLUMN IF NOT EXISTS controls_mid TEXT;
+
+    ALTER TABLE submissions
+      ADD COLUMN IF NOT EXISTS published_mid TEXT;
+
+    ALTER TABLE submissions
+      ADD COLUMN IF NOT EXISTS last_error TEXT;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS ep_submission_dedupe
+      ON submissions(dedupe_key);
+
+    CREATE TABLE IF NOT EXISTS ep_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ep_webhook_jobs (
+      id BIGSERIAL PRIMARY KEY,
+      event_key TEXT UNIQUE NOT NULL,
+      payload JSONB NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      locked_at TIMESTAMPTZ,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 
   console.log("DATABASE READY");
 }
 
-function createProposalCode() {
-  return crypto.randomBytes(12).toString("hex");
-}
-
-// ======================================================
-// MAX API
-// ======================================================
-
-async function maxRequest(path, options = {}) {
-  const response = await fetch(
-    `https://platform-api2.max.ru${path}`,
-    {
-      ...options,
-      headers: {
-        Authorization: MAX_BOT_TOKEN,
-        "Content-Type": "application/json",
-        ...(options.headers || {})
-      }
-    }
+async function checkAdministrator(chatId, userId) {
+  const result = await maxRequest(
+    `/chats/${encodeURIComponent(chatId)}/members/admins`
   );
 
-  const text = await response.text();
+  const member = result.members?.find(
+    x => String(x.user_id) === String(userId)
+  );
 
-  if (!response.ok) {
-    throw new Error(
-      `MAX API ${response.status}: ${text}`
-    );
+  return Boolean(
+    member && (member.is_owner || member.is_admin)
+  );
+}
+
+// ---------- Подключение канала ----------
+
+async function handleBotAdded(update) {
+  if (update.is_channel !== true) return;
+
+  const chatId = update.chat_id;
+  const user = update.user;
+  const userId = user?.user_id ?? update.user_id;
+
+  if (chatId == null || userId == null) return;
+
+  const channel = await maxRequest(`/chats/${chatId}`);
+
+  if (!(await checkAdministrator(chatId, userId))) {
+    console.log("CHANNEL CONNECT DENIED");
+    return;
   }
 
-  return text ? JSON.parse(text) : {};
-}
-
-async function sendToUser(userId, body) {
-  return maxRequest(
-    `/messages?user_id=${encodeURIComponent(userId)}`,
-    {
-      method: "POST",
-      body: JSON.stringify(body)
-    }
+  const existing = await pool.query(
+    "SELECT owner_user_id FROM channels WHERE max_chat_id = $1",
+    [chatId]
   );
-}
 
-async function sendToChannel(chatId, body) {
-  return maxRequest(
-    `/messages?chat_id=${encodeURIComponent(chatId)}`,
-    {
-      method: "POST",
-      body: JSON.stringify(body)
-    }
-  );
-}
+  // Повторное добавление другим администратором
+  // не передаёт ему аккаунт канала.
+  if (
+    existing.rowCount &&
+    String(existing.rows[0].owner_user_id) !== String(userId)
+  ) {
+    await notify(
+      userId,
+      "Этот канал уже связан с другим аккаунтом EveryPost."
+    );
+    return;
+  }
 
-// ВАЖНО:
-// MAX не разрешает attachments одновременно с forward.
-// Поэтому оригинал пересылаем отдельным сообщением.
-async function forwardToUser(userId, mid, extraText = null) {
-  return sendToUser(userId, {
-    text: extraText,
-    link: {
-      type: "forward",
-      mid
-    }
-  });
-}
+  await pool.query(`
+    INSERT INTO users(max_user_id, first_name, last_name)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (max_user_id)
+    DO UPDATE SET
+      first_name = EXCLUDED.first_name,
+      last_name = EXCLUDED.last_name
+  `, [
+    userId,
+    user?.first_name ?? null,
+    user?.last_name ?? null
+  ]);
 
-async function forwardToChannel(chatId, mid) {
-  return sendToChannel(chatId, {
-    link: {
-      type: "forward",
-      mid
-    }
-  });
-}
+  const saved = await pool.query(`
+    INSERT INTO channels(
+      max_chat_id,
+      owner_user_id,
+      title,
+      proposal_code
+    )
+    VALUES ($1, $2, $3, $4)
 
-async function sendSubmissionControls(
-  ownerUserId,
-  submissionId,
-  channelTitle
-) {
-  return sendToUser(ownerUserId, {
+    ON CONFLICT (max_chat_id)
+    DO UPDATE SET
+      title = EXCLUDED.title,
+      active = TRUE,
+      updated_at = NOW()
+
+    RETURNING *
+  `, [
+    chatId,
+    userId,
+    channel.title || "Без названия",
+    crypto.randomBytes(12).toString("hex")
+  ]);
+
+  const row = saved.rows[0];
+
+  await sendToUser(userId, {
     text:
-      `Предложка #${submissionId}\n` +
-      `Канал: «${channelTitle}»`,
+      `✅ Канал «${row.title}» подключён.\n\n` +
+      `📥 Ссылка для предложки:\n` +
+      `https://max.ru/${BOT_USERNAME}?start=${row.proposal_code}`
+  });
+
+  console.log("CHANNEL SAVED:", chatId);
+}
+
+// ---------- Открытие ссылки предложки ----------
+
+async function handleStart(update) {
+  const userId = update.user?.user_id;
+
+  if (userId == null) return;
+
+  const result = await pool.query(`
+    SELECT id, title
+    FROM channels
+    WHERE proposal_code = $1 AND active = TRUE
+  `, [
+    typeof update.payload === "string" ? update.payload : ""
+  ]);
+
+  if (!result.rowCount) {
+    await pool.query(
+      "DELETE FROM proposal_sessions WHERE max_user_id = $1",
+      [userId]
+    );
+
+    await notify(
+      userId,
+      "Откройте ссылку «Предложить новость» из нужного канала."
+    );
+    return;
+  }
+
+  const channel = result.rows[0];
+
+  await pool.query(`
+    INSERT INTO proposal_sessions(max_user_id, channel_id)
+    VALUES ($1, $2)
+
+    ON CONFLICT (max_user_id)
+    DO UPDATE SET
+      channel_id = EXCLUDED.channel_id,
+      updated_at = NOW()
+  `, [userId, channel.id]);
+
+  await notify(
+    userId,
+    `📥 Предложка для канала «${channel.title}».\n` +
+    `Отправьте текст, фото или видео.`
+  );
+
+  console.log("PROPOSAL SESSION STARTED:", channel.id);
+}
+
+// ---------- Карточка администратора ----------
+
+function controlsBody(submissionId, title) {
+  return {
+    text:
+      `📥 Предложка #${submissionId}\n` +
+      `Канал: «${title}»`,
     attachments: [
       {
         type: "inline_keyboard",
@@ -181,614 +548,502 @@ async function sendSubmissionControls(
         }
       }
     ]
-  });
+  };
 }
 
-// ======================================================
-// HEALTH CHECK
-// ======================================================
+// ---------- Получение предложки ----------
+
+async function handleMessage(update) {
+  const message = update.message;
+  const sender = message?.sender;
+  const mid = message?.body?.mid;
+
+  if (
+    !sender ||
+    sender.is_bot ||
+    sender.user_id == null ||
+    !mid
+  ) {
+    return;
+  }
+
+  const chatType = message.recipient?.chat_type;
+
+  // Публикации канала и сообщения бота
+  // не превращаем обратно в предложки.
+  if (chatType && chatType !== "dialog") return;
+
+  // При повторной доставке используем уже сохранённый
+  // канал, а не новую сессию пользователя.
+  let found = await pool.query(`
+    SELECT
+      s.*,
+      c.title,
+      c.owner_user_id,
+      c.max_chat_id,
+      c.active
+    FROM submissions s
+    JOIN channels c ON c.id = s.channel_id
+    WHERE s.max_message_id = $1
+    ORDER BY s.id
+    LIMIT 1
+  `, [mid]);
+
+  if (!found.rowCount) {
+    const sessionResult = await pool.query(`
+      SELECT ps.channel_id
+      FROM proposal_sessions ps
+      JOIN channels c ON c.id = ps.channel_id
+      WHERE ps.max_user_id = $1
+        AND c.active = TRUE
+    `, [sender.user_id]);
+
+    if (!sessionResult.rowCount) {
+      await notify(
+        sender.user_id,
+        "Откройте ссылку предложки из нужного канала " +
+        "и отправьте сообщение ещё раз."
+      );
+      return;
+    }
+
+    const saved = await pool.query(`
+      INSERT INTO submissions(
+        channel_id,
+        sender_user_id,
+        max_message_id,
+        dedupe_key
+      )
+      VALUES ($1, $2, $3, $3)
+
+      ON CONFLICT (dedupe_key)
+      DO UPDATE SET dedupe_key = EXCLUDED.dedupe_key
+
+      RETURNING *
+    `, [
+      sessionResult.rows[0].channel_id,
+      sender.user_id,
+      mid
+    ]);
+
+    found = await pool.query(`
+      SELECT
+        s.*,
+        c.title,
+        c.owner_user_id,
+        c.max_chat_id,
+        c.active
+      FROM submissions s
+      JOIN channels c ON c.id = s.channel_id
+      WHERE s.id = $1
+    `, [saved.rows[0].id]);
+  }
+
+  const submission = found.rows[0];
+
+  if (!submission || !submission.active) return;
+  if (submission.status !== "new") return;
+
+  console.log("SUBMISSION SAVED:", submission.id);
+
+  // Проверяем действующие права получателя,
+  // а не только старую запись в базе.
+  if (!(await checkAdministrator(
+    submission.max_chat_id,
+    submission.owner_user_id
+  ))) {
+    throw new Error(
+      "Channel account no longer has administrator rights"
+    );
+  }
+
+  // Первое сообщение: чистая пересылка оригинала.
+  if (!submission.owner_forward_mid) {
+    const forwarded = await forwardMessage(
+      "user_id",
+      submission.owner_user_id,
+      mid
+    );
+
+    await pool.query(`
+      UPDATE submissions
+      SET owner_forward_mid = $2
+      WHERE id = $1
+    `, [submission.id, messageId(forwarded)]);
+  }
+
+  // Второе сообщение: название канала и кнопки.
+  if (!submission.controls_mid) {
+    const controls = await sendToUser(
+      submission.owner_user_id,
+      controlsBody(submission.id, submission.title)
+    );
+
+    await pool.query(`
+      UPDATE submissions
+      SET controls_mid = $2
+      WHERE id = $1
+    `, [submission.id, messageId(controls)]);
+
+    await notify(
+      sender.user_id,
+      "✅ Предложка передана администратору."
+    );
+  }
+
+  console.log("SUBMISSION SENT TO OWNER:", submission.id);
+}
+
+// ---------- Нажатие кнопок ----------
+
+async function handleCallback(update) {
+  const callback = update.callback;
+  const userId = callback?.user?.user_id;
+
+  const match = typeof callback?.payload === "string"
+    ? callback.payload.match(/^(publish|reject)_(\d+)$/)
+    : null;
+
+  if (!match || userId == null) return;
+
+  const [, action, id] = match;
+
+  const result = await pool.query(`
+    SELECT
+      s.*,
+      c.max_chat_id,
+      c.owner_user_id,
+      c.title,
+      c.active
+    FROM submissions s
+    JOIN channels c ON c.id = s.channel_id
+    WHERE s.id = $1
+  `, [id]);
+
+  if (!result.rowCount) return;
+
+  const row = result.rows[0];
+
+  if (String(row.owner_user_id) !== String(userId)) {
+    await answerCallback(callback.callback_id);
+    console.log("UNAUTHORIZED CALLBACK");
+    return;
+  }
+
+  if (
+    !row.active ||
+    !(await checkAdministrator(row.max_chat_id, userId))
+  ) {
+    await notify(
+      userId,
+      "Канал отключён или у вас больше нет прав администратора."
+    );
+    return;
+  }
+
+  if (row.status !== "new") {
+    await notify(
+      userId,
+      `Предложка #${id}: ${row.status}. ` +
+      `Повторная публикация не выполнена.`
+    );
+
+    await answerCallback(callback.callback_id);
+    return;
+  }
+
+  // Отклонение.
+  if (action === "reject") {
+    const changed = await pool.query(`
+      UPDATE submissions
+      SET status = 'rejected'
+      WHERE id = $1 AND status = 'new'
+      RETURNING id
+    `, [id]);
+
+    if (!changed.rowCount) return;
+
+    await answerCallback(
+      callback.callback_id,
+      `🗑 Предложка #${id} отклонена.`,
+      true
+    );
+
+    console.log("SUBMISSION REJECTED:", id);
+    return;
+  }
+
+  // Атомарный переход:
+  // два нажатия не запускают две публикации.
+  const claimed = await pool.query(`
+    UPDATE submissions
+    SET status = 'publishing'
+    WHERE id = $1 AND status = 'new'
+    RETURNING id
+  `, [id]);
+
+  if (!claimed.rowCount) return;
+
+  let accepted = false;
+
+  try {
+    const published = await forwardMessage(
+      "chat_id",
+      row.max_chat_id,
+      row.max_message_id
+    );
+
+    accepted = true;
+
+    await pool.query(`
+      UPDATE submissions
+      SET
+        status = 'published',
+        published_mid = $2,
+        last_error = NULL
+      WHERE id = $1
+    `, [id, messageId(published)]);
+  } catch (error) {
+    // При тайм-ауте нельзя знать, создал ли MAX пост.
+    // Не повторяем публикацию вслепую.
+    const definiteRejection =
+      !accepted &&
+      error.status >= 400 &&
+      error.status < 500;
+
+    await pool.query(`
+      UPDATE submissions
+      SET status = $2, last_error = $3
+      WHERE id = $1
+    `, [
+      id,
+      definiteRejection ? "new" : "needs_check",
+      error.message.slice(0, 1000)
+    ]);
+
+    await notify(
+      userId,
+      definiteRejection
+        ? `Не удалось опубликовать предложку #${id}. ` +
+          `Она сохранена. Ошибка есть в Logs.`
+        : `Статус публикации #${id} не подтверждён. ` +
+          `Проверьте канал: повторная отправка остановлена, ` +
+          `чтобы не создать дубль.`
+    );
+
+    console.error("PUBLISH ERROR:", error.message);
+    return;
+  }
+
+  await answerCallback(
+    callback.callback_id,
+    `✅ Предложка #${id} опубликована в канале «${row.title}».`,
+    true
+  );
+
+  await notify(
+    userId,
+    `✅ Предложка #${id} опубликована в канале «${row.title}».`
+  );
+
+  console.log("SUBMISSION PUBLISHED:", id);
+}
+
+// ---------- Обработка событий ----------
+
+async function handleUpdate(update) {
+  console.log("UPDATE TYPE:", update.update_type);
+
+  switch (update.update_type) {
+    case "bot_added":
+      return handleBotAdded(update);
+
+    case "bot_started":
+      return handleStart(update);
+
+    case "message_created":
+      return handleMessage(update);
+
+    case "message_callback":
+      return handleCallback(update);
+
+    case "bot_removed":
+      await pool.query(`
+        UPDATE channels
+        SET active = FALSE, updated_at = NOW()
+        WHERE max_chat_id = $1
+      `, [update.chat_id]);
+      return;
+  }
+}
+
+// ---------- Webhook ----------
+// Подтверждаем получение только после записи события в БД.
 
 app.get("/", (req, res) => {
-  res.status(200).json({
+  res.status(ready ? 200 : 503).json({
     service: "EveryPost MAX",
-    status: "running"
+    version: VERSION,
+    status: ready ? "running" : "starting"
   });
 });
 
-// ======================================================
-// WEBHOOK
-// ======================================================
-
 app.post("/webhook", async (req, res) => {
-  // MAX сразу получает 200 OK.
-  res.sendStatus(200);
+  const received = Buffer.from(
+    req.get("X-Max-Bot-Api-Secret") || ""
+  );
+  const expected = Buffer.from(SECRET);
+
+  if (
+    received.length !== expected.length ||
+    !crypto.timingSafeEqual(received, expected)
+  ) {
+    return res.sendStatus(403);
+  }
+
+  const update = req.body;
+
+  if (!update || typeof update.update_type !== "string") {
+    return res.sendStatus(400);
+  }
+
+  const identity =
+    update.update_type === "message_created"
+      ? update.message?.body?.mid
+      : update.update_type === "message_callback"
+        ? update.callback?.callback_id
+        : null;
+
+  const key = crypto.createHash("sha256")
+    .update(
+      identity
+        ? `${update.update_type}:${identity}`
+        : JSON.stringify(update)
+    )
+    .digest("hex");
 
   try {
-    const update = req.body;
-
-    console.log(
-      "UPDATE TYPE:",
-      update.update_type
-    );
-
-    // ==================================================
-    // 1. EVERYPOST ДОБАВИЛИ В КАНАЛ
-    // ==================================================
-
-    if (
-      update.update_type === "bot_added" &&
-      update.is_channel === true
-    ) {
-      const chatId = update.chat_id;
-      const user = update.user;
-      const ownerUserId = user?.user_id;
-
-      if (!chatId || !ownerUserId) {
-        console.log(
-          "BOT_ADDED WITHOUT CHAT OR USER"
-        );
-        return;
-      }
-
-      const channel = await maxRequest(
-        `/chats/${chatId}`
-      );
-
-      const title =
-        channel.title ??
-        channel.name ??
-        "Без названия";
-
-      // Сохраняем владельца.
-      await pool.query(
-        `
-        INSERT INTO users (
-          max_user_id,
-          first_name,
-          last_name
-        )
-        VALUES ($1, $2, $3)
-        ON CONFLICT (max_user_id)
-        DO UPDATE SET
-          first_name = EXCLUDED.first_name,
-          last_name = EXCLUDED.last_name
-        `,
-        [
-          ownerUserId,
-          user?.first_name ?? null,
-          user?.last_name ?? null
-        ]
-      );
-
-      // Если канал уже существовал,
-      // сохраняем его старый proposal_code.
-      const existing = await pool.query(
-        `
-        SELECT proposal_code
-        FROM channels
-        WHERE max_chat_id = $1
-        `,
-        [chatId]
-      );
-
-      const proposalCode =
-        existing.rows[0]?.proposal_code ??
-        createProposalCode();
-
-      await pool.query(
-        `
-        INSERT INTO channels (
-          max_chat_id,
-          owner_user_id,
-          title,
-          proposal_code,
-          active,
-          updated_at
-        )
-        VALUES ($1, $2, $3, $4, TRUE, NOW())
-
-        ON CONFLICT (max_chat_id)
-        DO UPDATE SET
-          owner_user_id = EXCLUDED.owner_user_id,
-          title = EXCLUDED.title,
-          active = TRUE,
-          updated_at = NOW()
-        `,
-        [
-          chatId,
-          ownerUserId,
-          title,
-          proposalCode
-        ]
-      );
-
-      const proposalLink =
-        `https://max.ru/${BOT_USERNAME}` +
-        `?start=${proposalCode}`;
-
-      await sendToUser(ownerUserId, {
-        text:
-          `✅ Канал «${title}» подключён к EveryPost.\n\n` +
-          `📥 Ссылка для предложки:\n` +
-          `${proposalLink}\n\n` +
-          `Разместите её в канале. ` +
-          `Подписчики смогут отправлять текст, фото и видео.`
-      });
-
-      console.log(
-        "CHANNEL SAVED:",
-        chatId
-      );
-
-      console.log(
-        "PROPOSAL LINK SENT"
-      );
-
-      return;
-    }
-
-    // ==================================================
-    // 2. ПОДПИСЧИК ОТКРЫЛ ПЕРСОНАЛЬНУЮ ССЫЛКУ
-    // ==================================================
-
-    if (update.update_type === "bot_started") {
-      const userId =
-        update.user?.user_id;
-
-      const payload =
-        update.payload;
-
-      if (!userId || !payload) {
-        console.log(
-          "BOT STARTED WITHOUT PAYLOAD"
-        );
-        return;
-      }
-
-      const result = await pool.query(
-        `
-        SELECT
-          id,
-          title
-        FROM channels
-        WHERE proposal_code = $1
-          AND active = TRUE
-        `,
-        [payload]
-      );
-
-      if (result.rowCount === 0) {
-        await sendToUser(userId, {
-          text:
-            "Эта ссылка предложки недействительна."
-        });
-
-        return;
-      }
-
-      const channel =
-        result.rows[0];
-
-      // Запоминаем:
-      // этот пользователь сейчас отправляет
-      // предложку именно в этот канал.
-      await pool.query(
-        `
-        INSERT INTO proposal_sessions (
-          max_user_id,
-          channel_id,
-          updated_at
-        )
-        VALUES ($1, $2, NOW())
-
-        ON CONFLICT (max_user_id)
-        DO UPDATE SET
-          channel_id = EXCLUDED.channel_id,
-          updated_at = NOW()
-        `,
-        [
-          userId,
-          channel.id
-        ]
-      );
-
-      await sendToUser(userId, {
-        text:
-          `📥 Предложка для канала ` +
-          `«${channel.title}».\n\n` +
-          `Отправьте сюда текст, фото или видео.`
-      });
-
-      console.log(
-        "PROPOSAL SESSION STARTED:",
-        userId,
-        "CHANNEL:",
-        channel.id
-      );
-
-      return;
-    }
-
-    // ==================================================
-    // 3. ПОЛУЧИЛИ ПРЕДЛОЖКУ
-    // ==================================================
-
-    if (
-      update.update_type ===
-      "message_created"
-    ) {
-      const message =
-        update.message;
-
-      const senderUserId =
-        message?.sender?.user_id;
-
-      const mid =
-        message?.body?.mid;
-
-      if (
-        !senderUserId ||
-        !mid
-      ) {
-        console.log(
-          "MESSAGE WITHOUT USER OR MID"
-        );
-
-        return;
-      }
-
-      // Проверяем, есть ли у пользователя
-      // активная сессия предложки.
-      const sessionResult =
-        await pool.query(
-          `
-          SELECT
-            ps.channel_id,
-            c.title,
-            c.owner_user_id,
-            c.max_chat_id
-          FROM proposal_sessions ps
-
-          JOIN channels c
-            ON c.id = ps.channel_id
-
-          WHERE ps.max_user_id = $1
-            AND c.active = TRUE
-          `,
-          [senderUserId]
-        );
-
-      if (
-        sessionResult.rowCount === 0
-      ) {
-        console.log(
-          "MESSAGE WITHOUT PROPOSAL SESSION:",
-          senderUserId
-        );
-
-        return;
-      }
-
-      const session =
-        sessionResult.rows[0];
-
-      // Сохраняем предложку.
-      const saved =
-        await pool.query(
-          `
-          INSERT INTO submissions (
-            channel_id,
-            sender_user_id,
-            max_message_id,
-            status
-          )
-          VALUES (
-            $1,
-            $2,
-            $3,
-            'new'
-          )
-          RETURNING id
-          `,
-          [
-            session.channel_id,
-            senderUserId,
-            mid
-          ]
-        );
-
-      const submissionId =
-        saved.rows[0].id;
-
-      console.log(
-        "SUBMISSION SAVED:",
-        submissionId
-      );
-
-      // Подписчику подтверждение.
-      await sendToUser(
-        senderUserId,
-        {
-          text:
-            "✅ Предложка получена."
-        }
-      );
-
-      // 1. Отдельно пересылаем оригинал владельцу.
-      await forwardToUser(
-        session.owner_user_id,
-        mid,
-        `📥 Новая предложка\n` +
-        `Канал: «${session.title}»`
-      );
-
-      // 2. Отдельным сообщением отправляем кнопки.
-      // Так мы не смешиваем forward и attachments.
-      await sendSubmissionControls(
-        session.owner_user_id,
-        submissionId,
-        session.title
-      );
-
-      console.log(
-        "SUBMISSION SENT TO OWNER:",
-        submissionId
-      );
-
-      return;
-    }
-
-    // ==================================================
-    // 4. ВЛАДЕЛЕЦ НАЖАЛ КНОПКУ
-    // ==================================================
-
-    if (
-      update.update_type ===
-      "message_callback"
-    ) {
-      const callback =
-        update.callback;
-
-      const payload =
-        callback?.payload;
-
-      const actorUserId =
-        callback?.user?.user_id ??
-        update.user?.user_id;
-
-      if (
-        !payload ||
-        !actorUserId
-      ) {
-        console.log(
-          "CALLBACK WITHOUT PAYLOAD OR USER"
-        );
-
-        return;
-      }
-
-      const match =
-        payload.match(
-          /^(publish|reject)_(\d+)$/
-        );
-
-      if (!match) {
-        console.log(
-          "UNKNOWN CALLBACK:",
-          payload
-        );
-
-        return;
-      }
-
-      const action =
-        match[1];
-
-      const submissionId =
-        match[2];
-
-      const result =
-        await pool.query(
-          `
-          SELECT
-            s.id,
-            s.status,
-            s.max_message_id,
-            c.max_chat_id,
-            c.owner_user_id,
-            c.title
-          FROM submissions s
-
-          JOIN channels c
-            ON c.id = s.channel_id
-
-          WHERE s.id = $1
-          `,
-          [submissionId]
-        );
-
-      if (
-        result.rowCount === 0
-      ) {
-        console.log(
-          "SUBMISSION NOT FOUND:",
-          submissionId
-        );
-
-        return;
-      }
-
-      const submission =
-        result.rows[0];
-
-      // Нажимать кнопки может
-      // только владелец этого канала.
-      if (
-        String(
-          submission.owner_user_id
-        ) !==
-        String(actorUserId)
-      ) {
-        console.log(
-          "UNAUTHORIZED CALLBACK:",
-          actorUserId
-        );
-
-        return;
-      }
-
-      // Защита от повторного нажатия.
-      if (
-        submission.status !==
-        "new"
-      ) {
-        await sendToUser(
-          actorUserId,
-          {
-            text:
-              `Эта предложка уже обработана.\n` +
-              `Статус: ${submission.status}`
-          }
-        );
-
-        return;
-      }
-
-      // ----------------------------------------------
-      // ОТКЛОНИТЬ
-      // ----------------------------------------------
-
-      if (
-        action ===
-        "reject"
-      ) {
-        await pool.query(
-          `
-          UPDATE submissions
-          SET status = 'rejected'
-          WHERE id = $1
-          `,
-          [submissionId]
-        );
-
-        await sendToUser(
-          actorUserId,
-          {
-            text:
-              `🗑 Предложка #${submissionId} ` +
-              `отклонена.`
-          }
-        );
-
-        console.log(
-          "SUBMISSION REJECTED:",
-          submissionId
-        );
-
-        return;
-      }
-
-      // ----------------------------------------------
-      // ОПУБЛИКОВАТЬ
-      // ----------------------------------------------
-
-      if (
-        action ===
-        "publish"
-      ) {
-        await forwardToChannel(
-          submission.max_chat_id,
-          submission.max_message_id
-        );
-
-        await pool.query(
-          `
-          UPDATE submissions
-          SET status = 'published'
-          WHERE id = $1
-          `,
-          [submissionId]
-        );
-
-        await sendToUser(
-          actorUserId,
-          {
-            text:
-              `✅ Предложка #${submissionId} ` +
-              `опубликована в канале ` +
-              `«${submission.title}».`
-          }
-        );
-
-        console.log(
-          "SUBMISSION PUBLISHED:",
-          submissionId
-        );
-
-        return;
-      }
-    }
-
-    // ==================================================
-    // 5. БОТА УДАЛИЛИ ИЗ КАНАЛА
-    // ==================================================
-
-    if (
-      update.update_type ===
-      "bot_removed" &&
-      update.chat_id
-    ) {
-      await pool.query(
-        `
-        UPDATE channels
-        SET
-          active = FALSE,
-          updated_at = NOW()
-        WHERE max_chat_id = $1
-        `,
-        [update.chat_id]
-      );
-
-      console.log(
-        "CHANNEL DISABLED:",
-        update.chat_id
-      );
-
-      return;
-    }
-
+    await pool.query(`
+      INSERT INTO ep_webhook_jobs(event_key, payload)
+      VALUES ($1, $2::jsonb)
+      ON CONFLICT (event_key) DO NOTHING
+    `, [key, JSON.stringify(update)]);
+
+    res.sendStatus(200);
+    void runWorker();
   } catch (error) {
-    console.error(
-      "Webhook error:",
-      error
-    );
+    console.error("WEBHOOK SAVE ERROR:", error.message);
+    res.sendStatus(503);
   }
 });
 
-// ======================================================
-// START
-// ======================================================
+// ---------- Очередь обработки ----------
 
-async function start() {
+async function runWorker() {
+  if (!ready || workerBusy) return;
+
+  workerBusy = true;
+  let job;
+
   try {
-    await initDatabase();
+    const result = await pool.query(`
+      UPDATE ep_webhook_jobs
+      SET
+        state = 'processing',
+        locked_at = NOW(),
+        attempts = attempts + 1
+      WHERE id = (
+        SELECT id
+        FROM ep_webhook_jobs
+        WHERE
+          (state = 'pending' AND next_at <= NOW())
+          OR
+          (
+            state = 'processing'
+            AND locked_at < NOW() - INTERVAL '5 minutes'
+          )
+        ORDER BY id
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING *
+    `);
 
-    app.listen(
-      PORT,
-      () => {
-        console.log(
-          `EveryPost MAX started on port ${PORT}`
-        );
-      }
-    );
+    job = result.rows[0];
+
+    if (!job) return;
+
+    await handleUpdate(job.payload);
+
+    await pool.query(`
+      UPDATE ep_webhook_jobs
+      SET state = 'done', last_error = NULL
+      WHERE id = $1
+    `, [job.id]);
   } catch (error) {
-    console.error(
-      "STARTUP ERROR:",
-      error
-    );
+    console.error("Webhook error:", error.message);
 
-    process.exit(1);
+    if (job) {
+      await pool.query(`
+        UPDATE ep_webhook_jobs
+        SET
+          state = $2,
+          last_error = $3,
+          next_at = NOW() + INTERVAL '30 seconds'
+        WHERE id = $1
+      `, [
+        job.id,
+        job.attempts >= 3 ? "failed" : "pending",
+        error.message.slice(0, 1000)
+      ]).catch(e => {
+        console.error("JOB SAVE ERROR:", e.message);
+      });
+    }
+  } finally {
+    workerBusy = false;
   }
 }
 
-start();
+// ---------- Настройка подписки без Terminal ----------
+
+async function registerWebhook() {
+  try {
+    await maxRequest("/subscriptions", "POST", {
+      url: WEBHOOK_URL,
+      update_types: [
+        "message_created",
+        "message_callback",
+        "bot_started",
+        "bot_added",
+        "bot_removed"
+      ],
+      secret: SECRET
+    });
+
+    console.log("WEBHOOK READY");
+  } catch (error) {
+    console.error("WEBHOOK SETUP ERROR:", error.message);
+    setTimeout(registerWebhook, 30000).unref();
+  }
+}
+
+// ---------- Запуск ----------
+
+async function start() {
+  await initDatabase();
+  ready = true;
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`EveryPost ${VERSION} started on port ${PORT}`);
+    void registerWebhook();
+  });
+
+  setInterval(() => {
+    void runWorker();
+  }, 700).unref();
+}
+
+start().catch(error => {
+  console.error("STARTUP ERROR:", error.message);
+  process.exit(1);
+});
