@@ -11,7 +11,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "channel-admins-1";
+const VERSION = "channel-admins-2";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -176,10 +176,22 @@ async function notify(userId, text) {
   catch (error) { console.error("NOTIFICATION ERROR:", error.message); }
 }
 async function answerCallback(callbackId, text, removeButtons = false) {
-  if (!callbackId) return;
-  const body = removeButtons ? { message: { text, attachments: [] } } : {};
-  try { await queueMaxWrite(`/answers?callback_id=${encodeURIComponent(callbackId)}`, "POST", body); }
-  catch (error) { console.error("CALLBACK ANSWER ERROR:", error.message); }
+  // MAX отклоняет пустой ответ {}: нужен message или notification.
+  // Уведомление подтверждает только нажатие, а не успех публикации.
+  if (typeof callbackId !== "string" || !callbackId.trim()) return;
+  const replyText = typeof text === "string" ? text.trim() : "";
+  const body = removeButtons
+    ? { message: { text: replyText || "Действие завершено.", attachments: [] } }
+    : { notification: replyText || "Обрабатываю…" };
+  try {
+    await queueMaxWrite(
+      `/answers?callback_id=${encodeURIComponent(callbackId)}`, "POST", body
+    );
+  } catch (error) {
+    // Ошибка ответа на кнопку не меняет статус публикации
+    // и не запускает повторную отправку материала в канал.
+    console.error("CALLBACK ANSWER ERROR:", error.message);
+  }
 }
 
 // ---------- База: прежние таблицы и записи сохраняются ----------
