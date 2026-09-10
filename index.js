@@ -5,7 +5,9 @@ import https from "node:https";
 import tls from "node:tls";
 
 // EveryPost: предложка, анонимная публикация, редактор, права, черновики и расписание.
-// Версия schedule-2. Системный планировщик работает только при запущенном процессе.
+// Версия formatting-1. Автоподписи и URL-кнопки, настройки отдельно от контента.
+// Исходный материал и оформленный body хранятся отдельно. Отложенные сохраняют снимок.
+// Основа: schedule-2. Системный планировщик работает только при запущенном процессе.
 // На Free нет гарантии отправки в срок. Просроченные >5 минут задания удерживаются.
 // Черновики сохраняются в PostgreSQL. Медиа остаются вложениями MAX по токенам;
 // эта версия не создаёт собственную бессрочную резервную копию медиафайлов.
@@ -16,7 +18,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "schedule-2";
+const VERSION = "formatting-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -198,6 +200,416 @@ async function answerCallback(callbackId, text, removeButtons = false) {
     console.error("CALLBACK ANSWER ERROR:", error.message);
   }
 }
+
+// ---------- Оформление: база отдельно от готового сообщения ----------
+// Снимок настроек принадлежит конкретному посту. Мы не дописываем подпись
+// к уже оформленному body и не меняем body_snapshot отложенных публикаций.
+const MAX_CUSTOM_LINKS = 8; // Ограничение интерфейса EveryPost, не лимит MAX.
+const SIGNATURE_LIMIT = 700;
+const emptyPostStyle = () => ({ signature: null, signature_on: false,
+  proposal_on: false, proposal_url: null, buttons: [] });
+const copyJson = value => JSON.parse(JSON.stringify(value));
+
+function normalizedLinkUrl(value) {
+  if (typeof value !== "string") throw new Error("Пришлите ссылку текстом.");
+  const text = value.trim();
+  if (!text || text.length > 2048 || /[\s\u0000-\u001f\u007f]/u.test(text)) {
+    throw new Error("Ссылка должна быть без пробелов, не длиннее 2048 символов.");
+  }
+  if (!safeWebUrl(text)) throw new Error("Нужна полная ссылка с https:// или http://, без логина и пароля.");
+  const url = new URL(text);
+  if (!url.hostname) throw new Error("В ссылке отсутствует адрес.");
+  return text;
+}
+function normalizedButtonLabel(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text || [...text].length > 40 || /[\r\n\u0000-\u001f\u007f]/u.test(text)) {
+    throw new Error("Название кнопки: от 1 до 40 символов, одной строкой.");
+  }
+  return text;
+}
+function validateStyle(value) {
+  const s = { ...emptyPostStyle(), ...copyJson(value || {}) };
+  if (s.signature != null) {
+    if (typeof s.signature.text !== "string" || s.signature.text.length > SIGNATURE_LIMIT ||
+        ![undefined, null, "html"].includes(s.signature.format)) {
+      throw new Error("Некорректный формат автоподписи.");
+    }
+  }
+  s.signature_on = s.signature_on === true;
+  s.proposal_on = s.proposal_on === true;
+  if (s.proposal_on) s.proposal_url = normalizedLinkUrl(s.proposal_url);
+  if (!Array.isArray(s.buttons) || s.buttons.length > MAX_CUSTOM_LINKS) {
+    throw new Error(`В этом редакторе доступно до ${MAX_CUSTOM_LINKS} своих кнопок.`);
+  }
+  s.buttons = s.buttons.map(b => ({ text: normalizedButtonLabel(b?.text), url: normalizedLinkUrl(b?.url) }));
+  return s;
+}
+function styleForChannel(channel) {
+  const c = channel.post_style || {};
+  return validateStyle({ signature: c.signature || null,
+    signature_on: c.signature_on === true, proposal_on: c.proposal_on === true,
+    proposal_url: `https://max.ru/${BOT_USERNAME}?start=${encodeURIComponent(channel.proposal_code)}`,
+    buttons: [] });
+}
+function composeStyledPost(base, inputStyle) {
+  if (!base || typeof base !== "object" || Object.hasOwn(base,"link") || Object.hasOwn(base,"sender")) {
+    throw new Error("Нельзя оформить пересылку. Нужен самостоятельный пост.");
+  }
+  const style = validateStyle(inputStyle);
+  const body = copyJson(base);
+  const media = Array.isArray(body.attachments) ? body.attachments : [];
+  if (media.some(a => a?.type === "inline_keyboard")) {
+    throw new Error("В базовом материале уже есть клавиатура. Откройте материал заново.");
+  }
+  if (style.signature_on && style.signature?.text?.trim()) {
+    if (body.format && body.format !== "html") throw new Error("Этот формат текста пока нельзя объединить с подписью.");
+    const formatted = body.format === "html" || style.signature.format === "html";
+    const raw = typeof body.text === "string" ? body.text : "";
+    const main = formatted && body.format !== "html" ? escapeHtml(raw) : raw;
+    const tail = formatted && style.signature.format !== "html" ? escapeHtml(style.signature.text) : style.signature.text;
+    body.text = main ? `${main}\n\n${tail}` : tail;
+    if (formatted) body.format = "html";
+  }
+  if ((body.text || "").length > 4000) {
+    throw new Error("Пост вместе с автоподписью длиннее 4000 символов. Отключите подпись для этого поста или сократите текст.");
+  }
+  const links = [...style.buttons];
+  if (style.proposal_on && !links.some(b => b.url === style.proposal_url)) {
+    links.push({ text: "📥 Предложить новость", url: style.proposal_url });
+  }
+  if (links.length && media.length >= 12) {
+    throw new Error("В посте уже 12 вложений. Для кнопок нужно одно свободное место: отключите кнопки либо оставьте не больше 11 вложений.");
+  }
+  if (links.length && media.some(a => a.type === "sticker")) {
+    throw new Error("Кнопки со стикером в этом редакторе не поддержаны. Уберите кнопки или замените материал.");
+  }
+  if (links.length) body.attachments = [...media, { type: "inline_keyboard", payload: {
+    buttons: links.map(b => [{ type: "link", text: b.text, url: b.url }])
+  }}];
+  if (!body.text?.trim() && !media.length) throw new Error("В посте нет текста или медиа.");
+  return body;
+}
+function styleControls(kind, nonce, style) {
+  const s = style || emptyPostStyle();
+  return [
+    [button(`Подпись: ${s.signature_on && s.signature?.text ? "вкл" : "выкл"}`, `fmt_sig_${kind}_${nonce}`),
+     button(s.buttons?.length ? `🔗 Кнопки: ${s.buttons.length}` : "🔗 Добавить кнопку", `fmt_${s.buttons?.length ? "links" : "add"}_${kind}_${nonce}`)],
+    [button(`Кнопка предложки: ${s.proposal_on ? "вкл" : "выкл"}`, `fmt_prop_${kind}_${nonce}`)]
+  ];
+}
+async function submissionStyle(row) {
+  if (row.post_style) return validateStyle(row.post_style);
+  const channel = await getChannel(row.channel_id);
+  if (!channel) throw new Error("Канал не найден.");
+  const saved = await pool.query(`UPDATE submissions SET post_style=COALESCE(post_style,$2::jsonb)
+    WHERE id=$1 RETURNING post_style`, [row.id,JSON.stringify(styleForChannel(channel))]);
+  if (!saved.rowCount) throw new Error("Предложка не найдена.");
+  return validateStyle(saved.rows[0].post_style);
+}
+async function styledSubmissionBody(row) {
+  return composeStyledPost(buildAnonymousPost(await loadSubmissionSource(row)), await submissionStyle(row));
+}
+
+// ---------- Настройки владельца ----------
+async function showStyleSettings(channelId, userId) {
+  const c = await requireOwner(channelId,userId); if (!c) return;
+  const s = c.post_style || {};
+  if (s.signature?.text) await sendToUser(userId,copyJson(s.signature));
+  await sendToUser(userId,{ text:`Автоподпись · «${shortTitle(c.title)}»\n\n`+
+    (s.signature?.text ? "Выше показана сохранённая подпись." : "Автоподпись ещё не задана.")+"\n"+
+    "Пришлите подпись с нужным оформлением и ссылками через кнопку «Изменить подпись».\n\n"+
+    "Настройки применяются при подготовке новых постов. Существующие черновики, предпросмотры и отложенные не меняются.",
+    attachments:keyboard([
+      [button(s.signature?.text?"✏️ Изменить подпись":"✏️ Добавить подпись",`fmt_chinput_${c.id}_${c.style_version}`)],
+      [button(`Автоподпись: ${s.signature_on?"вкл":"выкл"}`,`fmt_chsig_${c.id}_${c.style_version}_${s.signature_on?0:1}`)],
+      [button(`Кнопка предложки: ${s.proposal_on?"вкл":"выкл"}`,`fmt_chprop_${c.id}_${c.style_version}_${s.proposal_on?0:1}`)],
+      ...(s.signature?.text?[[button("🗑 Удалить подпись",`fmt_chdel_${c.id}_${c.style_version}`)]]:[]),
+      [button("↩️ К каналу",`access_channel_${c.id}`)]
+    ])});
+}
+async function saveChannelStyle(c,userId,next,expectedVersion) {
+  const current=await requireOwner(c.id,userId);if(!current)return false;
+  const result=await pool.query(`UPDATE channels SET post_style=$2::jsonb,style_version=style_version+1,
+    updated_at=NOW() WHERE id=$1 AND style_version=$3 AND owner_user_id=$4 AND active=TRUE RETURNING *`,
+    [c.id,JSON.stringify(next),expectedVersion,userId]);
+  if(!result.rowCount){await notify(userId,"Настройки уже изменились. Откройте «Автоподпись» заново.");return false;}
+  await audit(c.id,userId,"channel_style_changed",null,{signature_on:!!next.signature_on,proposal_on:!!next.proposal_on});
+  return true;
+}
+
+// ---------- Доступ и изменения оформления конкретного предпросмотра ----------
+async function formatTarget(kind,nonce,userId) {
+  if(await getScheduleSession(userId))return null;
+  const session=kind==="p"?await getComposer(userId):await getEditorSession(userId);
+  if(!session||session.nonce!==nonce||session.stage!=="preview")return null;
+  const row=kind==="p"?await getOwnPost(session.post_id):await getSubmission(session.submission_id);
+  if(kind==="p" ? !row||row.status!=="draft"||!(await canUseOwnPost(row,userId)) : !(await canEdit(row,userId)))return null;
+  const access=await channelAccess(row.channel_id,userId,kind==="e"||row.source_submission_id?"moderate":"create");
+  if(!access)return null;
+  return {kind,nonce,userId,session,row,access,
+    base:kind==="p"?(row.base_body||row.body):(session.base_body||session.draft_body),
+    style:validateStyle((kind==="p"?row.post_style:session.post_style)||emptyPostStyle())};
+}
+async function renderFormatTarget(target,force=false) {
+  const current=await formatTarget(target.kind,target.nonce,target.userId);
+  if(!current)return;
+  if(force){
+    if(current.kind==="p")await pool.query("UPDATE ep_posts SET preview_mid=NULL,controls_mid=NULL WHERE id=$1 AND status='draft'",[current.row.id]);
+    else await pool.query("UPDATE ep_editor_sessions SET preview_mid=NULL,controls_mid=NULL WHERE actor_user_id=$1 AND nonce=$2",[current.userId,current.nonce]);
+  }
+  if(current.kind==="p")await showOwnPostPreview(await getComposer(current.userId));
+  else await showDraft(await getEditorSession(current.userId));
+}
+async function changeTargetStyle(target,next,input=null) {
+  const current=await formatTarget(target.kind,target.nonce,target.userId);
+  if(!current||current.access.version!==target.access.version){
+    await notify(target.userId,"Права или предпросмотр изменились. Оформление не сохранено.");return null;
+  }
+  const style=validateStyle(next),body=composeStyledPost(current.base,style),nonce=newEditNonce();
+  const client=await pool.connect();let changed=false;
+  try{
+    await client.query("BEGIN");
+    const table=target.kind==="p"?"ep_composer_sessions":"ep_editor_sessions";
+    const lock=await client.query(`SELECT * FROM ${table} WHERE actor_user_id=$1 AND nonce=$2 AND stage='preview' FOR UPDATE`,[target.userId,target.nonce]);
+    if(lock.rowCount){
+      if(input){
+        const receipt=await client.query(`INSERT INTO ep_style_inputs(max_message_id,actor_user_id)
+          VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING max_message_id`,[input.mid,target.userId]);
+        if(!receipt.rowCount){await client.query("ROLLBACK");return null;}
+      }
+      if(target.kind==="p"){
+        const r=await client.query(`UPDATE ep_posts SET post_style=$2::jsonb,base_body=$3::jsonb,body=$4::jsonb,
+          preview_mid=NULL,controls_mid=NULL,draft_revision=draft_revision+1,updated_at=NOW()
+          WHERE id=$1 AND status='draft' RETURNING id`,[current.row.id,JSON.stringify(style),JSON.stringify(current.base),JSON.stringify(body)]);
+        if(r.rowCount){
+          await client.query("UPDATE ep_composer_sessions SET nonce=$3,updated_at=NOW() WHERE actor_user_id=$1 AND nonce=$2",[target.userId,target.nonce,nonce]);changed=true;
+        }
+      }else{
+        const r=await client.query(`UPDATE ep_editor_sessions SET post_style=$3::jsonb,base_body=$4::jsonb,draft_body=$5::jsonb,
+          nonce=$6,preview_mid=NULL,controls_mid=NULL,updated_at=NOW()
+          WHERE actor_user_id=$1 AND nonce=$2 AND EXISTS(SELECT 1 FROM submissions s WHERE s.id=submission_id AND s.status='new') RETURNING *`,
+          [target.userId,target.nonce,JSON.stringify(style),JSON.stringify(current.base),JSON.stringify(body),nonce]);changed=r.rowCount>0;
+      }
+      if(changed){
+        if(input)await client.query("DELETE FROM ep_style_sessions WHERE actor_user_id=$1 AND nonce=$2",[target.userId,input.formNonce]);
+        await audit(current.row.channel_id,target.userId,"post_style_changed",current.row.id,{kind:target.kind,links:style.buttons.length},client);
+      }
+    }
+    await client.query("COMMIT");
+  }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e;}finally{client.release();}
+  if(!changed){await notify(target.userId,"Предпросмотр устарел. Изменение не применено.");return null;}
+  return formatTarget(target.kind,nonce,target.userId);
+}
+async function showLinks(target) {
+  const t=await formatTarget(target.kind,target.nonce,target.userId);
+  if(!t){await notify(target.userId,"Предпросмотр устарел или права изменились. Откройте /menu.");return;}
+  const links=t.style.buttons;
+  await sendToUser(t.userId,{text:`🔗 Кнопки-ссылки · «${shortTitle(t.row.title)}»\n\n`+
+    (links.length?links.map((b,i)=>`${i+1}. ${b.text}\n${b.url.slice(0,100)}${b.url.length>100?"…":""}`).join("\n\n"):"Своих кнопок пока нет.")+
+    `\n\nКнопка предложки: ${t.style.proposal_on?"вкл":"выкл"}.\nКнопки будут показаны в предпросмотре.`,attachments:keyboard([
+      ...links.map((b,i)=>[button(`✏️ ${b.text.slice(0,20)}`,`fmt_edit_${t.kind}_${t.nonce}_${i}`),button("🗑 Удалить",`fmt_del_${t.kind}_${t.nonce}_${i}`)]),
+      ...(links.length<MAX_CUSTOM_LINKS?[[button("➕ Добавить кнопку",`fmt_add_${t.kind}_${t.nonce}`)]]:[]),
+      [button("👁 К предпросмотру",`fmt_back_${t.kind}_${t.nonce}`)]
+    ])});
+}
+
+// ---------- Короткие формы ввода: не смешиваются с текстом предложки ----------
+async function getStyleInput(userId) {
+  return (await pool.query("SELECT * FROM ep_style_sessions WHERE actor_user_id=$1",[userId])).rows[0]||null;
+}
+async function promptStyleInput(form) {
+  const text=form.stage==="signature"
+    ? `Пришлите подпись одним текстовым сообщением, до ${SIGNATURE_LIMIT} символов с оформлением. Можно выделить текст и вставить ссылки средствами MAX.\nВвод сохранит подпись и включит её для новых постов. HTML-код вручную писать не нужно.`
+    : form.stage==="button_label"
+      ? "Пришлите название кнопки одной строкой, например «Подробнее». До 40 символов."
+      : `Кнопка «${form.label}». Пришлите полную ссылку, начиная с https:// или http://.`;
+  await sendToUser(form.actor_user_id,{text:text+"\n\nОтмена этого ввода: /cancel.",attachments:keyboard([
+    [button("↩️ Отменить ввод",`fmt_inputcancel_${form.nonce}`)]
+  ])});
+}
+async function startStyleInput(c,userId,version,target=null,index=null) {
+  const existing=await getStyleInput(userId);
+  if(existing){await promptStyleInput(existing);return;}
+  if(await getScheduleSession(userId)){await notify(userId,"Сначала завершите выбор времени.");return;}
+  if(!target&&(await getComposer(userId)||await getEditorSession(userId))){
+    await notify(userId,"Сначала сохраните или закройте текущий пост. Настройки подписи канала меняются отдельно.");return;
+  }
+  const access=target?.access||await channelAccess(c.id,userId,"manage");
+  if(!access||(!target&&!access.owner))return;
+  const made=await pool.query(`INSERT INTO ep_style_sessions(actor_user_id,channel_id,nonce,kind,target_id,
+    target_nonce,access_version,stage,button_index,expected_version)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING *`,
+    [userId,c.id,newEditNonce(),target?.kind||"channel",target?.row.id||null,target?.nonce||null,
+      access.version,target?"button_label":"signature",index,version]);
+  if(made.rowCount){
+    await pool.query("DELETE FROM proposal_sessions WHERE max_user_id=$1",[userId]);
+    await promptStyleInput(made.rows[0]);
+  }
+}
+async function cancelStyleInput(form) {
+  await pool.query("DELETE FROM ep_style_sessions WHERE actor_user_id=$1 AND nonce=$2",[form.actor_user_id,form.nonce]);
+  await notify(form.actor_user_id,"Ввод отменён. Оформление не изменено.");
+  if(form.kind==="channel")await showStyleSettings(form.channel_id,form.actor_user_id);
+  else{
+    const t=await formatTarget(form.kind,form.target_nonce,form.actor_user_id);
+    if(t)await renderFormatTarget(t);
+  }
+}
+async function rememberStyleInput(mid,userId) {
+  await pool.query("INSERT INTO ep_style_inputs(max_message_id,actor_user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",[mid,userId]);
+}
+async function handleStyleMessage(message) {
+  const userId=message.sender.user_id,mid=message.body.mid;
+  if((await pool.query("SELECT 1 FROM ep_style_inputs WHERE max_message_id=$1",[mid])).rowCount)return true;
+  const form=await getStyleInput(userId);if(!form)return false;
+  const text=typeof message.body.text==="string"?message.body.text:"";
+  const command=!message.link&&!(message.body.attachments||[]).length?text.trim().toLowerCase():"";
+  if(["/cancel","/отмена"].includes(command)){
+    await rememberStyleInput(mid,userId);await cancelStyleInput(form);return true;
+  }
+  if(new Date(form.expires_at).getTime()<=Date.now()){
+    await rememberStyleInput(mid,userId);
+    await pool.query("DELETE FROM ep_style_sessions WHERE actor_user_id=$1 AND nonce=$2",[userId,form.nonce]);
+    await notify(userId,"Время ввода истекло. Оформление не изменено, сообщение не отправлено в предложку. Откройте /menu.");return true;
+  }
+  let target=null,channel=null;
+  if(form.kind==="channel")channel=await requireOwner(form.channel_id,userId);
+  else target=await formatTarget(form.kind,form.target_nonce,userId);
+  if(form.kind==="channel"?!channel:!target||target.access.version!==Number(form.access_version)){
+    await rememberStyleInput(mid,userId);
+    await pool.query("DELETE FROM ep_style_sessions WHERE actor_user_id=$1 AND nonce=$2",[userId,form.nonce]);
+    await notify(userId,"Права или пост изменились. Ввод закрыт без сохранения. Сообщение не опубликовано.");return true;
+  }
+  if(["/menu","/start","меню"].includes(command)){
+    await rememberStyleInput(mid,userId);await promptStyleInput(form);return true;
+  }
+  try{
+    if(message.link||!text.trim()||(message.body.attachments||[]).some(a=>a?.type!=="share")){
+      throw new Error("На этом шаге нужен обычный текст, без пересылки, фото и видео.");
+    }
+    if(form.stage==="signature"){
+      const r=renderBodyText(message.body);
+      const signature={text:r.formatted?r.html:r.text};if(r.formatted)signature.format="html";
+      if(signature.text.length>SIGNATURE_LIMIT)throw new Error(`Подпись с оформлением длиннее ${SIGNATURE_LIMIT} символов.`);
+      const next={...(channel.post_style||{}),signature,signature_on:true};
+      const client=await pool.connect();let saved=false;
+      try{
+        await client.query("BEGIN");
+        const receipt=await client.query("INSERT INTO ep_style_inputs(max_message_id,actor_user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING max_message_id",[mid,userId]);
+        if(receipt.rowCount){
+          const updated=await client.query(`UPDATE channels SET post_style=$2::jsonb,style_version=style_version+1,updated_at=NOW()
+            WHERE id=$1 AND owner_user_id=$3 AND style_version=$4 AND active=TRUE RETURNING id`,
+            [channel.id,JSON.stringify(next),userId,form.expected_version]);
+          saved=updated.rowCount>0;
+          await client.query("DELETE FROM ep_style_sessions WHERE actor_user_id=$1 AND nonce=$2",[userId,form.nonce]);
+          if(saved)await audit(channel.id,userId,"signature_saved",null,{},client);
+        }
+        await client.query("COMMIT");
+      }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e;}finally{client.release();}
+      await notify(userId,saved?"✅ Автоподпись сохранена и включена для новых постов.":"Настройки уже изменились. Повторите ввод из новой карточки.");
+      await showStyleSettings(channel.id,userId);return true;
+    }
+    if(form.stage==="button_label"){
+      const label=normalizedButtonLabel(text);
+      const client=await pool.connect();let changed;
+      try{
+        await client.query("BEGIN");
+        const receipt=await client.query("INSERT INTO ep_style_inputs(max_message_id,actor_user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING max_message_id",[mid,userId]);
+        if(receipt.rowCount)changed=await client.query("UPDATE ep_style_sessions SET stage='button_url',label=$3 WHERE actor_user_id=$1 AND nonce=$2 AND stage='button_label' RETURNING *",[userId,form.nonce,label]);
+        await client.query("COMMIT");
+      }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e;}finally{client.release();}
+      if(changed?.rowCount)await promptStyleInput(changed.rows[0]);return true;
+    }
+    const url=normalizedLinkUrl(text),next=copyJson(target.style);
+    if(form.button_index==null){
+      if(next.buttons.length>=MAX_CUSTOM_LINKS)throw new Error(`Можно добавить до ${MAX_CUSTOM_LINKS} своих кнопок.`);
+      next.buttons.push({text:form.label,url});
+    }else{
+      if(!next.buttons[Number(form.button_index)])throw new Error("Этой кнопки больше нет.");
+      next.buttons[Number(form.button_index)]={text:form.label,url};
+    }
+    const changed=await changeTargetStyle(target,next,{mid,formNonce:form.nonce});
+    if(changed){await renderFormatTarget(changed);console.log("POST LINK SAVED:",changed.row.id);}
+    return true;
+  }catch(error){
+    // Неверный ввод не становится ни предложкой, ни текстом публикации.
+    await rememberStyleInput(mid,userId);
+    await notify(userId,`${error.message}\nИзменение не применено. Повторите ввод или /cancel.`);
+    return true;
+  }
+}
+async function handleStyleCallback(update) {
+  const cb=update.callback,userId=cb?.user?.user_id,value=typeof cb?.payload==="string"?cb.payload:"";
+  if(userId==null)return false;
+  const form=await getStyleInput(userId);
+  if(form){
+    await answerCallback(cb.callback_id);
+    if(value===`fmt_inputcancel_${form.nonce}`)await cancelStyleInput(form);
+    else if(new Date(form.expires_at).getTime()<=Date.now())await cancelStyleInput(form);
+    else await promptStyleInput(form);
+    return true;
+  }
+  if(!value.startsWith("fmt_"))return false;
+  await answerCallback(cb.callback_id);
+  const timing=await getScheduleSession(userId);
+  if(timing){await renderSchedulePicker(timing);return true;}
+  const channelAction=value.match(/^fmt_ch(open|input|sig|prop|del)_(\d+)(?:_(\d+))?(?:_([01]))?$/);
+  if(channelAction){
+    const [,action,id,version,on]=channelAction;
+    const c=await requireOwner(id,userId);if(!c)return true;
+    if(action==="open"){await showStyleSettings(id,userId);return true;}
+    if(Number(version)!==Number(c.style_version)){await notify(userId,"Настройки изменились. Используйте новую карточку.");await showStyleSettings(id,userId);return true;}
+    if(action==="input"){await startStyleInput(c,userId,Number(version));return true;}
+    const next=copyJson(c.post_style||{});
+    if(action==="sig"){
+      if(on==="1"&&!next.signature?.text){await notify(userId,"Сначала добавьте текст автоподписи.");await showStyleSettings(id,userId);return true;}
+      next.signature_on=on==="1";
+    }else if(action==="prop")next.proposal_on=on==="1";
+    else {next.signature=null;next.signature_on=false;}
+    await saveChannelStyle(c,userId,next,Number(version));await showStyleSettings(id,userId);return true;
+  }
+  const sub=value.match(/^fmt_sub_(\d+)(?:_a(\d+))?$/);
+  if(sub){
+    const row=await getSubmission(sub[1]);
+    const access=row?await channelAccess(row.channel_id,userId,"moderate"):null;
+    if(!access||(!access.owner&&access.version!==Number(sub[2]))){await notify(userId,"Нет доступа к предложке.");return true;}
+    const saved=await saveSubmissionDraft(row,userId,cb.callback_id,null,true,true);
+    if(saved)await openSavedDraft(saved.id,userId);
+    return true;
+  }
+  const action=value.match(/^fmt_(sig|prop|links|add|edit|del|back)_([pe])_([a-f0-9]{24})(?:_(\d+))?$/);
+  if(!action){await notify(userId,"Карточка оформления устарела. Откройте последний предпросмотр.");return true;}
+  const [,verb,kind,nonce,index]=action,t=await formatTarget(kind,nonce,userId);
+  if(!t){await notify(userId,"Предпросмотр устарел или права изменились. Откройте /menu.");return true;}
+  try{
+    if(verb==="links"){await showLinks(t);return true;}
+    if(verb==="back"){await renderFormatTarget(t,true);return true;}
+    if(["add","edit"].includes(verb)){
+      if(verb==="edit"&&!t.style.buttons[Number(index)])throw new Error("Кнопка не найдена.");
+      if(verb==="add"&&t.style.buttons.length>=MAX_CUSTOM_LINKS)throw new Error(`Можно добавить до ${MAX_CUSTOM_LINKS} своих кнопок.`);
+      await startStyleInput(t.access.channel,userId,0,t,verb==="edit"?Number(index):null);return true;
+    }
+    const next=copyJson(t.style);
+    if(verb==="sig"){
+      if(!next.signature?.text){
+        const defaults=styleForChannel(t.access.channel);
+        if(!defaults.signature?.text)throw new Error("Сначала сохраните или закройте пост, затем добавьте подпись: «Мои каналы» → канал → «Автоподпись».");
+        next.signature=defaults.signature;next.signature_on=true;
+      }else next.signature_on=!next.signature_on;
+    }else if(verb==="prop"){
+      next.proposal_on=!next.proposal_on;
+      // URL всегда строит сервер для канала материала, его нельзя подменить callback.
+      next.proposal_url=styleForChannel(t.access.channel).proposal_url;
+    }else if(verb==="del"){
+      if(!next.buttons[Number(index)])throw new Error("Кнопка не найдена.");
+      next.buttons.splice(Number(index),1);
+    }
+    const changed=await changeTargetStyle(t,next);if(changed)await renderFormatTarget(changed);
+  }catch(error){await notify(userId,`${error.message}\nПост не опубликован, прежнее оформление сохранено.`);}
+  return true;
+}
+
 
 // ---------- База: прежние таблицы и записи сохраняются ----------
 
@@ -422,6 +834,39 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  await pool.query(`
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS post_style JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS style_version INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE submissions ADD COLUMN IF NOT EXISTS post_style JSONB;
+    ALTER TABLE ep_posts ADD COLUMN IF NOT EXISTS base_body JSONB;
+    ALTER TABLE ep_posts ADD COLUMN IF NOT EXISTS post_style JSONB;
+    ALTER TABLE ep_editor_sessions ADD COLUMN IF NOT EXISTS base_body JSONB;
+    ALTER TABLE ep_editor_sessions ADD COLUMN IF NOT EXISTS post_style JSONB;
+    CREATE TABLE IF NOT EXISTS ep_style_sessions (
+      actor_user_id BIGINT PRIMARY KEY,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      nonce TEXT UNIQUE NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('channel','p','e')),
+      target_id BIGINT,
+      target_nonce TEXT,
+      access_version INTEGER NOT NULL,
+      stage TEXT NOT NULL CHECK (stage IN ('signature','button_label','button_url')),
+      button_index INTEGER,
+      label TEXT,
+      expected_version INTEGER NOT NULL DEFAULT 0,
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 minutes')
+    );
+    CREATE TABLE IF NOT EXISTS ep_style_inputs (
+      max_message_id TEXT PRIMARY KEY,
+      actor_user_id BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    -- Старые черновики и уже подготовленные редакторские варианты не меняют вид.
+    UPDATE ep_posts SET base_body=body, post_style='{}'::jsonb
+      WHERE body IS NOT NULL AND post_style IS NULL;
+    UPDATE ep_editor_sessions SET base_body=draft_body, post_style='{}'::jsonb
+      WHERE draft_body IS NOT NULL AND post_style IS NULL;
+  `);
   console.log("DATABASE READY");
 }
 
@@ -474,6 +919,8 @@ async function handleStart(update) {
   const userId = update.user?.user_id;
   if (userId == null) return;
   await rememberUser(update.user);
+  const styleInput=await getStyleInput(userId);
+  if(styleInput){await promptStyleInput(styleInput);return;}
   const timing = await getScheduleSession(userId);
   if (timing) {
     await notify(userId, "Сначала завершите выбор времени или отправьте /cancel. Затем откройте ссылку предложки заново.");
@@ -525,7 +972,8 @@ function controlsBody(submissionId, title, accessVersion = 0) {
     attachments: keyboard([
       [action("publish", "🚀 Опубликовать"), action("edit", "✏️ Редактировать")],
       [action("preview", "👁 Предпросмотр"), action("reject", "🗑 Отклонить")],
-      [action("savedraft", "💾 Сохранить черновик"), action("schedule", "🕒 Отложить")]
+      [action("savedraft", "💾 Сохранить черновик"), action("schedule", "🕒 Отложить")],
+      [button("🎨 Оформление и кнопки", `fmt_sub_${submissionId}${suffix}`)]
     ])
   };
 }
@@ -538,6 +986,7 @@ async function handleMessage(update) {
   const chatType = message.recipient?.chat_type;
   if (chatType && chatType !== "dialog") return;
   await rememberUser(sender);
+  if(await handleStyleMessage(message))return;
   // Повторная доставка уже записанной предложки сохраняет прежнее назначение.
   let found = await pool.query(`
     SELECT s.*, c.title, c.owner_user_id, c.max_chat_id, c.active
@@ -829,6 +1278,7 @@ function draftControls(session, title) {
       `Выше показан вариант для публикации. В канал он ещё не отправлен.`,
     attachments: keyboard([
       [editorButton("draftpublish", session, "🚀 Опубликовать этот вариант")],
+      ...styleControls("e", session.nonce, session.post_style),
       [editorButton("editsave", session, "💾 Сохранить черновик"),
        editorButton("editschedule", session, "🕒 Отложить")],
       [editorButton("again", session, "✏️ Изменить ещё"),
@@ -847,7 +1297,11 @@ async function showDraft(session) {
 
   try {
     if (!current.preview_mid) {
-      // Никакого forward: и предпросмотр, и публикация используют один body.
+      // Собираем строго из базового текста: повторный просмотр не удваивает подпись.
+      current.draft_body = composeStyledPost(current.base_body || current.draft_body, current.post_style);
+      await pool.query(`UPDATE ep_editor_sessions SET draft_body=$3::jsonb
+        WHERE actor_user_id=$1 AND nonce=$2 AND stage='preview'`,
+        [current.actor_user_id,current.nonce,JSON.stringify(current.draft_body)]);
       const shown = await sendToUser(current.actor_user_id, current.draft_body);
       const mid = messageId(shown);
       await pool.query(`
@@ -867,10 +1321,12 @@ async function showDraft(session) {
     console.error("EDIT PREVIEW ERROR:", error.message);
     // Если предпросмотр не отправился, не предлагаем публикацию вслепую.
     await sendToUser(current.actor_user_id, {
-      text: `Не удалось полностью показать предпросмотр #${row.id}. ` +
-        `Черновик сохранён, в канале ничего не опубликовано.`,
+      text: `Не удалось полностью показать предпросмотр #${row.id}. ${error.message.slice(0,500)}\n` +
+        `Материал сохранён, в канале ничего не опубликовано.`,
       attachments: keyboard([
         [editorButton("draftpreview", current, "🔄 Показать предпросмотр")],
+        ...styleControls("e",current.nonce,current.post_style),
+        [editorButton("again", current, "✏️ Изменить текст")],
         [editorButton("cancel", current, "↩️ Отменить правку")]
       ])
     });
@@ -1023,7 +1479,7 @@ async function handleEditorMessage(message) {
     return true;
   }
 
-  let draftBody;
+  let draftBody, baseBody, postStyle;
   try {
     if (!text.trim()) throw new Error("Отправьте непустой текст одним сообщением.");
     if (message.link?.type === "forward") {
@@ -1039,10 +1495,13 @@ async function handleEditorMessage(message) {
       throw new Error("На этом шаге меняется только текст. Фото и видео прикреплять не нужно.");
     }
     const source = await loadSubmissionSource(row);
-    draftBody = buildAnonymousPost(source, {
+    baseBody = buildAnonymousPost(source, {
       text,
       markup: Array.isArray(message.body.markup) ? message.body.markup : []
     });
+    postStyle = session.post_style || await submissionStyle(row);
+    // Оформление проверяется в showDraft до выдачи кнопки публикации.
+    draftBody = baseBody;
   } catch (error) {
     await rememberEditorInput(message, session.nonce);
     await notify(userId, `${error.message}\nПравка #${row.id} остаётся открытой. Пришлите текст ещё раз.`);
@@ -1063,13 +1522,13 @@ async function handleEditorMessage(message) {
       changed = await client.query(`
         UPDATE ep_editor_sessions
         SET nonce = $3, stage = 'preview', draft_body = $4::jsonb,
-          draft_text = $5, input_mid = $6, preview_mid = NULL,
+          draft_text = $5, input_mid = $6, base_body = $7::jsonb, post_style = $8::jsonb, preview_mid = NULL,
           controls_mid = NULL, updated_at = NOW()
         WHERE actor_user_id = $1 AND nonce = $2 AND stage = 'waiting_text'
           AND EXISTS (SELECT 1 FROM submissions s
             WHERE s.id = ep_editor_sessions.submission_id AND s.status = 'new')
         RETURNING *
-      `, [userId, session.nonce, nextNonce, JSON.stringify(draftBody), text, mid]);
+      `, [userId, session.nonce, nextNonce, JSON.stringify(draftBody), text, mid, JSON.stringify(baseBody), JSON.stringify(postStyle)]);
     }
     await client.query("COMMIT");
   } catch (error) {
@@ -1146,6 +1605,7 @@ async function handleCallback(update) {
   // Настройки доступа не меняются из групп или пересланных чужих карточек.
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
+  if (await handleStyleCallback(update)) return;
   if (await handleSchedulingCallback(update)) return;
   if (await handleAccessCallback(update)) return;
   if (await handleSavedDraftCallback(update)) return;
@@ -1264,7 +1724,7 @@ async function handleCallback(update) {
   }
   let body;
   try {
-    body = buildAnonymousPost(await loadSubmissionSource(row));
+    body = await styledSubmissionBody(row);
   } catch (error) {
     await pool.query("UPDATE submissions SET last_error = $2 WHERE id = $1",
       [id, error.message.slice(0, 1000)]);
@@ -1421,6 +1881,9 @@ async function showChannelAccess(channelId, userId) {
         `access_notify_${c.id}_${c.notify_owner ? 0 : 1}`)],
       [button("История действий", `access_log_${c.id}_0`)],
       [button("🕒 Часовой пояс канала", `tz_open_${c.id}`)],
+      [button("Автоподпись", `fmt_chopen_${c.id}`)],
+      [button(`Кнопка предложки: ${c.post_style?.proposal_on ? "вкл" : "выкл"}`,
+        `fmt_chprop_${c.id}_${c.style_version}_${c.post_style?.proposal_on ? 0 : 1}`)],
       [button("↩️ Мои каналы", "menu_channels_0")]
     ])
   });
@@ -1604,6 +2067,8 @@ async function confirmAccessChange(nonce, ownerId) {
       // Сохранённый черновик возвращается к версии до незавершённой правки.
       await client.query(`
         UPDATE ep_posts AS p SET body = e.restore_snapshot->'body',
+      base_body = COALESCE(e.restore_snapshot->'base_body',e.restore_snapshot->'body'),
+      post_style = COALESCE(e.restore_snapshot->'post_style','{}'::jsonb),
           source_message = e.restore_snapshot->'source_message',
           input_mid = e.restore_snapshot->>'input_mid', preview_mid = NULL,
           controls_mid = NULL, updated_at = NOW()
@@ -1855,6 +2320,8 @@ function adminMenuBody(canCreate = true) {
 }
 
 async function showAdminMenu(userId, switchMode = false) {
+  const styleInput=await getStyleInput(userId);
+  if(styleInput){await promptStyleInput(styleInput);return;}
   const timing = await getScheduleSession(userId);
   if (timing) { await renderSchedulePicker(timing); return; }
   const composer = await getComposer(userId);
@@ -2027,6 +2494,7 @@ function ownPostControls(session, row) {
       [button("✏️ Изменить текст", `ctext_${session.nonce}`),
        button("📎 Заменить материал", `creplace_${session.nonce}`)],
       [button("🕒 Отложить", `cschedule_${session.nonce}`)],
+      ...styleControls("p",session.nonce,row.post_style),
       ...(row.is_saved ? [[button("🗑 Удалить черновик", `ddelete_${session.nonce}`)]] : []),
       [button(row.is_saved ? "↩️ Закрыть без сохранения" : "↩️ Отменить пост",
         `ccancel_${session.nonce}`)]
@@ -2042,6 +2510,10 @@ async function showOwnPostPreview(session) {
   if (!row.body) throw new Error("Содержимое нового поста отсутствует.");
   try {
     if (!row.preview_mid) {
+      row.body = composeStyledPost(row.base_body || row.body, row.post_style);
+      await pool.query(`UPDATE ep_posts SET body=$2::jsonb WHERE id=$1 AND status='draft'
+        AND EXISTS(SELECT 1 FROM ep_composer_sessions e WHERE e.post_id=ep_posts.id AND e.nonce=$3 AND e.stage='preview')`,
+        [row.id,JSON.stringify(row.body),current.nonce]);
       const preview = await sendToUser(current.actor_user_id, row.body);
       await pool.query(`
         UPDATE ep_posts SET preview_mid = $2, updated_at = NOW()
@@ -2063,10 +2535,12 @@ async function showOwnPostPreview(session) {
   } catch (error) {
     console.error("POST PREVIEW ERROR:", error.message);
     await sendToUser(current.actor_user_id, {
-      text: `Предпросмотр поста #${row.id} не удалось показать полностью. ` +
-        "Пост сохранён, в канале ничего не опубликовано.",
+      text: `Предпросмотр поста #${row.id} не удалось показать полностью. ${error.message.slice(0,500)}\n` +
+        "Материал сохранён, в канале ничего не опубликовано.",
       attachments: keyboard([
         [button("🔄 Показать предпросмотр", `crefresh_${current.nonce}`)],
+        ...styleControls("p",current.nonce,row.post_style),
+        [button("✏️ Изменить текст",`ctext_${current.nonce}`), button("📎 Заменить материал",`creplace_${current.nonce}`)],
         [button("↩️ Отменить пост", `ccancel_${current.nonce}`)]
       ])
     });
@@ -2211,7 +2685,8 @@ async function handleComposerMessage(message) {
   }
 
   let postBody;
-  let source;
+  let source, postStyle;
+
   try {
     if (session.stage === "waiting_text") {
       if (!text.trim()) throw new Error("Отправьте непустой текст одним сообщением.");
@@ -2230,6 +2705,7 @@ async function handleComposerMessage(message) {
       source = message;
       postBody = buildAnonymousPost(message);
     }
+    postStyle = row.post_style || styleForChannel(await getChannel(row.channel_id));
   } catch (error) {
     await rememberComposerInput(message, session);
     await notify(userId, `${error.message}\nПост не опубликован. Отправьте материал ещё раз или /cancel.`);
@@ -2253,12 +2729,13 @@ async function handleComposerMessage(message) {
       if (inserted.rowCount) {
         const changed = await client.query(`
           UPDATE ep_posts SET source_message = $3::jsonb, body = $4::jsonb, input_mid = $5,
+            base_body = $4::jsonb, post_style = $6::jsonb,
             preview_mid = NULL, controls_mid = NULL, last_error = NULL, updated_at = NOW()
           WHERE id = $1 AND status = 'draft'
       AND (author_user_id = $2 OR EXISTS (
         SELECT 1 FROM channels c WHERE c.id = ep_posts.channel_id AND c.owner_user_id = $2))
     RETURNING id
-        `, [row.id, userId, JSON.stringify(source), JSON.stringify(postBody), mid]);
+        `, [row.id, userId, JSON.stringify(source), JSON.stringify(postBody), mid, JSON.stringify(postStyle)]);
         if (changed.rowCount) {
           next = await client.query(`
             UPDATE ep_composer_sessions SET nonce = $3, stage = 'preview', updated_at = NOW()
@@ -2470,12 +2947,15 @@ async function handleAdminCallback(update) {
 // нужна только в БД; в публичное сообщение она никогда не передаётся.
 
 function composerSnapshot(row) {
-  return { body: row.body, source_message: row.source_message, input_mid: row.input_mid ?? null };
+  return { body: row.body, source_message: row.source_message, input_mid: row.input_mid ?? null,
+    base_body: row.base_body || row.body, post_style: row.post_style || emptyPostStyle() };
 }
 
 async function restoreSavedComposer(session, client = pool) {
   await client.query(`
     UPDATE ep_posts AS p SET body = e.restore_snapshot->'body',
+      base_body = COALESCE(e.restore_snapshot->'base_body',e.restore_snapshot->'body'),
+      post_style = COALESCE(e.restore_snapshot->'post_style','{}'::jsonb),
       source_message = e.restore_snapshot->'source_message',
       input_mid = e.restore_snapshot->>'input_mid', preview_mid = NULL,
       controls_mid = NULL, updated_at = NOW()
@@ -2536,7 +3016,7 @@ async function saveComposerDraft(session, row, callbackId, silent = false) {
   await showAdminMenu(session.actor_user_id, true);
 }
 
-async function saveSubmissionDraft(row, userId, callbackId, session = null, silent = false) {
+async function saveSubmissionDraft(row, userId, callbackId, session = null, silent = false, allowStyleFix = false) {
   if (!(await canEdit(row, userId))) {
     await notify(userId, "Предложка недоступна или уже обработана."); return;
   }
@@ -2551,10 +3031,19 @@ async function saveSubmissionDraft(row, userId, callbackId, session = null, sile
   if (session && (session.stage !== "preview" || !session.preview_mid || !session.draft_body)) {
     await notify(userId, "Сначала нужен предпросмотр исправленной предложки."); return;
   }
-  let source, body;
+  let source, body, baseBody, postStyle;
   try {
     source = await loadSubmissionSource(row);
-    body = session ? session.draft_body : buildAnonymousPost(source);
+    baseBody = session ? (session.base_body || session.draft_body) : buildAnonymousPost(source);
+    postStyle = session ? (session.post_style || emptyPostStyle()) : await submissionStyle(row);
+    try { body = composeStyledPost(baseBody,postStyle); }
+    catch (error) {
+      // Переход «Оформление» должен оставаться доступным даже при 12 медиа
+      // или слишком длинной подписи. Сохраняем базу, но не даём кнопку отправки
+      // до успешно показанного нового предпросмотра.
+      if (!allowStyleFix) throw error;
+      body = baseBody;
+    }
   } catch (error) {
     await notify(userId, `Не удалось сохранить черновик. ${error.message}`); return;
   }
@@ -2573,9 +3062,9 @@ async function saveSubmissionDraft(row, userId, callbackId, session = null, sile
     if (locked.rows[0]?.status === "new" && validEdit) {
       const saved = await client.query(`
         INSERT INTO ep_posts(channel_id, author_user_id, status, source_message, body,
-          source_submission_id, is_saved, saved_at, draft_revision)
-        VALUES ($1, $2, 'draft', $3::jsonb, $4::jsonb, $5, TRUE, NOW(), 1) RETURNING *
-      `, [row.channel_id, userId, JSON.stringify(source), JSON.stringify(body), row.id]);
+          source_submission_id, is_saved, saved_at, draft_revision, base_body, post_style)
+        VALUES ($1, $2, 'draft', $3::jsonb, $4::jsonb, $5, TRUE, NOW(), 1, $6::jsonb, $7::jsonb) RETURNING *
+      `, [row.channel_id, userId, JSON.stringify(source), JSON.stringify(body), row.id, JSON.stringify(baseBody), JSON.stringify(postStyle)]);
       post = saved.rows[0];
       await client.query("UPDATE submissions SET status = 'drafted' WHERE id = $1 AND status = 'new'", [row.id]);
       if (session) await client.query(
