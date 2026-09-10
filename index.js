@@ -5,7 +5,12 @@ import https from "node:https";
 import tls from "node:tls";
 
 // EveryPost: предложка, анонимная публикация, редактор, права, черновики и расписание.
-// Версия formatting-1. Автоподписи и URL-кнопки, настройки отдельно от контента.
+// Версия menu-chat-1. Быстрые команды MAX и отдельный чат обсуждений для канала.
+// Это не нативная привязка комментариев MAX: кнопка открывает общую группу.
+// Автокопирование только новых постов EveryPost — по отдельному включению владельцем.
+// Существующие черновики и отложенные сохраняют свои снимки оформления.
+// PATCH /me/commands регистрирует список команд; расположение кнопки задаёт приложение.
+// Основа: formatting-1. Автоподписи и URL-кнопки сохранены.
 // Исходный материал и оформленный body хранятся отдельно. Отложенные сохраняют снимок.
 // Основа: schedule-2. Системный планировщик работает только при запущенном процессе.
 // На Free нет гарантии отправки в срок. Просроченные >5 минут задания удерживаются.
@@ -18,7 +23,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "formatting-1";
+const VERSION = "menu-chat-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -162,7 +167,12 @@ function sendMessage(kind, id, body) {
   )) {
     throw new Error("ANONYMITY GUARD: linked publication is forbidden");
   }
-  return queueMaxWrite(`/messages?${kind}=${encodeURIComponent(id)}`, "POST", body);
+  const result = queueMaxWrite(`/messages?${kind}=${encodeURIComponent(id)}`, "POST", body);
+  if (kind !== "chat_id") return result;
+  return result.then(async sent => {
+    await safeRememberDiscussion(id, body, sent);
+    return sent;
+  });
 }
 const sendToUser = (id, body) => sendMessage("user_id", id, body);
 
@@ -207,7 +217,8 @@ async function answerCallback(callbackId, text, removeButtons = false) {
 const MAX_CUSTOM_LINKS = 8; // Ограничение интерфейса EveryPost, не лимит MAX.
 const SIGNATURE_LIMIT = 700;
 const emptyPostStyle = () => ({ signature: null, signature_on: false,
-  proposal_on: false, proposal_url: null, buttons: [] });
+  proposal_on: false, proposal_url: null, discussion_on: false, discussion_url: null,
+  discussion_group_id: null, buttons: [] });
 const copyJson = value => JSON.parse(JSON.stringify(value));
 
 function normalizedLinkUrl(value) {
@@ -239,6 +250,8 @@ function validateStyle(value) {
   s.signature_on = s.signature_on === true;
   s.proposal_on = s.proposal_on === true;
   if (s.proposal_on) s.proposal_url = normalizedLinkUrl(s.proposal_url);
+  s.discussion_on = s.discussion_on === true;
+  if (s.discussion_on) s.discussion_url = groupLink(s.discussion_url);
   if (!Array.isArray(s.buttons) || s.buttons.length > MAX_CUSTOM_LINKS) {
     throw new Error(`В этом редакторе доступно до ${MAX_CUSTOM_LINKS} своих кнопок.`);
   }
@@ -250,6 +263,9 @@ function styleForChannel(channel) {
   return validateStyle({ signature: c.signature || null,
     signature_on: c.signature_on === true, proposal_on: c.proposal_on === true,
     proposal_url: `https://max.ru/${BOT_USERNAME}?start=${encodeURIComponent(channel.proposal_code)}`,
+    discussion_on: channel.discussion_enabled === true && !!channel.discussion_group_id,
+    discussion_url: channel.discussion_url || null,
+    discussion_group_id: channel.discussion_group_id || null,
     buttons: [] });
 }
 function composeStyledPost(base, inputStyle) {
@@ -278,6 +294,9 @@ function composeStyledPost(base, inputStyle) {
   if (style.proposal_on && !links.some(b => b.url === style.proposal_url)) {
     links.push({ text: "📥 Предложить новость", url: style.proposal_url });
   }
+  if (style.discussion_on && !links.some(b => b.url === style.discussion_url)) {
+    links.push({ text: "💬 Чат канала", url: style.discussion_url });
+  }
   if (links.length && media.length >= 12) {
     throw new Error("В посте уже 12 вложений. Для кнопок нужно одно свободное место: отключите кнопки либо оставьте не больше 11 вложений.");
   }
@@ -295,7 +314,8 @@ function styleControls(kind, nonce, style) {
   return [
     [button(`Подпись: ${s.signature_on && s.signature?.text ? "вкл" : "выкл"}`, `fmt_sig_${kind}_${nonce}`),
      button(s.buttons?.length ? `🔗 Кнопки: ${s.buttons.length}` : "🔗 Добавить кнопку", `fmt_${s.buttons?.length ? "links" : "add"}_${kind}_${nonce}`)],
-    [button(`Кнопка предложки: ${s.proposal_on ? "вкл" : "выкл"}`, `fmt_prop_${kind}_${nonce}`)]
+    [button(`Кнопка предложки: ${s.proposal_on ? "вкл" : "выкл"}`, `fmt_prop_${kind}_${nonce}`)],
+    [button(`Чат канала: ${s.discussion_on ? "вкл" : "выкл"}`, `fmt_chat_${kind}_${nonce}`)]
   ];
 }
 async function submissionStyle(row) {
@@ -578,7 +598,7 @@ async function handleStyleCallback(update) {
     if(saved)await openSavedDraft(saved.id,userId);
     return true;
   }
-  const action=value.match(/^fmt_(sig|prop|links|add|edit|del|back)_([pe])_([a-f0-9]{24})(?:_(\d+))?$/);
+  const action=value.match(/^fmt_(sig|prop|chat|links|add|edit|del|back)_([pe])_([a-f0-9]{24})(?:_(\d+))?$/);
   if(!action){await notify(userId,"Карточка оформления устарела. Откройте последний предпросмотр.");return true;}
   const [,verb,kind,nonce,index]=action,t=await formatTarget(kind,nonce,userId);
   if(!t){await notify(userId,"Предпросмотр устарел или права изменились. Откройте /menu.");return true;}
@@ -601,6 +621,14 @@ async function handleStyleCallback(update) {
       next.proposal_on=!next.proposal_on;
       // URL всегда строит сервер для канала материала, его нельзя подменить callback.
       next.proposal_url=styleForChannel(t.access.channel).proposal_url;
+    }else if(verb==="chat"){
+      if(next.discussion_on) next.discussion_on=false;
+      else {
+        const defaults=styleForChannel(t.access.channel);
+        if(!defaults.discussion_on||!defaults.discussion_url)throw new Error("Сначала подключите чат: «Мои каналы» → канал → «Чат канала».");
+        next.discussion_on=true;next.discussion_url=defaults.discussion_url;
+        next.discussion_group_id=defaults.discussion_group_id;
+      }
     }else if(verb==="del"){
       if(!next.buttons[Number(index)])throw new Error("Кнопка не найдена.");
       next.buttons.splice(Number(index),1);
@@ -867,6 +895,61 @@ async function initDatabase() {
     UPDATE ep_editor_sessions SET base_body=draft_body, post_style='{}'::jsonb
       WHERE draft_body IS NOT NULL AND post_style IS NULL;
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ep_command_inputs (
+      max_message_id TEXT PRIMARY KEY,
+      actor_user_id BIGINT NOT NULL,
+      handled BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS ep_discussion_groups (
+      chat_id BIGINT PRIMARY KEY,
+      title TEXT NOT NULL,
+      invite_url TEXT NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS ep_group_registrations (
+      chat_id BIGINT NOT NULL REFERENCES ep_discussion_groups(chat_id),
+      user_id BIGINT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(chat_id,user_id)
+    );
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS discussion_group_id BIGINT;
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS discussion_url TEXT;
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS discussion_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS discussion_copy BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS discussion_version INTEGER NOT NULL DEFAULT 0;
+    CREATE UNIQUE INDEX IF NOT EXISTS ep_one_group_per_channel
+      ON channels(discussion_group_id) WHERE discussion_group_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS ep_discussion_intents (
+      nonce TEXT PRIMARY KEY,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      owner_user_id BIGINT NOT NULL,
+      group_id BIGINT NOT NULL REFERENCES ep_discussion_groups(chat_id),
+      invite_url TEXT NOT NULL,
+      expected_version INTEGER NOT NULL,
+      used BOOLEAN NOT NULL DEFAULT FALSE,
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '10 minutes')
+    );
+    CREATE TABLE IF NOT EXISTS ep_discussion_jobs (
+      id BIGSERIAL PRIMARY KEY,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      group_id BIGINT NOT NULL REFERENCES ep_discussion_groups(chat_id),
+      link_version INTEGER NOT NULL,
+      channel_mid TEXT NOT NULL,
+      body_snapshot JSONB NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      dispatch_started_at TIMESTAMPTZ,
+      group_mid TEXT,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(channel_id,channel_mid)
+    );
+    CREATE INDEX IF NOT EXISTS ep_discussion_pending
+      ON ep_discussion_jobs(id) WHERE status IN ('pending','sending');
+  `);
   console.log("DATABASE READY");
 }
 
@@ -876,6 +959,7 @@ async function checkAdministrator(chatId, userId) {
 }
 
 async function handleBotAdded(update) {
+  if (update.is_channel === false) return handleDiscussionAdded(update);
   if (update.is_channel !== true) return;
   const chatId = update.chat_id;
   const user = update.user;
@@ -984,8 +1068,10 @@ async function handleMessage(update) {
   const mid = message?.body?.mid;
   if (!sender || sender.is_bot || sender.user_id == null || !mid) return;
   const chatType = message.recipient?.chat_type;
+  if (chatType === "chat") { await registerExistingGroupMessage(message); return; }
   if (chatType && chatType !== "dialog") return;
   await rememberUser(sender);
+  if (await handleQuickCommand(message)) return;
   if(await handleStyleMessage(message))return;
   // Повторная доставка уже записанной предложки сохраняет прежнее назначение.
   let found = await pool.query(`
@@ -1606,6 +1692,7 @@ async function handleCallback(update) {
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
   if (await handleStyleCallback(update)) return;
+  if (await handleDiscussionCallback(update)) return;
   if (await handleSchedulingCallback(update)) return;
   if (await handleAccessCallback(update)) return;
   if (await handleSavedDraftCallback(update)) return;
@@ -1882,6 +1969,7 @@ async function showChannelAccess(channelId, userId) {
       [button("История действий", `access_log_${c.id}_0`)],
       [button("🕒 Часовой пояс канала", `tz_open_${c.id}`)],
       [button("Автоподпись", `fmt_chopen_${c.id}`)],
+      [button("💬 Чат канала", `dc_open_${c.id}`)],
       [button(`Кнопка предложки: ${c.post_style?.proposal_on ? "вкл" : "выкл"}`,
         `fmt_chprop_${c.id}_${c.style_version}_${c.post_style?.proposal_on ? 0 : 1}`)],
       [button("↩️ Мои каналы", "menu_channels_0")]
@@ -3799,7 +3887,11 @@ async function dispatchScheduled(q) {
     lastApiCall=Date.now();
     return maxRequest(`/messages?chat_id=${encodeURIComponent(q.max_chat_id)}`,"POST",q.body_snapshot);
   });
-  apiTail=task.catch(()=>{});return task;
+  apiTail=task.catch(()=>{});
+  return task.then(async result=>{
+    await safeRememberDiscussion(q.max_chat_id,q.body_snapshot,result);
+    return result;
+  });
 }
 async function processOneScheduled() {
   const candidate=await pool.query(`SELECT id FROM ep_schedules WHERE status='sending'
@@ -3869,11 +3961,405 @@ async function handleUpdate(update) {
     case "message_created": return handleMessage(update);
     case "message_callback": return handleCallback(update);
     case "bot_removed":
+      await disableDiscussionGroup(update.chat_id);
       await pool.query(
         "UPDATE channels SET active = FALSE, updated_at = NOW() WHERE max_chat_id = $1",
         [update.chat_id]);
       return;
   }
+}
+
+// ---------- Быстрые команды MAX ----------
+// PATCH /me/commands регистрирует подсказки. Расположением меню управляет клиент MAX.
+const QUICK_COMMANDS = [
+  { name: "menu", description: "Главное меню" },
+  { name: "newpost", description: "Создать пост" },
+  { name: "inbox", description: "Предложки" },
+  { name: "drafts", description: "Черновики" },
+  { name: "scheduled", description: "Отложенные" },
+  { name: "channels", description: "Мои каналы" },
+  { name: "cancel", description: "Отменить текущий ввод" },
+  { name: "help", description: "Помощь и команды" }
+];
+let commandsReady = false;
+async function registerCommands() {
+  try {
+    const result = await queueMaxWrite("/me/commands", "PATCH", { commands: QUICK_COMMANDS });
+    if (Array.isArray(result.commands) && QUICK_COMMANDS.some(c =>
+      !result.commands.some(r => typeof r.name === "string" && r.name.replace(/^\//, "") === c.name))) throw new Error("MAX did not return all commands");
+    commandsReady = true;
+    console.log("COMMAND MENU READY");
+  } catch (e) {
+    commandsReady = false;
+    console.error("COMMAND MENU ERROR:", e.message);
+    setTimeout(registerCommands, 60000).unref();
+  }
+}
+function plainCommand(message) {
+  if (message?.link || (message?.body?.attachments || []).length ||
+      typeof message?.body?.text !== "string") return null;
+  const match = message.body.text.trim().match(/^\/([a-z_]+|отмена)(?:@([a-z0-9_]+))?$/iu);
+  if (!match || (match[2] && match[2].toLowerCase() !== BOT_USERNAME.toLowerCase())) return null;
+  return match[1].toLowerCase();
+}
+async function quickHelp(userId) {
+  await sendToUser(userId, { text:
+    "EveryPost · Быстрые команды\n\n" + QUICK_COMMANDS.map(c => `/${c.name} — ${c.description}`).join("\n") +
+    "\n\nСписок команд доступен в меню клиента MAX или при вводе /. " +
+    "Команды не публикуются как пост и не становятся текстом правки.\n\n" +
+    "Для подписчика: откройте персональную ссылку из канала и пришлите новость. " +
+    "Доступ к чужим каналам и материалам через команды не выдаётся.\n\n" +
+    "Чат канала: это отдельная группа для обсуждений, не встроенные комментарии MAX." });
+}
+async function handleQuickCommand(message) {
+  const value = plainCommand(message);
+  const action = ({start:"menu", new:"newpost", отмена:"cancel"})[value] || value;
+  if (!QUICK_COMMANDS.some(c => c.name === action)) return false;
+  const userId = message.sender.user_id, mid = message.body.mid;
+  const receipt = await pool.query("SELECT handled FROM ep_command_inputs WHERE max_message_id=$1", [mid]);
+  if (receipt.rows[0]?.handled) return true;
+  await pool.query(`INSERT INTO ep_command_inputs(max_message_id,actor_user_id)
+    VALUES ($1,$2) ON CONFLICT DO NOTHING`, [mid,userId]);
+  const style = await getStyleInput(userId), timing = await getScheduleSession(userId);
+  const composing = await getComposer(userId), editing = await getEditorSession(userId);
+  if (action === "help") {
+    await quickHelp(userId);
+  } else if (action === "cancel") {
+    if (style) await cancelStyleInput(style);
+    else if (timing) await closeSchedulePicker(timing);
+    else if (composing) await cancelComposer(composing, message);
+    else if (editing) await cancelEditor(editing, mid);
+    else { await notify(userId,"Незавершённого ввода нет. Отложенные посты не изменены."); await showAdminMenu(userId); }
+  } else if (style || timing || composing || editing) {
+    // Не теряем несохранённую правку при навигации, не подставляем /drafts в текст поста.
+    if (action !== "menu") await notify(userId,"Сначала завершите текущую правку или /cancel. Она не потеряна.");
+    if (style) await promptStyleInput(style);
+    else if (timing) await renderSchedulePicker(timing);
+    else if (composing) await resumeComposer(composing);
+    else await resumeEditor(editing);
+  } else if (!(await hasOwnChannel(userId))) {
+    await showAdminMenu(userId);
+  } else {
+    await pool.query("DELETE FROM proposal_sessions WHERE max_user_id=$1", [userId]);
+    if (action === "menu") await showAdminMenu(userId, true);
+    else if (action === "newpost") await beginComposer(userId);
+    else if (action === "inbox") await listMySubmissions(userId);
+    else if (action === "drafts") await listSavedDrafts(userId);
+    else if (action === "scheduled") await listScheduled(userId);
+    else if (action === "channels") await listMyChannels(userId);
+  }
+  await pool.query("UPDATE ep_command_inputs SET handled=TRUE WHERE max_message_id=$1", [mid]);
+  return true;
+}
+
+// ---------- Связанный групповой чат ----------
+// Это наша связка «канал -> группа», не включение нативных комментариев MAX.
+// Кнопка ведёт в общую группу. Комментарии разных устройств не синхронизируются.
+function groupLink(value) {
+  const normalized = normalizedLinkUrl(value);
+  const url = new URL(normalized);
+  if (url.protocol !== "https:" || !["max.ru","www.max.ru"].includes(url.hostname.toLowerCase()) ||
+      !url.pathname || url.pathname === "/" || url.hash || url.port) {
+    throw new Error("Нужна действующая HTTPS-ссылка на групповой чат в MAX.");
+  }
+  return normalized;
+}
+async function verifiedGroup(chatId, userId) {
+  if (!/^-?\d+$/.test(String(chatId))) throw new Error("Неверный ID группы.");
+  const chat = await maxRequest(`/chats/${encodeURIComponent(chatId)}`);
+  if (chat.type !== "chat" || chat.status !== "active") throw new Error("Нужна действующая группа, не канал и не личный диалог.");
+  if (!(await checkAdministrator(chatId,userId))) throw new Error("Вы должны быть администратором этой группы в MAX.");
+  const me = await maxRequest(`/chats/${encodeURIComponent(chatId)}/members/me`);
+  if (!(me.is_admin || me.is_owner)) throw new Error("Назначьте EveryPost администратором группы и повторите выбор.");
+  if (typeof chat.link !== "string" || !chat.link.trim()) {
+    throw new Error("MAX не вернул ссылку группы. Создайте действующую ссылку-приглашение в настройках группы и повторите подключение.");
+  }
+  const invite = groupLink(chat.link);
+  return { chat_id:String(chatId), title:chat.title || "Группа без названия", invite_url:invite };
+}
+async function registerDiscussionGroup(chatId,userId) {
+  // Регистрация группы сама НЕ подключает её к какому-либо каналу.
+  const group = await verifiedGroup(chatId,userId);
+  await pool.query(`INSERT INTO ep_discussion_groups(chat_id,title,invite_url,active)
+    VALUES ($1,$2,$3,TRUE) ON CONFLICT(chat_id) DO UPDATE SET
+      title=EXCLUDED.title,invite_url=EXCLUDED.invite_url,active=TRUE,updated_at=NOW()`,
+    [group.chat_id,group.title,group.invite_url]);
+  await pool.query(`INSERT INTO ep_group_registrations(chat_id,user_id) VALUES ($1,$2)
+    ON CONFLICT(chat_id,user_id) DO UPDATE SET updated_at=NOW()`,[group.chat_id,userId]);
+  await notify(userId,`💬 Группа «${shortTitle(group.title)}» доступна для подключения.\n`+
+    "В личном чате с EveryPost: /channels → канал → «Чат канала» → «Подключить чат».\n"+
+    "Пока ничего в группу не публикуется, её ссылка не добавлена под постами.");
+  console.log("DISCUSSION GROUP READY:",group.chat_id);
+}
+async function handleDiscussionAdded(update) {
+  const id=update.chat_id, userId=update.user?.user_id ?? update.user_id;
+  if (id==null || userId==null || update.user?.is_bot) return;
+  await registerDiscussionGroup(id,userId);
+}
+async function registerExistingGroupMessage(message) {
+  if (message?.recipient?.chat_type !== "chat" || message?.sender?.is_bot ||
+      plainCommand(message) !== "registerchat") return false;
+  const id=message.recipient.chat_id, userId=message.sender?.user_id;
+  if (id!=null && userId!=null) await registerDiscussionGroup(id,userId);
+  return true;
+}
+async function showDiscussionSettings(channelId,userId) {
+  const c=await requireOwner(channelId,userId);if(!c)return;
+  let g=null;
+  if(c.discussion_group_id)g=(await pool.query("SELECT * FROM ep_discussion_groups WHERE chat_id=$1",[c.discussion_group_id])).rows[0];
+  const rows=[[button(c.discussion_group_id?"Заменить чат":"Подключить чат",`dc_list_${c.id}_0`)]];
+  if(c.discussion_group_id){
+    rows.push([button(`Кнопка чата: ${c.discussion_enabled?"вкл":"выкл"}`,`dc_button_${c.id}_${c.discussion_version}_${c.discussion_enabled?0:1}`)]);
+    rows.push([button(`Копировать посты: ${c.discussion_copy?"вкл":"выкл"}`,`dc_copy_${c.id}_${c.discussion_version}_${c.discussion_copy?0:1}`)]);
+    rows.push([button("Проверить чат / обновить ссылку",`dc_check_${c.id}_${c.discussion_version}`)]);
+    rows.push([button("Последние копии",`dc_jobs_${c.id}`)]);
+    rows.push([button("Отключить чат",`dc_unlink_${c.id}_${c.discussion_version}`)]);
+  }
+  rows.push([button("↩️ К каналу",`access_channel_${c.id}`)]);
+  await sendToUser(userId,{text:`💬 Чат канала «${shortTitle(c.title)}»\n\n`+
+    (g?`Группа: «${shortTitle(g.title)}»${g.active?"":" (бот удалён)"}\n`:"Чат ещё не подключён.\n")+
+    "\nЭто отдельная общая группа для обсуждений, не встроенные комментарии к каждому посту MAX.\n"+
+    "Кнопка «💬 Чат канала» добавляется при подготовке новых постов. Ссылка видна читателям.\n"+
+    "Копирование выключено по умолчанию. При включении опубликованный через EveryPost пост с кнопкой этого чата " +
+    "дополнительно появится в группе без автора предложки. Обсуждать его можно обычным ответом в группе.\n\n"+
+    "Уже опубликованные посты, черновики и отложенные автоматически не меняются. Сообщения участников группы бот не публикует в канал.",
+    attachments:keyboard(rows)});
+}
+async function listDiscussionGroups(channelId,userId,page=0) {
+  const c=await requireOwner(channelId,userId);if(!c)return;
+  page=pageNumber(page);
+  // Только группы, которые этот владелец сам зарегистрировал, не список чужих групп.
+  const candidates=await pool.query(`SELECT g.* FROM ep_discussion_groups g JOIN ep_group_registrations r ON r.chat_id=g.chat_id
+    WHERE r.user_id=$1 AND g.active=TRUE ORDER BY g.chat_id LIMIT $2 OFFSET $3`,[userId,ADMIN_PAGE_SIZE+1,page*ADMIN_PAGE_SIZE]);
+  const rows=[];
+  for(const g of candidates.rows.slice(0,ADMIN_PAGE_SIZE)){
+    try{
+      if(await checkAdministrator(g.chat_id,userId))rows.push([button(shortTitle(g.title),`dc_select_${c.id}_${g.chat_id}_${c.discussion_version}`)]);
+    }catch(e){console.error("DISCUSSION CANDIDATE CHECK:",e.message);}
+  }
+  const nav=[];
+  if(page>0)nav.push(button("◀️ Назад",`dc_list_${c.id}_${page-1}`));
+  if(candidates.rows.length>ADMIN_PAGE_SIZE)nav.push(button("Далее ▶️",`dc_list_${c.id}_${page+1}`));
+  if(nav.length)rows.push(nav);
+  rows.push([button("Обновить список",`dc_list_${c.id}_${page}`)]);
+  rows.push([button("↩️ К настройкам чата",`dc_open_${c.id}`)]);
+  await sendToUser(userId,{text:`Подключить чат · «${shortTitle(c.title)}»\n\n`+
+    "Выберите группу для читателей, не служебный чат редакции.\n"+
+    "Если группы нет: разрешите добавление EveryPost в группы в настройках MAX для бизнеса, затем добавьте его " +
+    "администратором в нужную группу со своего аккаунта. Вы тоже должны быть её администратором.\n\n"+
+    `Если бот уже был в группе, отправьте внутри неё /registerchat@${BOT_USERNAME}, затем обновите этот список.`,
+    attachments:keyboard(rows)});
+}
+async function proposeDiscussionConnection(channelId,groupId,userId,version) {
+  const c=await requireOwner(channelId,userId);if(!c)return;
+  if(Number(c.discussion_version)!==Number(version)){await notify(userId,"Настройки уже изменены. Откройте «Чат канала» заново.");return;}
+  const registration=await pool.query("SELECT 1 FROM ep_group_registrations WHERE chat_id=$1 AND user_id=$2",[groupId,userId]);
+  if(!registration.rowCount){await notify(userId,"Группа не зарегистрирована вами. Сначала добавьте EveryPost в неё.");return;}
+  const other=await pool.query("SELECT id FROM channels WHERE discussion_group_id=$1 AND id<>$2",[groupId,channelId]);
+  if(other.rowCount){await notify(userId,"Эта группа уже связана с другим каналом. Для каждого канала используйте отдельную группу.");return;}
+  const group=await verifiedGroup(groupId,userId), nonce=newEditNonce();
+  await pool.query(`INSERT INTO ep_discussion_intents(nonce,channel_id,owner_user_id,group_id,invite_url,expected_version)
+    VALUES($1,$2,$3,$4,$5,$6)`,[nonce,c.id,userId,group.chat_id,group.invite_url,version]);
+  await sendToUser(userId,{text:`Канал: «${shortTitle(c.title)}»\nГруппа: «${shortTitle(group.title)}»\n\n`+
+    `Ссылка группы:\n${group.invite_url}\n\n`+
+    "При подключении ссылка будет добавляться под НОВЫМИ постами для читателей. Не подключайте закрытый чат редакции. " +
+    "Доступ по ссылке определяется настройками группы MAX. Автокопирование пока выключено.",attachments:keyboard([
+      [button("Подключить этот чат",`dc_confirm_${nonce}`)],
+      [button("↩️ Другой чат",`dc_list_${c.id}_0`)]])});
+}
+async function confirmDiscussionConnection(nonce,userId) {
+  const intent=(await pool.query("SELECT * FROM ep_discussion_intents WHERE nonce=$1 AND owner_user_id=$2",[nonce,userId])).rows[0];
+  if(!intent||intent.used||new Date(intent.expires_at).getTime()<=Date.now()){await notify(userId,"Эта карточка подключения устарела. Откройте «Чат канала».");return;}
+  const c=await requireOwner(intent.channel_id,userId);if(!c)return;
+  if(Number(c.discussion_version)!==Number(intent.expected_version)){await notify(userId,"Настройки уже изменены. Повторите выбор чата.");return;}
+  const group=await verifiedGroup(intent.group_id,userId);
+  if(group.invite_url!==intent.invite_url){await notify(userId,"Ссылка группы изменилась. Выберите чат заново, чтобы проверить новую ссылку.");return;}
+  const db=await pool.connect();let changed;
+  try{
+    await db.query("BEGIN");
+    const claim=await db.query("UPDATE ep_discussion_intents SET used=TRUE WHERE nonce=$1 AND owner_user_id=$2 AND used=FALSE AND expires_at>NOW() RETURNING nonce",[nonce,userId]);
+    if(claim.rowCount){
+      changed=await db.query(`UPDATE channels SET discussion_group_id=$2,discussion_url=$3,discussion_enabled=TRUE,
+        discussion_copy=FALSE,discussion_version=discussion_version+1,updated_at=NOW()
+        WHERE id=$1 AND owner_user_id=$4 AND discussion_version=$5 AND active=TRUE RETURNING *`,
+        [c.id,group.chat_id,group.invite_url,userId,intent.expected_version]);
+      if(changed.rowCount){
+        await db.query("UPDATE ep_discussion_jobs SET status='cancelled',last_error='Настройки чата изменились' WHERE channel_id=$1 AND status='pending'",[c.id]);
+        await audit(c.id,userId,"discussion_connected",group.chat_id,{},db);
+      }
+    }
+    await db.query("COMMIT");
+  }catch(e){await db.query("ROLLBACK").catch(()=>{});
+    if(e.code==="23505"){await notify(userId,"Эта группа уже подключена к другому каналу. Выберите другую.");return;}
+    throw e;
+  }finally{db.release();}
+  await notify(userId,changed?.rowCount?"✅ Чат подключён. Кнопка добавится к новым постам. Копирование постов пока выключено.":"Подключение уже обработано или настройки изменились.");
+  await showDiscussionSettings(c.id,userId);
+}
+async function changeDiscussionSetting(channelId,userId,version,action,on) {
+  const c=await requireOwner(channelId,userId);if(!c)return;
+  if(!c.discussion_group_id||Number(c.discussion_version)!==Number(version)){await notify(userId,"Настройки изменились. Откройте «Чат канала» заново.");return;}
+  const value=on==="1";
+  let group=null;
+  if(action==="check"||((action==="button"||action==="copy")&&value)){
+    group=await verifiedGroup(c.discussion_group_id,userId);
+    if(action!=="check"&&group.invite_url!==c.discussion_url){await notify(userId,"Ссылка в MAX изменилась. Нажмите «Проверить чат / обновить ссылку».");return;}
+  }
+  if(action==="copy"&&value&&!c.discussion_enabled){await notify(userId,"Сначала включите кнопку чата. Копируются только посты с этой кнопкой.");return;}
+  const next={group:c.discussion_group_id,url:c.discussion_url,enabled:c.discussion_enabled,copy:c.discussion_copy};
+  if(action==="unlink"){next.group=null;next.url=null;next.enabled=false;next.copy=false;}
+  else if(action==="button"){next.enabled=value;if(!value)next.copy=false;}
+  else if(action==="copy")next.copy=value;
+  else if(action==="check")next.url=group.invite_url;
+  else return;
+  const db=await pool.connect();let result;
+  try{
+    await db.query("BEGIN");
+    result=await db.query(`UPDATE channels SET discussion_group_id=$2,discussion_url=$3,discussion_enabled=$4,discussion_copy=$5,
+      discussion_version=discussion_version+1,updated_at=NOW() WHERE id=$1 AND owner_user_id=$6 AND discussion_version=$7 AND active=TRUE RETURNING id`,
+      [c.id,next.group,next.url,next.enabled,next.copy,userId,version]);
+    if(result.rowCount){
+      await db.query("UPDATE ep_discussion_jobs SET status='cancelled',last_error='Настройки чата изменились' WHERE channel_id=$1 AND status='pending'",[c.id]);
+      await audit(c.id,userId,`discussion_${action}`,next.group,{enabled:next.enabled,copy:next.copy},db);
+    }
+    await db.query("COMMIT");
+  }catch(e){await db.query("ROLLBACK").catch(()=>{});throw e;}finally{db.release();}
+  if(result.rowCount)await notify(userId,action==="unlink"?"Чат отключён. Старые посты и ссылки не удалены.":
+    action==="check"?"✅ Ссылка проверена. Новые посты получат актуальную ссылку; сохранённые материалы не меняются.":
+    "✅ Настройка сохранена. Старые публикации и их оформление не изменены.");
+  await showDiscussionSettings(c.id,userId);
+}
+async function showDiscussionJobs(channelId,userId) {
+  const c=await requireOwner(channelId,userId);if(!c)return;
+  const r=await pool.query("SELECT id,status,last_error FROM ep_discussion_jobs WHERE channel_id=$1 ORDER BY id DESC LIMIT 5",[c.id]);
+  const names={pending:"ожидает копирования",sending:"отправляется",sent:"скопирован",cancelled:"отменён",failed:"не отправлен",needs_check:"нужно проверить чат"};
+  await sendToUser(userId,{text:`Копии в чат · «${shortTitle(c.title)}»\n\n`+(r.rowCount?r.rows.map(j=>`#${j.id}: ${names[j.status]||j.status}`+
+    (j.last_error?`\n${j.last_error.slice(0,160)}`:"")).join("\n\n"):"Копий пока нет.")+
+    "\n\nОшибка копирования не переотправляет пост в канал. При неопределённом результате повтор отключён.",
+    attachments:keyboard([[button("↩️ Чат канала",`dc_open_${c.id}`)]])});
+}
+async function handleDiscussionCallback(update) {
+  const cb=update.callback,userId=cb?.user?.user_id,value=typeof cb?.payload==="string"?cb.payload:"";
+  if(userId==null||!value.startsWith("dc_"))return false;
+  await answerCallback(cb.callback_id);
+  if(await getStyleInput(userId)||await getScheduleSession(userId)||await getComposer(userId)||await getEditorSession(userId)){
+    await notify(userId,"Сначала завершите текущую правку или /cancel. Настройки чата не изменены.");await showAdminMenu(userId);return true;
+  }
+  try{
+    let m;
+    if((m=value.match(/^dc_open_(\d+)$/)))await showDiscussionSettings(m[1],userId);
+    else if((m=value.match(/^dc_jobs_(\d+)$/)))await showDiscussionJobs(m[1],userId);
+    else if((m=value.match(/^dc_list_(\d+)_(\d+)$/)))await listDiscussionGroups(m[1],userId,m[2]);
+    else if((m=value.match(/^dc_select_(\d+)_(-?\d+)_(\d+)$/)))await proposeDiscussionConnection(m[1],m[2],userId,m[3]);
+    else if((m=value.match(/^dc_confirm_([a-f0-9]{24})$/)))await confirmDiscussionConnection(m[1],userId);
+    else if((m=value.match(/^dc_(button|copy)_(\d+)_(\d+)_([01])$/)))await changeDiscussionSetting(m[2],userId,m[3],m[1],m[4]);
+    else if((m=value.match(/^dc_(check|unlink)_(\d+)_(\d+)$/)))await changeDiscussionSetting(m[2],userId,m[3],m[1]);
+    else await notify(userId,"Карточка устарела. Откройте /channels → канал → «Чат канала».");
+  }catch(e){console.error("DISCUSSION SETTINGS ERROR:",e.message);await notify(userId,`Не удалось изменить чат. ${e.message.slice(0,200)}`);}
+  return true;
+}
+
+// ---------- Копирование опубликованных постов в связанный чат ----------
+// Отдельная очередь: сбой группы не повторяет публикацию в канале.
+// Публикации вне EveryPost, черновики и входящие предложки сюда не попадают.
+function hasDiscussionLink(body,url) {
+  return (body?.attachments||[]).some(a=>a.type==="inline_keyboard"&&
+    (a.payload?.buttons||[]).some(r=>r.some(b=>b.type==="link"&&b.url===url)));
+}
+function discussionCopyBody(body,discussionUrl,publicationUrl) {
+  if(!body||Object.hasOwn(body,"link")||Object.hasOwn(body,"sender"))throw new Error("Unsafe discussion copy");
+  const copy=copyJson(body);
+  const media=(copy.attachments||[]).filter(a=>a.type!=="inline_keyboard");
+  const rows=(copy.attachments||[]).filter(a=>a.type==="inline_keyboard").flatMap(a=>a.payload?.buttons||[])
+    .map(row=>row.filter(b=>b.type==="link"&&b.url!==discussionUrl)).filter(row=>row.length);
+  if(typeof publicationUrl==="string"&&safeWebUrl(publicationUrl)&&new URL(publicationUrl).hostname==="max.ru"){
+    rows.push([{type:"link",text:"Открыть пост в канале",url:publicationUrl}]);
+  }
+  copy.attachments=rows.length?[...media,{type:"inline_keyboard",payload:{buttons:rows}}]:media;
+  if(!copy.attachments.length)delete copy.attachments;
+  // Не подставляем source_message: только уже отправленное публичное содержание.
+  return copy;
+}
+async function rememberDiscussionPublication(chatId,body,result) {
+  const channel=(await pool.query("SELECT * FROM channels WHERE max_chat_id=$1 AND active=TRUE",[chatId])).rows[0];
+  if(!channel?.discussion_group_id||!channel.discussion_enabled||!channel.discussion_copy||
+    !hasDiscussionLink(body,channel.discussion_url))return;
+  const mid=messageId(result),copy=discussionCopyBody(body,channel.discussion_url,result.message?.url);
+  await pool.query(`INSERT INTO ep_discussion_jobs(channel_id,group_id,link_version,channel_mid,body_snapshot)
+    VALUES($1,$2,$3,$4,$5::jsonb) ON CONFLICT(channel_id,channel_mid) DO NOTHING`,
+    [channel.id,channel.discussion_group_id,channel.discussion_version,mid,JSON.stringify(copy)]);
+}
+async function safeRememberDiscussion(chatId,body,result) {
+  try{await rememberDiscussionPublication(chatId,body,result);}
+  catch(e){
+    console.error("DISCUSSION QUEUE ERROR:",e.message);
+    // Главный пост уже опубликован. Сбой необязательной копии не меняет его статус.
+    try{
+      const c=(await pool.query("SELECT owner_user_id FROM channels WHERE max_chat_id=$1",[chatId])).rows[0];
+      if(c)await notify(c.owner_user_id,"Пост в канале опубликован, но копия в чат не поставлена в очередь. Проверьте Logs; канал повторно не публикуйте.");
+    }catch{}
+  }
+}
+async function discussionJobAllowed(job) {
+  const c=await getChannel(job.channel_id);
+  if(!c?.active||!c.discussion_enabled||!c.discussion_copy||
+    String(c.discussion_group_id)!==String(job.group_id)||Number(c.discussion_version)!==Number(job.link_version))return null;
+  const registered=(await pool.query("SELECT active FROM ep_discussion_groups WHERE chat_id=$1",[job.group_id])).rows[0];
+  if(!registered?.active)return null;
+  if(!(await checkAdministrator(c.max_chat_id,c.owner_user_id)))return null;
+  const group=await verifiedGroup(job.group_id,c.owner_user_id);
+  if(group.invite_url!==c.discussion_url)return null;
+  return c;
+}
+async function dispatchDiscussion(job) {
+  const task=apiTail.catch(()=>{}).then(async()=>{
+    await sleep(Math.max(0,650-(Date.now()-lastApiCall)));
+    const c=await discussionJobAllowed(job);
+    if(!c){const e=new Error("Связка, права или ссылка чата изменились.");e.deliveryNotStarted=true;throw e;}
+    const claim=await pool.query("UPDATE ep_discussion_jobs SET dispatch_started_at=NOW() WHERE id=$1 AND status='sending' RETURNING id",[job.id]);
+    if(!claim.rowCount){const e=new Error("Задание отменено.");e.deliveryNotStarted=true;throw e;}
+    if(Object.hasOwn(job.body_snapshot,"sender")||Object.hasOwn(job.body_snapshot,"link")){
+      const e=new Error("Небезопасный формат копии.");e.deliveryNotStarted=true;throw e;
+    }
+    lastApiCall=Date.now();
+    return maxRequest(`/messages?chat_id=${encodeURIComponent(job.group_id)}`,"POST",job.body_snapshot);
+  });
+  apiTail=task.catch(()=>{});return task;
+}
+async function processOneDiscussion() {
+  const result=await pool.query(`SELECT * FROM ep_discussion_jobs WHERE status IN ('sending','pending') ORDER BY id LIMIT 1`);
+  let job=result.rows[0];if(!job)return;
+  if(job.status==="sending"){
+    await pool.query("UPDATE ep_discussion_jobs SET status='needs_check',last_error='Процесс перезапустился во время копирования; проверьте чат' WHERE id=$1",[job.id]);
+    const c=await getChannel(job.channel_id);if(c)await notify(c.owner_user_id,"Проверьте копию в чате: сервер перезапустился во время отправки. Автоповтора нет, пост канала не изменён.");return;
+  }
+  let allowed;
+  try{allowed=await discussionJobAllowed(job);}
+  catch(e){console.error("DISCUSSION CHECK ERROR:",e.message);}
+  if(!allowed){
+    await pool.query("UPDATE ep_discussion_jobs SET status='failed',last_error='Проверьте связь группы, актуальную ссылку и права владельца/бота' WHERE id=$1",[job.id]);
+    const c=await getChannel(job.channel_id);if(c)await notify(c.owner_user_id,"Пост в канале опубликован, но копия в чат удержана: не удалось подтвердить связку или права. Откройте «Чат канала». Канал повторно не публикуйте.");return;
+  }
+  const claimed=await pool.query("UPDATE ep_discussion_jobs SET status='sending',dispatch_started_at=NULL WHERE id=$1 AND status='pending' RETURNING *",[job.id]);
+  if(!claimed.rowCount)return;job=claimed.rows[0];
+  let accepted=false;
+  try{
+    const sent=await dispatchDiscussion(job);accepted=true;
+    await pool.query("UPDATE ep_discussion_jobs SET status='sent',group_mid=$2,last_error=NULL,updated_at=NOW() WHERE id=$1",[job.id,messageId(sent)]);
+    console.log("DISCUSSION COPY SENT:",job.id);
+  }catch(e){
+    const definite=!accepted&&(e.deliveryNotStarted||(e.status>=400&&e.status<500&&e.status!==408));
+    await pool.query("UPDATE ep_discussion_jobs SET status=$2,last_error=$3,updated_at=NOW() WHERE id=$1",[job.id,definite?"failed":"needs_check",e.message.slice(0,500)]);
+    console.error("DISCUSSION COPY ERROR:",e.message);
+    await notify(allowed.owner_user_id,"Основной пост в канале опубликован. "+(definite?"Копия в чат не отправлена.":"Результат копирования в чат не подтверждён. Проверьте группу; повтор отключён.")+" Подробности: «Чат канала» → «Последние копии».");
+  }
+}
+async function disableDiscussionGroup(chatId) {
+  await pool.query("UPDATE ep_discussion_groups SET active=FALSE,updated_at=NOW() WHERE chat_id=$1",[chatId]);
+  const rows=await pool.query(`UPDATE channels SET discussion_enabled=FALSE,discussion_copy=FALSE,
+    discussion_version=discussion_version+1,updated_at=NOW() WHERE discussion_group_id=$1 RETURNING id,owner_user_id`,[chatId]);
+  await pool.query("UPDATE ep_discussion_jobs SET status='cancelled',last_error='Бот удалён из группы' WHERE group_id=$1 AND status='pending'",[chatId]);
+  for(const c of rows.rows)await notify(c.owner_user_id,"EveryPost удалён из связанного чата. Копирование остановлено, кнопка отключена для новых постов. Старые опубликованные ссылки не меняются.");
 }
 
 // ---------- Webhook: подтверждаем только после записи события в БД ----------
@@ -3889,6 +4375,12 @@ app.post("/webhook", async (req, res) => {
   }
   const update = req.body;
   if (!update || typeof update.update_type !== "string") return res.sendStatus(400);
+  // Участники группы не являются авторами предложек. Их обычную переписку
+  // не записываем в очередь; из группы обрабатываем только /registerchat.
+  if (update.update_type === "message_created" && update.message?.recipient?.chat_type === "chat" &&
+      plainCommand(update.message) !== "registerchat") return res.sendStatus(200);
+  if (update.update_type === "message_callback" && update.message?.recipient?.chat_type &&
+      update.message.recipient.chat_type !== "dialog") return res.sendStatus(200);
   const identity = update.update_type === "message_created" ? update.message?.body?.mid
     : update.update_type === "message_callback" ? update.callback?.callback_id : null;
   const key = crypto.createHash("sha256")
@@ -3938,6 +4430,8 @@ async function runWorker() {
     // Ошибка фоновой отправки не переоткрывает успешно обработанный webhook.
     try { await processOneScheduled(); }
     catch (error) { console.error("SCHEDULE WORKER ERROR:", error.message); }
+    try { await processOneDiscussion(); }
+    catch (error) { console.error("DISCUSSION WORKER ERROR:", error.message); }
   } catch (error) {
     console.error("Webhook error:", error.message);
     if (job) {
@@ -3980,6 +4474,7 @@ async function start() {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`EveryPost ${VERSION} started on port ${PORT}`);
     void registerWebhook();
+    void registerCommands();
   });
   setInterval(() => void runWorker(), 700).unref();
 }
