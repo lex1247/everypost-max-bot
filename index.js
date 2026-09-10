@@ -4,7 +4,9 @@ import crypto from "node:crypto";
 import https from "node:https";
 import tls from "node:tls";
 
-// EveryPost: предложка, анонимная публикация, редактор, постинг, права и сохранённые черновики.
+// EveryPost: предложка, анонимная публикация, редактор, права, черновики и расписание.
+// Версия schedule-1. Системный планировщик работает только при запущенном процессе.
+// На Free нет гарантии отправки в срок. Просроченные >5 минут задания удерживаются.
 // Черновики сохраняются в PostgreSQL. Медиа остаются вложениями MAX по токенам;
 // эта версия не создаёт собственную бессрочную резервную копию медиафайлов.
 // Оригинальная предложка не удаляется при сохранении или удалении её черновика.
@@ -14,7 +16,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "drafts-1";
+const VERSION = "schedule-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -369,6 +371,57 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  await pool.query(`
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Europe/Moscow';
+    CREATE TABLE IF NOT EXISTS ep_schedules (
+      id BIGSERIAL PRIMARY KEY,
+      post_id BIGINT UNIQUE NOT NULL REFERENCES ep_posts(id),
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      due_at TIMESTAMPTZ NOT NULL,
+      timezone TEXT NOT NULL,
+      scheduled_by BIGINT NOT NULL,
+      access_version INTEGER NOT NULL,
+      body_snapshot JSONB NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      locked_at TIMESTAMPTZ,
+      dispatch_started_at TIMESTAMPTZ,
+      published_at TIMESTAMPTZ,
+      published_mid TEXT,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS ep_schedules_due ON ep_schedules(due_at)
+      WHERE status = 'scheduled';
+    CREATE UNIQUE INDEX IF NOT EXISTS ep_post_source_schedule_once
+      ON ep_posts(source_submission_id)
+      WHERE source_submission_id IS NOT NULL
+        AND status IN ('draft', 'scheduled', 'publishing', 'needs_check', 'published');
+    CREATE TABLE IF NOT EXISTS ep_schedule_sessions (
+      actor_user_id BIGINT PRIMARY KEY,
+      post_id BIGINT UNIQUE NOT NULL REFERENCES ep_posts(id),
+      nonce TEXT UNIQUE NOT NULL,
+      schedule_id BIGINT REFERENCES ep_schedules(id),
+      expected_revision INTEGER NOT NULL DEFAULT 0,
+      draft_revision INTEGER NOT NULL,
+      access_version INTEGER NOT NULL,
+      timezone TEXT NOT NULL,
+      stage TEXT NOT NULL DEFAULT 'day',
+      day_key TEXT NOT NULL,
+      month_key TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK (hour BETWEEN 0 AND 23),
+      minute INTEGER NOT NULL CHECK (minute BETWEEN 0 AND 59),
+      card_mid TEXT,
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 minutes')
+    );
+    CREATE TABLE IF NOT EXISTS ep_schedule_inputs (
+      max_message_id TEXT PRIMARY KEY,
+      actor_user_id BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
   console.log("DATABASE READY");
 }
 
@@ -421,6 +474,11 @@ async function handleStart(update) {
   const userId = update.user?.user_id;
   if (userId == null) return;
   await rememberUser(update.user);
+  const timing = await getScheduleSession(userId);
+  if (timing) {
+    await notify(userId, "Сначала завершите выбор времени или отправьте /cancel. Затем откройте ссылку предложки заново.");
+    await renderSchedulePicker(timing); return;
+  }
   if (typeof update.payload !== "string" || !update.payload) {
     await showAdminMenu(userId, true);
     return;
@@ -467,7 +525,7 @@ function controlsBody(submissionId, title, accessVersion = 0) {
     attachments: keyboard([
       [action("publish", "🚀 Опубликовать"), action("edit", "✏️ Редактировать")],
       [action("preview", "👁 Предпросмотр"), action("reject", "🗑 Отклонить")],
-      [action("savedraft", "💾 Сохранить черновик")]
+      [action("savedraft", "💾 Сохранить черновик"), action("schedule", "🕒 Отложить")]
     ])
   };
 }
@@ -488,6 +546,7 @@ async function handleMessage(update) {
   `, [mid]);
   if (!found.rowCount) {
     // Собственные посты и правки обрабатываются до входящих предложок.
+    if (await handleScheduleMessage(message)) return;
     if (await handleComposerMessage(message)) return;
     if (await handleEditorMessage(message)) return;
     const sessionResult = await pool.query(`
@@ -770,7 +829,8 @@ function draftControls(session, title) {
       `Выше показан вариант для публикации. В канал он ещё не отправлен.`,
     attachments: keyboard([
       [editorButton("draftpublish", session, "🚀 Опубликовать этот вариант")],
-      [editorButton("editsave", session, "💾 Сохранить черновик")],
+      [editorButton("editsave", session, "💾 Сохранить черновик"),
+       editorButton("editschedule", session, "🕒 Отложить")],
       [editorButton("again", session, "✏️ Изменить ещё"),
        editorButton("cancel", session, "↩️ Отменить правку")]
     ])
@@ -1086,6 +1146,7 @@ async function handleCallback(update) {
   // Настройки доступа не меняются из групп или пересланных чужих карточек.
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
+  if (await handleSchedulingCallback(update)) return;
   if (await handleAccessCallback(update)) return;
   if (await handleSavedDraftCallback(update)) return;
   if (await handleAdminCallback(update)) return;
@@ -1359,6 +1420,7 @@ async function showChannelAccess(channelId, userId) {
       [button(`Уведомления мне: ${c.notify_owner ? "вкл" : "выкл"}`,
         `access_notify_${c.id}_${c.notify_owner ? 0 : 1}`)],
       [button("История действий", `access_log_${c.id}_0`)],
+      [button("🕒 Часовой пояс канала", `tz_open_${c.id}`)],
       [button("↩️ Мои каналы", "menu_channels_0")]
     ])
   });
@@ -1489,6 +1551,7 @@ async function confirmAccessChange(nonce, ownerId) {
   }
   const client = await pool.connect();
   let changed;
+  let pausedSchedules = 0;
   try {
     await client.query("BEGIN");
     // Взаимное исключение настроек этого канала плюс одноразовый nonce.
@@ -1526,6 +1589,18 @@ async function confirmAccessChange(nonce, ownerId) {
       `, [intent.target_user_id, c.id]);
     }
     if (["revoke", "deny_posts"].includes(intent.action)) {
+      const pausedResult = await client.query(`
+        UPDATE ep_schedules AS q SET status = 'paused', revision = q.revision + 1,
+          last_error = 'Права назначившего публикацию админа отозваны. Владелец может назначить время заново.', updated_at = NOW()
+        FROM ep_posts p WHERE q.post_id = p.id AND p.channel_id = $1
+          AND q.scheduled_by = $2 AND q.status = 'scheduled'
+          AND ($3 = 'revoke' OR p.source_submission_id IS NULL) RETURNING q.id
+      `, [c.id, intent.target_user_id, intent.action]);
+      pausedSchedules = pausedResult.rowCount;
+      await client.query(`DELETE FROM ep_schedule_sessions WHERE actor_user_id = $1
+        AND post_id IN (SELECT id FROM ep_posts WHERE channel_id = $2
+          AND ($3 = 'revoke' OR source_submission_id IS NULL))`,
+        [intent.target_user_id, c.id, intent.action]);
       // Сохранённый черновик возвращается к версии до незавершённой правки.
       await client.query(`
         UPDATE ep_posts AS p SET body = e.restore_snapshot->'body',
@@ -1544,6 +1619,15 @@ async function confirmAccessChange(nonce, ownerId) {
             AND ($3 = 'revoke' OR source_submission_id IS NULL))
       `, [intent.target_user_id, c.id, intent.action]);
     }
+    if (["allow_posts", "deny_posts"].includes(intent.action)) {
+      // Версия общего доступа изменилась, но право на предложку осталось прежним.
+      // При revoke старые задачи не возобновляются ни здесь, ни после повторного grant.
+      await client.query(`UPDATE ep_schedules AS q SET access_version = $3
+        FROM ep_posts p WHERE q.post_id = p.id AND p.channel_id = $1
+          AND q.scheduled_by = $2 AND q.status = 'scheduled'
+          AND ($4 = 'allow_posts' OR p.source_submission_id IS NOT NULL)`,
+        [c.id, intent.target_user_id, changed.version, intent.action]);
+    }
     await audit(c.id, ownerId, `access_${intent.action}`, intent.target_user_id,
       { version: changed.version, can_create_posts: changed.can_create_posts }, client);
     await client.query("COMMIT");
@@ -1552,7 +1636,8 @@ async function confirmAccessChange(nonce, ownerId) {
   } finally { client.release(); }
   const text = intent.action === "grant" ? "✅ Админ назначен."
     : intent.action === "revoke" ? "✅ Админ разжалован." : "✅ Разрешение обновлено.";
-  await notify(ownerId, `${text}\n${changed.display_name} · «${shortTitle(c.title)}»`);
+  await notify(ownerId, `${text}\n${changed.display_name} · «${shortTitle(c.title)}»` +
+    (pausedSchedules ? `\nПриостановлено отложенных постов: ${pausedSchedules}. Откройте «Отложенные», чтобы назначить время заново.` : ""));
   try {
     await sendToUser(changed.max_user_id, {text:
       intent.action === "revoke"
@@ -1763,13 +1848,15 @@ function adminMenuBody(canCreate = true) {
       "Без подтверждения ничего не публикуется.",
     attachments: keyboard([
       ...(canCreate ? [[button("➕ Создать пост", "menu_create")]] : []),
-      [button("📝 Черновики", "menu_drafts_0")],
+      [button("📝 Черновики", "menu_drafts_0"), button("🕒 Отложенные", "menu_scheduled_all_0")],
       [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")]
     ])
   };
 }
 
 async function showAdminMenu(userId, switchMode = false) {
+  const timing = await getScheduleSession(userId);
+  if (timing) { await renderSchedulePicker(timing); return; }
   const composer = await getComposer(userId);
   if (composer) {
     await resumeComposer(composer);
@@ -1939,6 +2026,7 @@ function ownPostControls(session, row) {
        button("💾 Сохранить черновик", `csave_${session.nonce}`)],
       [button("✏️ Изменить текст", `ctext_${session.nonce}`),
        button("📎 Заменить материал", `creplace_${session.nonce}`)],
+      [button("🕒 Отложить", `cschedule_${session.nonce}`)],
       ...(row.is_saved ? [[button("🗑 Удалить черновик", `ddelete_${session.nonce}`)]] : []),
       [button(row.is_saved ? "↩️ Закрыть без сохранения" : "↩️ Отменить пост",
         `ccancel_${session.nonce}`)]
@@ -2397,7 +2485,7 @@ async function restoreSavedComposer(session, client = pool) {
   `, [session.actor_user_id, session.nonce]);
 }
 
-async function saveComposerDraft(session, row, callbackId) {
+async function saveComposerDraft(session, row, callbackId, silent = false) {
   if (!(await canUseOwnPost(row, session.actor_user_id))) {
     await notify(session.actor_user_id, "Доступ изменился. Черновик не сохранён.");
     return;
@@ -2439,6 +2527,7 @@ async function saveComposerDraft(session, row, callbackId) {
     await notify(session.actor_user_id, "Карточка устарела. Откройте /menu; повторное сохранение не выполнено.");
     return;
   }
+  if (silent) return saved.rows[0];
   await answerCallback(callbackId, `💾 Черновик #${row.id} сохранён. В канал ничего не отправлено.`, true);
   await notify(session.actor_user_id,
     `💾 Черновик #${row.id} сохранён для канала «${shortTitle(row.title)}».\n` +
@@ -2447,7 +2536,7 @@ async function saveComposerDraft(session, row, callbackId) {
   await showAdminMenu(session.actor_user_id, true);
 }
 
-async function saveSubmissionDraft(row, userId, callbackId, session = null) {
+async function saveSubmissionDraft(row, userId, callbackId, session = null, silent = false) {
   if (!(await canEdit(row, userId))) {
     await notify(userId, "Предложка недоступна или уже обработана."); return;
   }
@@ -2501,6 +2590,7 @@ async function saveSubmissionDraft(row, userId, callbackId, session = null) {
     await notify(userId, "Предложка уже изменилась или её редактирует другой админ. Сохранение не выполнено.");
     return;
   }
+  if (silent) return post;
   await answerCallback(callbackId, `💾 Сохранён черновик #${post.id}.`, true);
   await notify(userId,
     `💾 Черновик #${post.id} для канала «${shortTitle(row.title)}» сохранён.\n` +
@@ -2547,6 +2637,7 @@ async function openSavedDraft(postId, userId) {
   if (!row?.is_saved || row.status !== "draft" || !(await canUseOwnPost(row, userId))) {
     await notify(userId, "Черновик недоступен, удалён или уже опубликован."); return;
   }
+  if (await schedulePostLocked(postId, userId)) return;
   const editing = await getEditorSession(userId);
   if (editing) {
     await notify(userId, "Сначала сохраните или отмените открытую правку предложки.");
@@ -2590,6 +2681,7 @@ async function openSavedDraft(postId, userId) {
 }
 
 async function requestDraftDeletion(session, row, callbackId) {
+  if (row && await schedulePostLocked(row.id, session.actor_user_id)) return;
   // Удаление начинается из открытого предпросмотра, поэтому канал и материал
   // уже видны. До подтверждения не удаляем ни черновик, ни исходную предложку.
   if (!row?.is_saved || row.status !== "draft" || !(await canUseOwnPost(row, session.actor_user_id))) {
@@ -2625,6 +2717,7 @@ async function confirmDraftDeletion(nonce, userId, callbackId) {
     await notify(userId, "Это подтверждение уже использовано или устарело."); return;
   }
   const row = await getOwnPost(intent.post_id);
+  if (row && await schedulePostLocked(row.id, userId)) return;
   if (!row?.is_saved || row.status !== "draft" || !(await canUseOwnPost(row, userId))) {
     await notify(userId, "Нет доступа к удалению этого черновика."); return;
   }
@@ -2705,6 +2798,578 @@ async function handleSavedDraftCallback(update) {
 }
 
 
+// ---------- Отложенные публикации: выбор в боте, время в PostgreSQL ----------
+// Нет внешнего пингера. На Render Free фоновые задачи выполняются только пока
+// процесс активен. Опоздание больше 5 минут удерживает материал, а не публикует его.
+// При сетевой неопределённости публикацию автоматически не повторяем.
+const SCHEDULE_GRACE_MS = 5 * 60 * 1000;
+const SCHEDULE_HORIZON_DAYS = 366;
+const CHANNEL_ZONES = [
+  ["Europe/Kaliningrad", "Калининград"], ["Europe/Moscow", "Москва"],
+  ["Europe/Samara", "Самара"], ["Asia/Yekaterinburg", "Екатеринбург"],
+  ["Asia/Omsk", "Омск"], ["Asia/Krasnoyarsk", "Красноярск"],
+  ["Asia/Irkutsk", "Иркутск"], ["Asia/Yakutsk", "Якутск"],
+  ["Asia/Vladivostok", "Владивосток"], ["Asia/Magadan", "Магадан"],
+  ["Asia/Kamchatka", "Камчатка"]
+];
+const ruMonths = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
+const pad2 = n => String(n).padStart(2, "0");
+function zoneAllowed(zone) { return CHANNEL_ZONES.some(([z]) => z === zone); }
+function localParts(instant, zone) {
+  if (!zoneAllowed(zone)) throw new Error("Неизвестный часовой пояс канала.");
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: zone,
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit",
+    minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(new Date(instant));
+  return Object.fromEntries(parts.filter(p => p.type !== "literal").map(p => [p.type, Number(p.value)]));
+}
+function dateKey(parts) { return `${parts.year}${pad2(parts.month)}${pad2(parts.day)}`; }
+function validDay(key) {
+  if (!/^\d{8}$/.test(String(key))) return false;
+  const y = Number(key.slice(0,4)), m = Number(key.slice(4,6)), d = Number(key.slice(6,8));
+  const x = new Date(Date.UTC(y, m - 1, d));
+  return y >= 2000 && y < 2200 && x.getUTCFullYear() === y && x.getUTCMonth() === m - 1 && x.getUTCDate() === d;
+}
+function shiftDay(key, days) {
+  if (!validDay(key)) throw new Error("Некорректная дата.");
+  const x = new Date(Date.UTC(Number(key.slice(0,4)), Number(key.slice(4,6)) - 1,
+    Number(key.slice(6,8)) + days));
+  return `${x.getUTCFullYear()}${pad2(x.getUTCMonth()+1)}${pad2(x.getUTCDate())}`;
+}
+function civilTime(key, hour, minute, zone) {
+  if (!validDay(key) || !Number.isInteger(hour) || hour < 0 || hour > 23 ||
+      !Number.isInteger(minute) || minute < 0 || minute > 59 || !zoneAllowed(zone)) {
+    throw new Error("Выберите существующие дату и время.");
+  }
+  const target = Date.UTC(Number(key.slice(0,4)), Number(key.slice(4,6)) - 1,
+    Number(key.slice(6,8)), hour, minute);
+  let stamp = target;
+  for (let i = 0; i < 4; i++) {
+    const p = localParts(stamp, zone);
+    const shown = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+    stamp += target - shown;
+  }
+  const p = localParts(stamp, zone);
+  if (dateKey(p) !== key || p.hour !== hour || p.minute !== minute) {
+    throw new Error("Это местное время не существует. Выберите другое.");
+  }
+  return stamp;
+}
+function zoneLabel(zone, instant = Date.now()) {
+  const p = localParts(instant, zone);
+  const base = new Date(instant); base.setUTCMilliseconds(0);
+  const offset = Math.round((Date.UTC(p.year, p.month-1, p.day, p.hour, p.minute, p.second) - base.getTime()) / 60000);
+  return `${CHANNEL_ZONES.find(([z]) => z === zone)[1]} · UTC${offset >= 0 ? "+" : "−"}` +
+    `${Math.floor(Math.abs(offset)/60)}${Math.abs(offset)%60 ? ":"+pad2(Math.abs(offset)%60) : ""}`;
+}
+function timeLabel(instant, zone) {
+  const p = localParts(instant, zone);
+  return `${pad2(p.day)}.${pad2(p.month)}.${p.year}, ${pad2(p.hour)}:${pad2(p.minute)}`;
+}
+function choiceValid(session, now = Date.now()) {
+  try {
+    const due = civilTime(session.day_key, Number(session.hour), Number(session.minute), session.timezone);
+    const today = dateKey(localParts(now, session.timezone));
+    return due > now + 5000 && session.day_key <= shiftDay(today, SCHEDULE_HORIZON_DAYS);
+  } catch { return false; }
+}
+function scheduleLabel(state) {
+  return { scheduled: "ожидает", sending: "отправляется", paused: "приостановлен",
+    needs_check: "нужна проверка канала", published: "опубликован", cancelled: "снят с расписания" }[state] || state;
+}
+async function getScheduleSession(userId) {
+  await pool.query("DELETE FROM ep_schedule_sessions WHERE actor_user_id = $1 AND expires_at <= NOW()", [userId]);
+  return (await pool.query(`SELECT * FROM ep_schedule_sessions WHERE actor_user_id = $1`, [userId])).rows[0] || null;
+}
+async function schedulePostLocked(postId, userId) {
+  const r = await pool.query("SELECT actor_user_id FROM ep_schedule_sessions WHERE post_id = $1 AND expires_at > NOW()", [postId]);
+  if (!r.rowCount) return false;
+  await notify(userId, "Для этого материала выбирается время. Завершите выбор или отмените его в карточке отложки.");
+  return true;
+}
+async function getSchedule(id) {
+  return (await pool.query(`SELECT q.*, p.channel_id, p.author_user_id, p.source_submission_id,
+    p.status AS post_status, c.title, c.max_chat_id, c.owner_user_id, c.active
+    FROM ep_schedules q JOIN ep_posts p ON p.id = q.post_id JOIN channels c ON c.id = p.channel_id
+    WHERE q.id = $1`, [id])).rows[0] || null;
+}
+async function scheduleAccess(row, userId) {
+  if (!row) return null;
+  const access = await channelAccess(row.channel_id, userId, row.source_submission_id ? "moderate" : "create");
+  if (!access || (!access.owner && String(row.author_user_id) !== String(userId) &&
+      String(row.scheduled_by) !== String(userId))) return null;
+  return access;
+}
+function pickerButton(session, action, text) { return button(text, `sp_${session.nonce}_${action}`); }
+function schedulePickerBody(session, title, now = Date.now()) {
+  const rows = [], today = dateKey(localParts(now, session.timezone));
+  const b = (action, text) => pickerButton(session, action, text);
+  let text = `🕒 ${session.schedule_id ? "Перенести публикацию" : "Отложить пост"} #${session.post_id}\n` +
+    `Канал: «${shortTitle(title)}»\n${zoneLabel(session.timezone)}\n\n`;
+  if (session.schedule_id) text += "До подтверждения нового времени прежнее расписание действует.\n\n";
+  if (session.stage === "day") {
+    text += "Когда опубликовать?";
+    rows.push([b("today", "Сегодня"), b("tomorrow", "Завтра")], [b("calendar", "📅 Выбрать дату")]);
+  } else if (session.stage === "calendar") {
+    const month = String(session.month_key || today.slice(0,6));
+    const year = Number(month.slice(0,4)), m = Number(month.slice(4,6));
+    const first = new Date(Date.UTC(year, m-1, 1));
+    text += `${ruMonths[m-1]} ${year}\nВыберите день.`;
+    rows.push([b("prevmonth", "◀"), b("noop", `${ruMonths[m-1]} ${year}`), b("nextmonth", "▶")]);
+    rows.push(["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].map(x => b("noop", x)));
+    const offset = (first.getUTCDay() + 6) % 7;
+    const days = new Date(Date.UTC(year, m, 0)).getUTCDate();
+    const cells = Array.from({ length: Math.ceil((days+offset)/7)*7 }, (_, i) => {
+      const d = i-offset+1, key = `${month}${pad2(d)}`;
+      return d < 1 || d > days || key < today || key > shiftDay(today, SCHEDULE_HORIZON_DAYS)
+        ? b("noop", "·") : b(`day${key}`, `${d}`);
+    });
+    for (let i=0;i<cells.length;i+=7) rows.push(cells.slice(i,i+7));
+    rows.push([b("days", "Сегодня / завтра")]);
+  } else {
+    text += `Дата: ${session.day_key.slice(6,8)}.${session.day_key.slice(4,6)}.${session.day_key.slice(0,4)}\n` +
+      `Время: ${pad2(session.hour)}:${pad2(session.minute)}\n\n`;
+    if (session.stage === "hours") {
+      text += "Выберите час.";
+      for (let i=0;i<24;i+=4) rows.push(Array.from({length:4}, (_,j) => b(`h${i+j}`, pad2(i+j))));
+    } else if (session.stage === "minutes") {
+      text += "Выберите минуту.";
+      for (let i=0;i<60;i+=6) rows.push(Array.from({length:6}, (_,j) => b(`m${i+j}`, pad2(i+j))));
+    } else {
+      text += "Нажмите на часы или минуты. Можно прислать время текстом: 18:30.";
+      rows.push([b("hours", `Часы: ${pad2(session.hour)}`), b("minutes", `Минуты: ${pad2(session.minute)}`)]);
+      if (choiceValid(session, now)) rows.push([b("confirm",
+        `🕒 Отложить на ${session.day_key.slice(6,8)}.${session.day_key.slice(4,6)}, ${pad2(session.hour)}:${pad2(session.minute)}`)]);
+      else text += "\n\n⚠️ Это время уже прошло или слишком близко. Выберите другое.";
+      text += "\n\nЕсли сервис опоздает больше 5 минут, пост будет удержан для проверки.";
+    }
+    rows.push([b("days", "📅 Изменить дату")]);
+  }
+  rows.push([b("cancel", session.schedule_id ? "↩️ Оставить прежнее время" : "↩️ К предпросмотру")]);
+  return { text, attachments: keyboard(rows) };
+}
+async function renderSchedulePicker(session, callbackId = null) {
+  const current = await getScheduleSession(session.actor_user_id);
+  if (!current || current.nonce !== session.nonce) return;
+  const post = await getOwnPost(session.post_id);
+  if (!(await canUseOwnPost(post, session.actor_user_id))) return;
+  const body = schedulePickerBody(session, post.title);
+  // Обновляем одну управляющую карточку. Никаких пустых callback-ответов.
+  if (callbackId) {
+    try {
+      await queueMaxWrite(`/answers?callback_id=${encodeURIComponent(callbackId)}`, "POST", { message: body });
+      return;
+    } catch (error) { console.error("SCHEDULE CARD CALLBACK ERROR:", error.message); }
+  }
+  if (session.card_mid) {
+    try {
+      await queueMaxWrite(`/messages?message_id=${encodeURIComponent(session.card_mid)}`, "PUT", body);
+      return;
+    } catch (error) { console.error("SCHEDULE CARD EDIT ERROR:", error.message); }
+  }
+  const sent = await sendToUser(session.actor_user_id, body);
+  await pool.query("UPDATE ep_schedule_sessions SET card_mid = $2 WHERE actor_user_id = $1 AND nonce = $3",
+    [session.actor_user_id, messageId(sent), session.nonce]);
+}
+async function beginSchedulePicker(postId, userId, schedule = null) {
+  const current = await getScheduleSession(userId);
+  if (current) { await renderSchedulePicker(current); return; }
+  if (await getComposer(userId) || await getEditorSession(userId)) {
+    await notify(userId, "Сначала сохраните или закройте открытый редактор."); return;
+  }
+  const post = await getOwnPost(postId);
+  const access = post ? await channelAccess(post.channel_id, userId, post.source_submission_id ? "moderate" : "create") : null;
+  if (!access || !(await canUseOwnPost(post,userId)) || !post.body ||
+      (!schedule && (post.status !== "draft" || !post.is_saved)) ||
+      (schedule && (!["scheduled","paused"].includes(schedule.status) || post.status !== "scheduled"))) {
+    await notify(userId, "Этот материал нельзя поставить в расписание."); return;
+  }
+  const timezone = schedule?.timezone || access.channel.timezone || "Europe/Moscow";
+  const defaultAt = schedule ? new Date(schedule.due_at).getTime() : Math.ceil((Date.now()+10*60000)/60000)*60000;
+  const initial = localParts(Math.max(defaultAt, Date.now()+60000), timezone);
+  // Реальный предпросмотр: если медиа не отправляются, расписание не подтверждается вслепую.
+  try { await sendToUser(userId, post.body); }
+  catch (error) { await notify(userId, `Предпросмотр недоступен. Материал сохранён. ${error.message.slice(0,200)}`); return; }
+  const made = await pool.query(`INSERT INTO ep_schedule_sessions(actor_user_id, post_id, nonce,
+    schedule_id, expected_revision, draft_revision, access_version, timezone, stage, day_key, month_key, hour, minute)
+    SELECT $1, p.id, $3, $4, $5, p.draft_revision, $6, $7, 'day', $8, $9, $10, $11
+    FROM ep_posts p WHERE p.id = $2 AND p.status = $12
+      AND NOT EXISTS (SELECT 1 FROM ep_composer_sessions e WHERE e.post_id = p.id)
+    ON CONFLICT DO NOTHING RETURNING *`, [userId,post.id,newEditNonce(),schedule?.id || null,
+    schedule?.revision ?? 0,access.version,timezone,dateKey(initial),dateKey(initial).slice(0,6),
+    initial.hour,initial.minute,schedule ? "scheduled" : "draft"]);
+  if (!made.rowCount) { await notify(userId, "Материал уже открыт другим админом или изменился."); return; }
+  await pool.query("DELETE FROM proposal_sessions WHERE max_user_id = $1", [userId]);
+  await renderSchedulePicker(made.rows[0]);
+}
+async function closeSchedulePicker(session, callbackId = null) {
+  const r = await pool.query("DELETE FROM ep_schedule_sessions WHERE actor_user_id = $1 AND nonce = $2 RETURNING *",
+    [session.actor_user_id,session.nonce]);
+  if (!r.rowCount) return;
+  if (callbackId) await answerCallback(callbackId, session.schedule_id ? "Прежнее расписание не изменено." : "Время не назначено. Материал сохранён в черновиках.", true);
+  if (session.schedule_id) await showScheduledPost(session.schedule_id, session.actor_user_id);
+  else await openSavedDraft(session.post_id, session.actor_user_id);
+}
+async function confirmSchedule(session, callbackId) {
+  if (!choiceValid(session)) { await renderSchedulePicker(session,callbackId); return; }
+  const post = await getOwnPost(session.post_id);
+  const access = post ? await channelAccess(post.channel_id,session.actor_user_id,post.source_submission_id ? "moderate" : "create") : null;
+  if (!access || access.version !== Number(session.access_version) || !(await canUseOwnPost(post,session.actor_user_id))) {
+    await notify(session.actor_user_id,"Права изменились. Расписание не сохранено."); return;
+  }
+  const due = new Date(civilTime(session.day_key,Number(session.hour),Number(session.minute),session.timezone));
+  const client = await pool.connect(); let saved;
+  try {
+    await client.query("BEGIN");
+    const form = (await client.query("SELECT * FROM ep_schedule_sessions WHERE actor_user_id = $1 AND nonce = $2 AND expires_at > NOW() FOR UPDATE",
+      [session.actor_user_id,session.nonce])).rows[0];
+    const fresh = (await client.query("SELECT * FROM ep_posts WHERE id = $1 FOR UPDATE",[post.id])).rows[0];
+    const old = (await client.query("SELECT * FROM ep_schedules WHERE post_id = $1 FOR UPDATE",[post.id])).rows[0];
+    const valid = form && fresh && Number(fresh.draft_revision) === Number(session.draft_revision) &&
+      (session.schedule_id ? old && ["scheduled","paused"].includes(old.status) && fresh.status === "scheduled" &&
+         Number(old.revision) === Number(session.expected_revision)
+       : fresh.status === "draft" && (!old || old.status === "cancelled"));
+    if (valid && choiceValid(form)) {
+      saved = (await client.query(`INSERT INTO ep_schedules(post_id,status,due_at,timezone,scheduled_by,access_version,body_snapshot)
+        VALUES ($1,'scheduled',$2,$3,$4,$5,$6::jsonb)
+        ON CONFLICT(post_id) DO UPDATE SET status = 'scheduled', due_at = EXCLUDED.due_at,
+          timezone = EXCLUDED.timezone, scheduled_by = EXCLUDED.scheduled_by,
+          access_version = EXCLUDED.access_version, body_snapshot = EXCLUDED.body_snapshot,
+          revision = ep_schedules.revision + 1, attempts = 0, next_at = NOW(),
+          locked_at = NULL, dispatch_started_at = NULL, last_error = NULL, updated_at = NOW()
+        RETURNING *`,[post.id,due,session.timezone,session.actor_user_id,access.version,JSON.stringify(fresh.body)])).rows[0];
+      await client.query("UPDATE ep_posts SET status = 'scheduled', is_saved = TRUE, saved_at = NOW(), updated_at = NOW() WHERE id = $1",[post.id]);
+      await client.query("DELETE FROM ep_schedule_sessions WHERE actor_user_id = $1 AND nonce = $2",[session.actor_user_id,session.nonce]);
+      await audit(post.channel_id,session.actor_user_id,session.schedule_id ? "schedule_moved" : "post_scheduled",post.id,
+        { due_at: due.toISOString(), timezone: session.timezone },client);
+    }
+    await client.query("COMMIT");
+  } catch(error) { await client.query("ROLLBACK").catch(()=>{}); throw error; }
+  finally { client.release(); }
+  if (!saved) { await notify(session.actor_user_id,"Материал, права или время изменились. Откройте «Отложенные» или «Черновики» заново."); return; }
+  await answerCallback(callbackId,`✅ Пост #${post.id} отложен.\nКанал: «${shortTitle(post.title)}»\n${timeLabel(due,session.timezone)} · ${zoneLabel(session.timezone,due)}`,true);
+  console.log("POST SCHEDULED:",post.id,due.toISOString());
+  await showScheduledPost(saved.id,session.actor_user_id,false);
+}
+async function handleScheduleMessage(message) {
+  const userId = message.sender.user_id, mid = message.body.mid;
+  if ((await pool.query("SELECT 1 FROM ep_schedule_inputs WHERE max_message_id = $1",[mid])).rowCount) return true;
+  const session = await getScheduleSession(userId);
+  const text = typeof message.body.text === "string" ? message.body.text.trim() : "";
+  const ordinary = !message.link && !(message.body.attachments || []).length;
+  if (!session) {
+    if (!ordinary || !["/scheduled", "отложенные"].includes(text.toLowerCase())) return false;
+    await pool.query("INSERT INTO ep_schedule_inputs(max_message_id,actor_user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",[mid,userId]);
+    await listScheduled(userId); return true;
+  }
+  await pool.query("INSERT INTO ep_schedule_inputs(max_message_id,actor_user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",[mid,userId]);
+  if (ordinary && ["/cancel","/отмена"].includes(text.toLowerCase())) {
+    await closeSchedulePicker(session); return true;
+  }
+  if (new Date(session.expires_at).getTime() <= Date.now()) {
+    await notify(userId,"Время выбора истекло. Материал сохранён, расписание не изменено.");
+    await closeSchedulePicker(session); return true;
+  }
+  const time = ordinary ? text.match(/^(\d{1,2}):(\d{2})$/) : null;
+  if (time && Number(time[1]) < 24 && Number(time[2]) < 60) {
+    const next = await pool.query(`UPDATE ep_schedule_sessions SET hour=$3,minute=$4,stage='time',nonce=$5
+      WHERE actor_user_id=$1 AND nonce=$2 RETURNING *`,[userId,session.nonce,Number(time[1]),Number(time[2]),newEditNonce()]);
+    if (next.rowCount) await renderSchedulePicker(next.rows[0]);
+  } else {
+    if (!["/menu","/start","меню"].includes(text.toLowerCase())) {
+      await notify(userId,"Сейчас выбирается время. Нажмите кнопки или отправьте время, например 18:30. Для отмены: /cancel. Сообщение не опубликовано.");
+    }
+    await renderSchedulePicker(session);
+  }
+  return true;
+}
+async function handlePickerAction(session, action, callbackId) {
+  if (action === "noop") { await answerCallback(callbackId,"Выберите доступное значение."); return; }
+  if (action === "cancel") { await closeSchedulePicker(session,callbackId); return; }
+  if (action === "confirm") {
+    if (session.stage !== "time") return;
+    await confirmSchedule(session,callbackId); return;
+  }
+  const next = { ...session }, today = dateKey(localParts(Date.now(),session.timezone));
+  if (action === "days") next.stage = "day";
+  else if (action === "today" || action === "tomorrow") {
+    next.day_key = shiftDay(today,action === "today" ? 0 : 1); next.stage = "time";
+  } else if (action === "calendar") { next.stage = "calendar"; next.month_key = next.day_key.slice(0,6); }
+  else if (["prevmonth","nextmonth"].includes(action)) {
+    const m = String(session.month_key), d = new Date(Date.UTC(Number(m.slice(0,4)),Number(m.slice(4,6))-1+(action === "prevmonth" ? -1 : 1),1));
+    const target = `${d.getUTCFullYear()}${pad2(d.getUTCMonth()+1)}`;
+    if (target < today.slice(0,6) || target > shiftDay(today,SCHEDULE_HORIZON_DAYS).slice(0,6)) {
+      await answerCallback(callbackId,"Выберите дату не дальше года вперёд."); return;
+    }
+    next.month_key=target; next.stage="calendar";
+  } else if (/^day\d{8}$/.test(action)) {
+    const d = action.slice(3);
+    if (!validDay(d) || d < today || d > shiftDay(today,SCHEDULE_HORIZON_DAYS)) return;
+    next.day_key=d; next.stage="time";
+  } else if (["hours","minutes"].includes(action)) next.stage=action;
+  else if (/^h\d{1,2}$/.test(action) && Number(action.slice(1))<24) { next.hour=Number(action.slice(1)); next.stage="time"; }
+  else if (/^m\d{1,2}$/.test(action) && Number(action.slice(1))<60) { next.minute=Number(action.slice(1)); next.stage="time"; }
+  else return;
+  const changed=await pool.query(`UPDATE ep_schedule_sessions SET nonce=$3,stage=$4,day_key=$5,month_key=$6,hour=$7,minute=$8
+    WHERE actor_user_id=$1 AND nonce=$2 AND expires_at>NOW() RETURNING *`,[session.actor_user_id,session.nonce,newEditNonce(),
+    next.stage,next.day_key,next.month_key,next.hour,next.minute]);
+  if (changed.rowCount) await renderSchedulePicker(changed.rows[0],callbackId);
+}
+async function listScheduled(userId,group="all",page=0) {
+  page=pageNumber(page);
+  const channels=await accessibleChannels(userId,"moderate"), ids=channels.map(c=>c.id), createIds=channels.filter(c=>c.can_create).map(c=>c.id);
+  const result=await pool.query(`SELECT q.*,p.channel_id,p.source_submission_id,c.title FROM ep_schedules q
+    JOIN ep_posts p ON p.id=q.post_id JOIN channels c ON c.id=p.channel_id
+    WHERE p.channel_id=ANY($2::bigint[]) AND q.status IN ('scheduled','paused','sending','needs_check')
+      AND (q.scheduled_by=$1 OR p.author_user_id=$1 OR c.owner_user_id=$1)
+      AND (p.source_submission_id IS NOT NULL OR p.channel_id=ANY($3::bigint[]))
+    ORDER BY q.due_at,q.id`,[userId,ids,createIds]);
+  const filtered=result.rows.filter(q=>{
+    const key=dateKey(localParts(q.due_at,q.timezone)), today=dateKey(localParts(Date.now(),q.timezone));
+    return group==="all" || (group==="today" && key===today) || (group==="tomorrow" && key===shiftDay(today,1)) ||
+      (group==="other" && key!==today && key!==shiftDay(today,1));
+  });
+  const rows=filtered.slice(page*ADMIN_PAGE_SIZE,(page+1)*ADMIN_PAGE_SIZE);
+  const nav=pageButtons(`menu_scheduled_${group}`,page,filtered.length);
+  const groups={all:"Все",today:"Сегодня",tomorrow:"Завтра",other:"Другие даты"};
+  await sendToUser(userId,{text:`🕒 Отложенные · ${groups[group] || "Все"}\n\n`+(rows.length ?
+    "Выберите пост. Дата и время показаны по часовому поясу его канала. ⚠️ — отправка остановлена." : "В этом разделе нет доступных материалов."),
+    attachments:keyboard([
+      [button("Сегодня","menu_scheduled_today_0"),button("Завтра","menu_scheduled_tomorrow_0")],
+      [button("Другие даты","menu_scheduled_other_0"),button("Все","menu_scheduled_all_0")],
+      ...rows.map(q=>[button(`${q.status==="scheduled" ? "🕒" : "⚠️"} ${timeLabel(q.due_at,q.timezone)} · #${q.post_id} · ${shortTitle(q.title)}`.slice(0,90),`so_${q.id}`)]),
+      ...(nav.length?[nav]:[]),[button("↩️ Меню","menu_main")]
+    ])});
+}
+async function showScheduledPost(id,userId,preview=true) {
+  const q=await getSchedule(id);
+  if (!(await scheduleAccess(q,userId))) { await notify(userId,"Нет доступа к этой отложенной публикации."); return; }
+  if (preview) {
+    try { await sendToUser(userId,q.body_snapshot); }
+    catch(e) { await notify(userId,"Не удалось показать медиа. Расписание не изменено."); console.error("SCHEDULE PREVIEW ERROR:",e.message); }
+  }
+  const controls=[];
+  if (["scheduled","paused"].includes(q.status)) {
+    controls.push([button("🕒 Изменить время",`st_move_${q.id}_${q.revision}`)]);
+    controls.push([button("✏️ Редактировать",`st_edit_${q.id}_${q.revision}`),button("🚀 Опубликовать сейчас",`st_now_${q.id}_${q.revision}`)]);
+    controls.push([button("↩️ Снять с отложки",`st_cancel_${q.id}_${q.revision}`)]);
+  }
+  controls.push([button("🕒 Отложенные","menu_scheduled_all_0")]);
+  await sendToUser(userId,{text:`🕒 Пост #${q.post_id}\nКанал: «${shortTitle(q.title)}»\n`+
+    `${timeLabel(q.due_at,q.timezone)} · ${zoneLabel(q.timezone,q.due_at)}\nСтатус: ${scheduleLabel(q.status)}`+
+    (q.last_error ? `\n\n${q.last_error.slice(0,350)}` : "")+
+    (q.status==="needs_check" ? "\nПроверьте сам канал. Повторная отправка заблокирована, чтобы не создать дубль." : ""),attachments:keyboard(controls)});
+}
+async function changeScheduledPost(id,revision,userId,action,callbackId,confirmed=false) {
+  const q=await getSchedule(id),access=await scheduleAccess(q,userId);
+  if (!access || !["scheduled","paused"].includes(q.status) || Number(q.revision)!==Number(revision)) {
+    await notify(userId,"Карточка устарела, публикация уже началась или нет доступа. Откройте «Отложенные»."); return;
+  }
+  if (action==="move") { await beginSchedulePicker(q.post_id,userId,q); return; }
+  if (!confirmed) {
+    const questions={cancel:"Снять с расписания и сохранить в черновиках?",edit:"Снять с расписания и открыть редактор? После правки нужно заново нажать «Отложить».",now:"Опубликовать этот пост сейчас вместо назначенного времени?"};
+    await sendToUser(userId,{text:`Пост #${q.post_id} · «${shortTitle(q.title)}»\n\n${questions[action]}`,attachments:keyboard([
+      [button(action==="now"?"🚀 Опубликовать сейчас":action==="edit"?"✏️ Снять и редактировать":"↩️ Снять с отложки",`sx_${action}_${q.id}_${q.revision}`)],
+      [button("Не менять",`so_${q.id}`)]])}); return;
+  }
+  if (action==="edit" && (await getComposer(userId)||await getEditorSession(userId))) {
+    await notify(userId,"Сначала завершите открытую правку. Расписание не изменено."); return;
+  }
+  const client=await pool.connect(); let changed;
+  try {
+    await client.query("BEGIN");
+    const fresh=(await client.query("SELECT * FROM ep_schedules WHERE id=$1 FOR UPDATE",[id])).rows[0];
+    if (fresh && ["scheduled","paused"].includes(fresh.status) && Number(fresh.revision)===Number(revision)) {
+      changed=await client.query(`UPDATE ep_schedules SET status=$2,revision=revision+1,updated_at=NOW(),last_error=NULL,
+        due_at=CASE WHEN $2='scheduled' THEN NOW() ELSE due_at END,
+        scheduled_by=CASE WHEN $2='scheduled' THEN $3 ELSE scheduled_by END,
+        access_version=CASE WHEN $2='scheduled' THEN $4 ELSE access_version END,
+        next_at=NOW(),attempts=0,dispatch_started_at=NULL,locked_at=NULL WHERE id=$1 RETURNING *`,
+        [id,action==="now"?"scheduled":"cancelled",userId,access.version]);
+      if (action!=="now") await client.query(`UPDATE ep_posts SET status='draft',is_saved=TRUE,saved_at=NOW(),body=$2::jsonb,
+        draft_revision=draft_revision+1,preview_mid=NULL,controls_mid=NULL,updated_at=NOW() WHERE id=$1 AND status='scheduled'`,
+        [q.post_id,JSON.stringify(fresh.body_snapshot)]);
+      await client.query("DELETE FROM ep_schedule_sessions WHERE post_id=$1",[q.post_id]);
+      await audit(q.channel_id,userId,action==="now"?"schedule_publish_now":"schedule_cancelled",q.post_id,{},client);
+    }
+    await client.query("COMMIT");
+  } catch(e) { await client.query("ROLLBACK").catch(()=>{}); throw e; } finally {client.release();}
+  if (!changed?.rowCount) {await notify(userId,"Статус уже изменился. Обновите «Отложенные».");return;}
+  await answerCallback(callbackId,action==="now"?"Пост поставлен на немедленную отправку. Дождитесь результата.":"Расписание снято. Материал сохранён в черновиках.",true);
+  if(action==="edit") await openSavedDraft(q.post_id,userId);
+  else if(action!=="now") await listSavedDrafts(userId);
+}
+async function showTimezone(channelId,userId) {
+  const channel=await requireOwner(channelId,userId); if(!channel)return;
+  await sendToUser(userId,{text:`Часовой пояс канала «${shortTitle(channel.title)}»\nСейчас: ${zoneLabel(channel.timezone || "Europe/Moscow")}\n\n`+
+    "Выберите пояс для новых публикаций. Уже отложенные посты сохранят прежние время и пояс.",attachments:keyboard([
+    ...CHANNEL_ZONES.map(([zone],i)=>[button(zoneLabel(zone),`tz_set_${channelId}_${i}`)]),[button("↩️ Назад",`access_channel_${channelId}`)]])});
+}
+async function handleSchedulingCallback(update) {
+  const cb=update.callback,userId=cb?.user?.user_id,value=typeof cb?.payload==="string"?cb.payload:"";
+  if(userId==null)return false;
+  const picker=value.match(/^sp_([a-f0-9]{24})_([a-z0-9]+)$/);
+  const entry=value.match(/^cschedule_([a-f0-9]{24})$/);
+  const sub=value.match(/^schedule_(\d+)(?:_a(\d+))?$/);
+  const subEdit=value.match(/^editschedule_(\d+)_([a-f0-9]{24})$/);
+  const listing=value.match(/^menu_scheduled_(all|today|tomorrow|other)_(\d+)$/);
+  const open=value.match(/^so_(\d+)$/);
+  const task=value.match(/^(st|sx)_(move|edit|cancel|now)_(\d+)_(\d+)$/);
+  const zone=value.match(/^tz_(open|set)_(\d+)(?:_(\d+))?$/);
+  const session=await getScheduleSession(userId);
+  if(picker) {
+    if(!session||session.nonce!==picker[1]||new Date(session.expires_at).getTime()<=Date.now()) {
+      await answerCallback(cb.callback_id,"Карточка выбора времени устарела.");
+      if(session)await renderSchedulePicker(session); else await notify(userId,"Откройте «Отложенные» или «Черновики» через /menu.");
+      return true;
+    }
+    const post=await getOwnPost(session.post_id);
+    const access=post?await channelAccess(post.channel_id,userId,post.source_submission_id?"moderate":"create"):null;
+    if(!access||access.version!==Number(session.access_version)||!(await canUseOwnPost(post,userId))) {
+      await pool.query("DELETE FROM ep_schedule_sessions WHERE actor_user_id=$1",[userId]);
+      await answerCallback(cb.callback_id,"Права или материал изменились. Расписание не изменено.");return true;
+    }
+    await handlePickerAction(session,picker[2],cb.callback_id);return true;
+  }
+  if(session) {await answerCallback(cb.callback_id,"Сначала завершите выбор времени или нажмите «Назад».");await renderSchedulePicker(session);return true;}
+  if(!entry&&!sub&&!subEdit&&!listing&&!open&&!task&&!zone)return false;
+  await answerCallback(cb.callback_id);
+  if(listing){await listScheduled(userId,listing[1],listing[2]);return true;}
+  if(open){await showScheduledPost(open[1],userId);return true;}
+  if(task){await changeScheduledPost(task[3],task[4],userId,task[2],cb.callback_id,task[1]==="sx");return true;}
+  if(zone) {
+    const channel=await requireOwner(zone[2],userId);if(!channel)return true;
+    if(zone[1]==="open")await showTimezone(zone[2],userId);
+    else {
+      const selected=CHANNEL_ZONES[Number(zone[3])];if(!selected)return true;
+      await pool.query("UPDATE channels SET timezone=$2,updated_at=NOW() WHERE id=$1",[channel.id,selected[0]]);
+      await audit(channel.id,userId,"timezone_changed",channel.id,{timezone:selected[0]});
+      await notify(userId,`Часовой пояс: ${zoneLabel(selected[0])}. Уже отложенные посты не перенесены.`);
+      await showChannelAccess(channel.id,userId);
+    }
+    return true;
+  }
+  let saved;
+  if(entry) {
+    const composer=await getComposer(userId);
+    if(!composer||composer.nonce!==entry[1]){await notify(userId,"Предпросмотр устарел. Откройте /menu.");return true;}
+    saved=await saveComposerDraft(composer,await getOwnPost(composer.post_id),cb.callback_id,true);
+  } else {
+    const row=await getSubmission((sub||subEdit)[1]);
+    const access=row?await channelAccess(row.channel_id,userId,"moderate"):null;
+    if(!access||(sub&&!access.owner&&access.version!==Number(sub[2]))){await notify(userId,"Нет доступа к этой предложке.");return true;}
+    let editing=null;
+    if(subEdit){editing=await getEditorSession(userId);if(!editing||editing.nonce!==subEdit[2]||String(editing.submission_id)!==subEdit[1])return true;}
+    saved=await saveSubmissionDraft(row,userId,cb.callback_id,editing,true);
+  }
+  if(saved)await beginSchedulePicker(saved.id,userId);
+  return true;
+}
+// ---------- Выполнение расписания: под тем же advisory lock, что и webhook ----------
+async function scheduledNotice(q,text) {
+  const ids=new Set([String(q.scheduled_by),String(q.owner_user_id)]);
+  for(const id of ids) await notify(id,text);
+}
+async function holdScheduled(q,reason,state="paused") {
+  const client=await pool.connect();let changed;
+  try{
+    await client.query("BEGIN");
+    changed=await client.query(`UPDATE ep_schedules SET status=$2,revision=revision+1,last_error=$3,updated_at=NOW()
+      WHERE id=$1 AND status IN ('scheduled','sending') RETURNING id`,[q.id,state,reason.slice(0,1000)]);
+    if(changed.rowCount){
+      await client.query("UPDATE ep_posts SET status=$2,last_error=$3,updated_at=NOW() WHERE id=$1 AND status IN ('scheduled','publishing')",
+        [q.post_id,state==="needs_check"?"needs_check":"scheduled",reason.slice(0,1000)]);
+      if(q.source_submission_id)await client.query("UPDATE submissions SET status=$2,last_error=$3 WHERE id=$1 AND status IN ('drafted','publishing')",
+        [q.source_submission_id,state==="needs_check"?"needs_check":"drafted",reason.slice(0,1000)]);
+      await client.query("DELETE FROM ep_schedule_sessions WHERE post_id=$1",[q.post_id]);
+      await audit(q.channel_id,q.scheduled_by,"schedule_held",q.post_id,{reason},client);
+    }
+    await client.query("COMMIT");
+  }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e;}finally{client.release();}
+  if(changed?.rowCount) await scheduledNotice(q,`⚠️ Отложенный пост #${q.post_id} · «${shortTitle(q.title)}»\n${reason}\nОткройте /scheduled.`);
+}
+async function dispatchScheduled(q) {
+  // Ожидаем свою очередь, затем повторно проверяем права ПЕРЕД HTTP POST.
+  const task=apiTail.catch(()=>{}).then(async()=>{
+    await sleep(Math.max(0,650-(Date.now()-lastApiCall)));
+    const fresh=await getSchedule(q.id);
+    const access=await scheduleAccess(fresh,q.scheduled_by);
+    if(!fresh||fresh.status!=="sending"||Number(fresh.revision)!==Number(q.revision)||
+       !access||access.version!==Number(q.access_version)) {
+      const e=new Error("Права или состояние изменились до отправки.");e.deliveryNotStarted=true;throw e;
+    }
+    if(Date.now()-new Date(q.due_at).getTime()>SCHEDULE_GRACE_MS){
+      const e=new Error("Публикация опоздала больше чем на 5 минут. Нужен новый выбор времени.");e.deliveryNotStarted=true;throw e;
+    }
+    if(!q.body_snapshot||Object.hasOwn(q.body_snapshot,"link")||Object.hasOwn(q.body_snapshot,"sender")){
+      const e=new Error("Небезопасный формат публикации. Отправка остановлена.");e.deliveryNotStarted=true;throw e;
+    }
+    await pool.query("UPDATE ep_schedules SET dispatch_started_at=NOW() WHERE id=$1 AND status='sending'",[q.id]);
+    lastApiCall=Date.now();
+    return maxRequest(`/messages?chat_id=${encodeURIComponent(q.max_chat_id)}`,"POST",q.body_snapshot);
+  });
+  apiTail=task.catch(()=>{});return task;
+}
+async function processOneScheduled() {
+  const candidate=await pool.query(`SELECT id FROM ep_schedules WHERE status='sending'
+    OR (status='scheduled' AND due_at<=NOW() AND next_at<=NOW()) ORDER BY due_at,id LIMIT 1`);
+  if(!candidate.rowCount)return;
+  let q=await getSchedule(candidate.rows[0].id);if(!q)return;
+  if(q.status==="sending"){
+    // После сбоя процесса никакого слепого повтора, даже если HTTP-ответ не успели записать.
+    await holdScheduled(q,q.dispatch_started_at?"Процесс остановился во время отправки. Проверьте канал; автоматический повтор запрещён.":
+      "Процесс остановился до отправки. Материал сохранён; назначьте время заново.",q.dispatch_started_at?"needs_check":"paused");return;
+  }
+  if(Date.now()-new Date(q.due_at).getTime()>SCHEDULE_GRACE_MS){await holdScheduled(q,"Сервис опоздал больше чем на 5 минут. Пост НЕ опубликован; выберите новое время.");return;}
+  let access;
+  try{access=await scheduleAccess(q,q.scheduled_by);}
+  catch(e){await holdScheduled(q,"Не удалось проверить права в MAX. Публикация удержана.");console.error("SCHEDULE RIGHTS ERROR:",e.message);return;}
+  if(!access||access.version!==Number(q.access_version)){await holdScheduled(q,"Права назначившего публикацию админа изменились. Владелец может назначить время заново.");return;}
+  const post=await getOwnPost(q.post_id);
+  if(!post||post.status!=="scheduled"||!post.body){await holdScheduled(q,"Состояние материала изменилось. Отправка остановлена.");return;}
+  if(q.source_submission_id){
+    const source=await getSubmission(q.source_submission_id);
+    if(source?.status!=="drafted"){await holdScheduled(q,"Исходная предложка уже обработана. Отправка остановлена.");return;}
+  }
+  const client=await pool.connect();let claimed;
+  try{
+    await client.query("BEGIN");
+    claimed=await client.query(`UPDATE ep_schedules SET status='sending',locked_at=NOW(),dispatch_started_at=NULL,
+      attempts=attempts+1,updated_at=NOW() WHERE id=$1 AND status='scheduled' AND revision=$2 AND due_at<=NOW() RETURNING *`,[q.id,q.revision]);
+    if(claimed.rowCount){
+      const changed=await client.query("UPDATE ep_posts SET status='publishing',published_body=$2::jsonb,updated_at=NOW() WHERE id=$1 AND status='scheduled' RETURNING id",[q.post_id,JSON.stringify(q.body_snapshot)]);
+      if(!changed.rowCount)throw new Error("Scheduled post state changed");
+      if(q.source_submission_id){
+        const source=await client.query("UPDATE submissions SET status='publishing',published_body=$2::jsonb WHERE id=$1 AND status='drafted' RETURNING id",[q.source_submission_id,JSON.stringify(q.body_snapshot)]);
+        if(!source.rowCount)throw new Error("Scheduled submission state changed");
+      }
+    }
+    await client.query("COMMIT");
+  }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e;}finally{client.release();}
+  if(!claimed.rowCount)return;
+  q={...q,...claimed.rows[0]};let accepted=false;
+  try{
+    const sent=await dispatchScheduled(q);accepted=true;const mid=messageId(sent);
+    const finish=await pool.connect();
+    try{
+      await finish.query("BEGIN");
+      await finish.query("UPDATE ep_posts SET status='published',published_mid=$2,last_error=NULL,updated_at=NOW() WHERE id=$1",[q.post_id,mid]);
+      await finish.query("UPDATE ep_schedules SET status='published',published_mid=$2,published_at=NOW(),last_error=NULL,revision=revision+1,updated_at=NOW() WHERE id=$1",[q.id,mid]);
+      if(q.source_submission_id)await finish.query(`UPDATE submissions SET status='published',published_mid=$2,last_error=NULL,
+        decision_actor_id=$3,decision_kind='human',decided_at=NOW() WHERE id=$1`,[q.source_submission_id,mid,q.scheduled_by]);
+      await finish.query("DELETE FROM ep_schedule_sessions WHERE post_id=$1",[q.post_id]);
+      await audit(q.channel_id,q.scheduled_by,"scheduled_published",q.post_id,{schedule_id:q.id},finish);
+      await finish.query("COMMIT");
+    }catch(e){await finish.query("ROLLBACK").catch(()=>{});throw e;}finally{finish.release();}
+  }catch(e){
+    const definite=!accepted&&(e.deliveryNotStarted||(e.status>=400&&e.status<500&&e.status!==408));
+    await holdScheduled(q,definite?`Пост не отправлен. ${e.message}`:"Результат отправки не подтверждён. Проверьте канал; автоматический повтор запрещён.",definite?"paused":"needs_check");
+    console.error("SCHEDULE PUBLISH ERROR:",e.message);return;
+  }
+  console.log("SCHEDULED POST PUBLISHED:",q.post_id);
+  await scheduledNotice(q,`✅ Отложенный пост #${q.post_id} опубликован в канале «${shortTitle(q.title)}».`);
+}
+
 async function handleUpdate(update) {
   console.log("UPDATE TYPE:", update.update_type);
   switch (update.update_type) {
@@ -2775,9 +3440,13 @@ async function runWorker() {
       ) RETURNING *
     `);
     job = result.rows[0];
-    if (!job) return;
-    await handleUpdate(job.payload);
-    await pool.query("UPDATE ep_webhook_jobs SET state = 'done', last_error = NULL WHERE id = $1", [job.id]);
+    if (job) {
+      await handleUpdate(job.payload);
+      await pool.query("UPDATE ep_webhook_jobs SET state = 'done', last_error = NULL WHERE id = $1", [job.id]);
+    }
+    // Ошибка фоновой отправки не переоткрывает успешно обработанный webhook.
+    try { await processOneScheduled(); }
+    catch (error) { console.error("SCHEDULE WORKER ERROR:", error.message); }
   } catch (error) {
     console.error("Webhook error:", error.message);
     if (job) {
