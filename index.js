@@ -12,7 +12,6 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
-
 const BOT_USERNAME = "id190206555510_3_bot";
 
 if (!MAX_BOT_TOKEN) throw new Error("MAX_BOT_TOKEN is not set");
@@ -94,14 +93,46 @@ async function maxRequest(path, options = {}) {
   return text ? JSON.parse(text) : {};
 }
 
-async function sendToUser(userId, text) {
+async function sendToUser(userId, body) {
   return maxRequest(
     `/messages?user_id=${encodeURIComponent(userId)}`,
     {
       method: "POST",
-      body: JSON.stringify({ text })
+      body: JSON.stringify(body)
     }
   );
+}
+
+async function sendToChannel(chatId, body) {
+  return maxRequest(
+    `/messages?chat_id=${encodeURIComponent(chatId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify(body)
+    }
+  );
+}
+
+async function forwardToUser(userId, mid, extraText = null, attachments = null) {
+  return sendToUser(userId, {
+    text: extraText,
+    attachments,
+    link: {
+      type: "forward",
+      mid
+    }
+  });
+}
+
+async function forwardToChannel(chatId, mid) {
+  return sendToChannel(chatId, {
+    text: null,
+    attachments: null,
+    link: {
+      type: "forward",
+      mid
+    }
+  });
 }
 
 app.get("/", (req, res) => {
@@ -116,13 +147,9 @@ app.post("/webhook", async (req, res) => {
 
   try {
     const update = req.body;
-
     console.log("UPDATE TYPE:", update.update_type);
 
-    // ---------------------------
     // БОТА ДОБАВИЛИ В КАНАЛ
-    // ---------------------------
-
     if (
       update.update_type === "bot_added" &&
       update.is_channel === true
@@ -142,11 +169,7 @@ app.post("/webhook", async (req, res) => {
 
       await pool.query(
         `
-        INSERT INTO users (
-          max_user_id,
-          first_name,
-          last_name
-        )
+        INSERT INTO users (max_user_id, first_name, last_name)
         VALUES ($1, $2, $3)
         ON CONFLICT (max_user_id)
         DO UPDATE SET
@@ -161,11 +184,7 @@ app.post("/webhook", async (req, res) => {
       );
 
       const existing = await pool.query(
-        `
-        SELECT proposal_code
-        FROM channels
-        WHERE max_chat_id = $1
-        `,
+        `SELECT proposal_code FROM channels WHERE max_chat_id = $1`,
         [chatId]
       );
 
@@ -191,40 +210,30 @@ app.post("/webhook", async (req, res) => {
           active = TRUE,
           updated_at = NOW()
         `,
-        [
-          chatId,
-          ownerUserId,
-          title,
-          proposalCode
-        ]
+        [chatId, ownerUserId, title, proposalCode]
       );
 
       const proposalLink =
         `https://max.ru/${BOT_USERNAME}?start=${proposalCode}`;
 
-      await sendToUser(
-        ownerUserId,
-        `✅ Канал «${title}» подключён к EveryPost.\n\n` +
-        `📥 Ссылка для предложки:\n${proposalLink}`
-      );
+      await sendToUser(ownerUserId, {
+        text:
+          `✅ Канал «${title}» подключён к EveryPost.\n\n` +
+          `📥 Ссылка для предложки:\n${proposalLink}`
+      });
 
       console.log("CHANNEL SAVED:", chatId);
-      console.log("PROPOSAL LINK SENT");
-
       return;
     }
 
-    // ---------------------------
-    // ПОДПИСЧИК ОТКРЫЛ ССЫЛКУ
-    // ---------------------------
-
+    // ПОДПИСЧИК ОТКРЫЛ ССЫЛКУ ПРЕДЛОЖКИ
     if (update.update_type === "bot_started") {
       const userId = update.user?.user_id;
       const payload = update.payload;
 
       if (!userId || !payload) return;
 
-      const channelResult = await pool.query(
+      const result = await pool.query(
         `
         SELECT id, title
         FROM channels
@@ -234,15 +243,14 @@ app.post("/webhook", async (req, res) => {
         [payload]
       );
 
-      if (channelResult.rowCount === 0) {
-        await sendToUser(
-          userId,
-          "Эта ссылка предложки недействительна."
-        );
+      if (result.rowCount === 0) {
+        await sendToUser(userId, {
+          text: "Эта ссылка предложки недействительна."
+        });
         return;
       }
 
-      const channel = channelResult.rows[0];
+      const channel = result.rows[0];
 
       await pool.query(
         `
@@ -260,35 +268,22 @@ app.post("/webhook", async (req, res) => {
         [userId, channel.id]
       );
 
-      await sendToUser(
-        userId,
-        `📥 Предложка для канала «${channel.title}».\n\n` +
-        `Отправьте сюда текст, фото или видео.`
-      );
-
-      console.log(
-        "PROPOSAL SESSION STARTED:",
-        userId,
-        "CHANNEL:",
-        channel.id
-      );
+      await sendToUser(userId, {
+        text:
+          `📥 Предложка для канала «${channel.title}».\n\n` +
+          `Отправьте сюда текст, фото или видео.`
+      });
 
       return;
     }
 
-    // ---------------------------
-    // ПОЛУЧИЛИ ПРЕДЛОЖКУ
-    // ---------------------------
-
+    // НОВАЯ ПРЕДЛОЖКА
     if (update.update_type === "message_created") {
       const message = update.message;
       const senderUserId = message?.sender?.user_id;
       const mid = message?.body?.mid;
 
-      if (!senderUserId || !mid) {
-        console.log("MESSAGE WITHOUT USER OR MID");
-        return;
-      }
+      if (!senderUserId || !mid) return;
 
       const sessionResult = await pool.query(
         `
@@ -297,26 +292,20 @@ app.post("/webhook", async (req, res) => {
           c.title,
           c.owner_user_id
         FROM proposal_sessions ps
-        JOIN channels c
-          ON c.id = ps.channel_id
+        JOIN channels c ON c.id = ps.channel_id
         WHERE ps.max_user_id = $1
           AND c.active = TRUE
         `,
         [senderUserId]
       );
 
-      // Пользователь написал боту не через предложку.
       if (sessionResult.rowCount === 0) {
-        console.log(
-          "MESSAGE WITHOUT PROPOSAL SESSION:",
-          senderUserId
-        );
         return;
       }
 
       const session = sessionResult.rows[0];
 
-      await pool.query(
+      const saved = await pool.query(
         `
         INSERT INTO submissions (
           channel_id,
@@ -325,6 +314,7 @@ app.post("/webhook", async (req, res) => {
           status
         )
         VALUES ($1, $2, $3, 'new')
+        RETURNING id
         `,
         [
           session.channel_id,
@@ -333,27 +323,145 @@ app.post("/webhook", async (req, res) => {
         ]
       );
 
-      console.log(
-        "SUBMISSION SAVED:",
-        JSON.stringify({
-          channel_id: session.channel_id,
-          sender_user_id: senderUserId,
-          mid
-        })
+      const submissionId = saved.rows[0].id;
+
+      // Подтверждение подписчику
+      await sendToUser(senderUserId, {
+        text: "✅ Предложка получена."
+      });
+
+      // Пересылаем оригинал владельцу + кнопки
+      await forwardToUser(
+        session.owner_user_id,
+        mid,
+        `📥 Новая предложка\nКанал: «${session.title}»`,
+        [
+          {
+            type: "inline_keyboard",
+            payload: {
+              buttons: [
+                [
+                  {
+                    type: "callback",
+                    text: "🚀 Опубликовать",
+                    payload: `publish_${submissionId}`
+                  },
+                  {
+                    type: "callback",
+                    text: "🗑 Отклонить",
+                    payload: `reject_${submissionId}`
+                  }
+                ]
+              ]
+            }
+          }
+        ]
       );
 
-      await sendToUser(
-        senderUserId,
-        "✅ Предложка получена."
-      );
-
+      console.log("SUBMISSION SENT TO OWNER:", submissionId);
       return;
     }
 
-    // ---------------------------
-    // БОТА УДАЛИЛИ ИЗ КАНАЛА
-    // ---------------------------
+    // ВЛАДЕЛЕЦ НАЖАЛ КНОПКУ
+    if (update.update_type === "message_callback") {
+      const callback = update.callback;
+      const payload = callback?.payload;
+      const actorUserId = callback?.user?.user_id ?? update.user?.user_id;
 
+      if (!payload || !actorUserId) {
+        console.log("CALLBACK WITHOUT PAYLOAD OR USER");
+        return;
+      }
+
+      const match = payload.match(/^(publish|reject)_(\d+)$/);
+
+      if (!match) return;
+
+      const action = match[1];
+      const submissionId = match[2];
+
+      const result = await pool.query(
+        `
+        SELECT
+          s.id,
+          s.status,
+          s.max_message_id,
+          c.max_chat_id,
+          c.owner_user_id,
+          c.title
+        FROM submissions s
+        JOIN channels c ON c.id = s.channel_id
+        WHERE s.id = $1
+        `,
+        [submissionId]
+      );
+
+      if (result.rowCount === 0) return;
+
+      const submission = result.rows[0];
+
+      // Защита: кнопку может использовать только владелец канала
+      if (
+        String(submission.owner_user_id) !==
+        String(actorUserId)
+      ) {
+        console.log("UNAUTHORIZED CALLBACK:", actorUserId);
+        return;
+      }
+
+      if (submission.status !== "new") {
+        await sendToUser(actorUserId, {
+          text: `Эта предложка уже обработана: ${submission.status}`
+        });
+        return;
+      }
+
+      if (action === "reject") {
+        await pool.query(
+          `
+          UPDATE submissions
+          SET status = 'rejected'
+          WHERE id = $1
+          `,
+          [submissionId]
+        );
+
+        await sendToUser(actorUserId, {
+          text: `🗑 Предложка #${submissionId} отклонена.`
+        });
+
+        console.log("SUBMISSION REJECTED:", submissionId);
+        return;
+      }
+
+      if (action === "publish") {
+        // Публикуем исходное сообщение в нужный канал
+        await forwardToChannel(
+          submission.max_chat_id,
+          submission.max_message_id
+        );
+
+        await pool.query(
+          `
+          UPDATE submissions
+          SET status = 'published'
+          WHERE id = $1
+          `,
+          [submissionId]
+        );
+
+        await sendToUser(actorUserId, {
+          text:
+            `✅ Предложка #${submissionId} опубликована ` +
+            `в канале «${submission.title}».`
+        });
+
+        console.log("SUBMISSION PUBLISHED:", submissionId);
+        return;
+      }
+    }
+
+    // БОТА УДАЛИЛИ ИЗ КАНАЛА
     if (
       update.update_type === "bot_removed" &&
       update.chat_id
