@@ -4,12 +4,14 @@ import crypto from "node:crypto";
 import https from "node:https";
 import tls from "node:tls";
 
-// EveryPost: предложка, анонимная публикация, редактор и собственные посты.
+// EveryPost: предложка, анонимная публикация, редактор, постинг и доступ по каналам.
+// Назначения относятся только к EveryPost, права в самом MAX не изменяются.
+// ИИ не подключён. Режим модерации на этой версии только manual.
 // Режим администратора открывается командой /menu в личном чате с ботом.
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "create-post-1";
+const VERSION = "channel-admins-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -269,6 +271,59 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE UNIQUE INDEX IF NOT EXISTS ep_submission_dedupe ON submissions(dedupe_key);
+
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS moderation_mode TEXT NOT NULL DEFAULT 'manual';
+    ALTER TABLE channels ADD COLUMN IF NOT EXISTS notify_owner BOOLEAN NOT NULL DEFAULT TRUE;
+    ALTER TABLE submissions ADD COLUMN IF NOT EXISTS receipt_sent BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE submissions ADD COLUMN IF NOT EXISTS decision_actor_id BIGINT;
+    ALTER TABLE submissions ADD COLUMN IF NOT EXISTS decision_kind TEXT;
+    ALTER TABLE submissions ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
+    CREATE TABLE IF NOT EXISTS ep_channel_admins (
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      max_user_id BIGINT NOT NULL,
+      display_name TEXT NOT NULL,
+      assigned_by BIGINT NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      can_create_posts BOOLEAN NOT NULL DEFAULT FALSE,
+      version INTEGER NOT NULL DEFAULT 1,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(channel_id, max_user_id)
+    );
+    CREATE INDEX IF NOT EXISTS ep_channel_admins_user ON ep_channel_admins(max_user_id, active);
+    CREATE TABLE IF NOT EXISTS ep_access_intents (
+      nonce TEXT PRIMARY KEY,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      owner_user_id BIGINT NOT NULL,
+      target_user_id BIGINT NOT NULL,
+      action TEXT NOT NULL CHECK (action IN ('grant', 'revoke', 'allow_posts', 'deny_posts')),
+      expected_version INTEGER NOT NULL,
+      used BOOLEAN NOT NULL DEFAULT FALSE,
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '10 minutes')
+    );
+    CREATE TABLE IF NOT EXISTS ep_submission_deliveries (
+      submission_id BIGINT NOT NULL REFERENCES submissions(id),
+      recipient_user_id BIGINT NOT NULL,
+      access_version INTEGER NOT NULL,
+      original_mid TEXT,
+      controls_mid TEXT,
+      last_error TEXT,
+      issue_reported BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(submission_id, recipient_user_id)
+    );
+    CREATE TABLE IF NOT EXISTS ep_audit_events (
+      id BIGSERIAL PRIMARY KEY,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      actor_user_id BIGINT,
+      actor_kind TEXT NOT NULL DEFAULT 'human',
+      action TEXT NOT NULL,
+      target_id TEXT,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS ep_audit_channel ON ep_audit_events(channel_id, id);
+
     CREATE TABLE IF NOT EXISTS ep_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS ep_webhook_jobs (
       id BIGSERIAL PRIMARY KEY, event_key TEXT UNIQUE NOT NULL,
@@ -283,9 +338,8 @@ async function initDatabase() {
 }
 
 async function checkAdministrator(chatId, userId) {
-  const result = await maxRequest(`/chats/${encodeURIComponent(chatId)}/members/admins`);
-  const member = result.members?.find(x => String(x.user_id) === String(userId));
-  return Boolean(member && (member.is_owner || member.is_admin));
+  const member = await maxAdministrator(chatId, userId);
+  return Boolean(member && !member.is_bot && (member.is_owner || member.is_admin));
 }
 
 async function handleBotAdded(update) {
@@ -331,6 +385,7 @@ async function handleBotAdded(update) {
 async function handleStart(update) {
   const userId = update.user?.user_id;
   if (userId == null) return;
+  await rememberUser(update.user);
   if (typeof update.payload !== "string" || !update.payload) {
     await showAdminMenu(userId, true);
     return;
@@ -368,22 +423,16 @@ async function handleStart(update) {
   console.log("PROPOSAL SESSION STARTED:", channel.id);
 }
 
-function controlsBody(submissionId, title) {
+function controlsBody(submissionId, title, accessVersion = 0) {
+  const suffix = accessVersion > 0 ? `_a${accessVersion}` : "";
+  const action = (name, text) => ({ type: "callback", text,
+    payload: `${name}_${submissionId}${suffix}` });
   return {
-    text: `📥 Предложка #${submissionId}\nКанал: «${title}»`,
-    attachments: [{
-      type: "inline_keyboard",
-      payload: { buttons: [
-        [
-          { type: "callback", text: "🚀 Опубликовать", payload: `publish_${submissionId}` },
-          { type: "callback", text: "✏️ Редактировать", payload: `edit_${submissionId}` }
-        ],
-        [
-          { type: "callback", text: "👁 Предпросмотр", payload: `preview_${submissionId}` },
-          { type: "callback", text: "🗑 Отклонить", payload: `reject_${submissionId}` }
-        ]
-      ] }
-    }]
+    text: `📥 Предложка #${submissionId}\nКанал: «${shortTitle(title)}»`,
+    attachments: keyboard([
+      [action("publish", "🚀 Опубликовать"), action("edit", "✏️ Редактировать")],
+      [action("preview", "👁 Предпросмотр"), action("reject", "🗑 Отклонить")]
+    ])
   };
 }
 
@@ -394,6 +443,7 @@ async function handleMessage(update) {
   if (!sender || sender.is_bot || sender.user_id == null || !mid) return;
   const chatType = message.recipient?.chat_type;
   if (chatType && chatType !== "dialog") return;
+  await rememberUser(sender);
   // Повторная доставка уже записанной предложки сохраняет прежнее назначение.
   let found = await pool.query(`
     SELECT s.*, c.title, c.owner_user_id, c.max_chat_id, c.active
@@ -442,23 +492,9 @@ async function handleMessage(update) {
   `, [submission.id, JSON.stringify(message)]);
   console.log("SUBMISSION SAVED:", submission.id);
 
-  // Проверяем действующие права получателя, а не только старую запись в БД.
-  if (!(await checkAdministrator(submission.max_chat_id, submission.owner_user_id))) {
-    throw new Error("Channel account no longer has administrator rights");
-  }
-  if (!submission.owner_forward_mid) {
-    const forwarded = await forwardMessage("user_id", submission.owner_user_id, mid);
-    await pool.query("UPDATE submissions SET owner_forward_mid = $2 WHERE id = $1",
-      [submission.id, messageId(forwarded)]);
-  }
-  if (!submission.controls_mid) {
-    const controls = await sendToUser(submission.owner_user_id,
-      controlsBody(submission.id, submission.title));
-    await pool.query("UPDATE submissions SET controls_mid = $2 WHERE id = $1",
-      [submission.id, messageId(controls)]);
-    await notify(sender.user_id, "✅ Предложка передана администратору.");
-  }
-  console.log("SUBMISSION SENT TO OWNER:", submission.id);
+  // Каждому получателю — своя карточка и версия доступа.
+  await deliverSubmission(submission);
+
 }
 
 
@@ -672,9 +708,8 @@ function keyboard(rows) {
 }
 
 async function canEdit(row, userId) {
-  return Boolean(row && row.active && row.status === "new" &&
-    String(row.owner_user_id) === String(userId) &&
-    await checkAdministrator(row.max_chat_id, userId));
+  return Boolean(row && row.status === "new" &&
+    await channelAccess(row.channel_id, userId, "moderate"));
 }
 
 async function sendEditPrompt(session) {
@@ -757,6 +792,8 @@ async function resumeEditor(session) {
 }
 
 async function beginEdit(row, userId) {
+  if (!(await canEdit(row, userId))) return;
+  await pool.query("DELETE FROM proposal_sessions WHERE max_user_id = $1", [userId]);
   const composing = await getComposer(userId);
   if (composing) {
     await notify(userId, "Сначала завершите создание собственного поста или отправьте /cancel.");
@@ -773,15 +810,24 @@ async function beginEdit(row, userId) {
     await resumeEditor(session);
     return;
   }
+  const occupied = await pool.query(
+    "SELECT actor_user_id FROM ep_editor_sessions WHERE submission_id = $1", [row.id]);
+  if (occupied.rowCount) {
+    await notify(userId, `Предложка #${row.id} уже в работе у другого администратора. ` +
+      "Дождитесь завершения правки или её отмены.");
+    return;
+  }
   // Заблаговременно сохраняем оригинал, в том числе для старых предложок.
   await loadSubmissionSource(row);
   const created = await pool.query(`
     INSERT INTO ep_editor_sessions(actor_user_id, submission_id, nonce, stage)
     VALUES ($1, $2, $3, 'waiting_text')
-    ON CONFLICT (actor_user_id) DO NOTHING
+    ON CONFLICT DO NOTHING
     RETURNING *
   `, [userId, row.id, newEditNonce()]);
   session = created.rows[0] || await getEditorSession(userId);
+  if (!session) await notify(userId, "Эту предложку уже открыл другой администратор.");
+  if (created.rowCount) await audit(row.channel_id, userId, "edit_started", row.id);
   if (session) {
     console.log("EDIT STARTED:", session.submission_id);
     await resumeEditor(session);
@@ -790,9 +836,9 @@ async function beginEdit(row, userId) {
 
 async function returnOriginalControls(submissionId, userId) {
   const row = await getSubmission(submissionId);
-  if (await canEdit(row, userId)) {
-    await sendToUser(userId, controlsBody(row.id, row.title));
-  }
+  if (!row || row.status !== "new") return;
+  const access = await channelAccess(row.channel_id, userId, "moderate");
+  if (access) await sendToUser(userId, controlsBody(row.id, row.title, access.version));
 }
 
 async function cancelEditor(session, inputMid = null) {
@@ -934,6 +980,7 @@ async function handleEditorMessage(message) {
     throw error;
   } finally { client.release(); }
   if (changed?.rowCount) {
+    await audit(row.channel_id, userId, "edit_saved", row.id);
     console.log("EDIT DRAFT SAVED:", row.id);
     await showDraft(changed.rows[0]);
   }
@@ -941,6 +988,10 @@ async function handleEditorMessage(message) {
 }
 
 async function publishPrepared(row, userId, callbackId, body, session = null) {
+  if (!(await canEdit(row, userId))) {
+    await notify(userId, "Публикация остановлена: доступ к каналу изменился.");
+    return;
+  }
   // Claim и снимок будущего поста сохраняются одним запросом.
   // Старые кнопки исходной предложки не обходят открытый редактор.
   const claimed = session
@@ -970,9 +1021,10 @@ async function publishPrepared(row, userId, callbackId, body, session = null) {
     const published = await sendMessage("chat_id", row.max_chat_id, body);
     accepted = true;
     await pool.query(`
-      UPDATE submissions SET status = 'published', published_mid = $2, last_error = NULL
+      UPDATE submissions SET status = 'published', published_mid = $2, last_error = NULL,
+        decision_actor_id = $3, decision_kind = 'human', decided_at = NOW()
       WHERE id = $1
-    `, [row.id, messageId(published)]);
+    `, [row.id, messageId(published), userId]);
   } catch (error) {
     // При сетевой неопределённости не делаем автоматический повтор публикации.
     const definiteRejection = !accepted && error.status >= 400 && error.status < 500 && error.status !== 408;
@@ -989,22 +1041,28 @@ async function publishPrepared(row, userId, callbackId, body, session = null) {
   await answerCallback(callbackId,
     `✅ Предложка #${row.id} опубликована в канале «${row.title}».`, true);
   await notify(userId, `✅ Предложка #${row.id} опубликована в канале «${row.title}».`);
+  await audit(row.channel_id, userId, "submission_published", row.id);
   console.log("SUBMISSION PUBLISHED ANONYMOUSLY:", row.id);
 }
 
 async function handleCallback(update) {
+  // Настройки доступа не меняются из групп или пересланных чужих карточек.
+  const recipientType = update.message?.recipient?.chat_type;
+  if (recipientType && recipientType !== "dialog") return;
+  if (await handleAccessCallback(update)) return;
   if (await handleAdminCallback(update)) return;
   const callback = update.callback;
   const userId = callback?.user?.user_id;
   const payload = typeof callback?.payload === "string" ? callback.payload : "";
-  const basic = payload.match(/^(publish|reject|edit|preview)_(\d+)$/);
+  const basic = payload.match(/^(publish|reject|edit|preview)_(\d+)(?:_a(\d+))?$/);
   const draft = payload.match(/^(draftpublish|again|cancel|draftpreview)_(\d+)_([a-f0-9]{24})$/);
   if ((!basic && !draft) || userId == null) return;
   const [, action, id] = draft || basic;
   const row = await getSubmission(id);
-  if (!row || String(row.owner_user_id) !== String(userId)) {
+  const access = row ? await channelAccess(row.channel_id, userId, "moderate") : null;
+  if (!access || (basic && !access.owner && Number(basic[3]) !== access.version)) {
     await answerCallback(callback.callback_id);
-    console.log("UNAUTHORIZED OR MISSING CALLBACK");
+    await notify(userId, "Нет доступа к этой карточке либо права изменились. Откройте /menu.");
     return;
   }
   // Снимаем ожидание кнопки. Саму карточку уберём только после завершения.
@@ -1016,10 +1074,7 @@ async function handleCallback(update) {
       "затем вернитесь к предложке. Предложка не опубликована.");
     return;
   }
-  if (!row.active || !(await checkAdministrator(row.max_chat_id, userId))) {
-    await notify(userId, "Канал отключён или у вас больше нет прав администратора.");
-    return;
-  }
+
   if (row.status !== "new") {
     if (["published", "rejected"].includes(row.status)) {
       // Восстановление после остановки процесса между записью результата
@@ -1032,6 +1087,13 @@ async function handleCallback(update) {
     };
     await notify(userId,
       `Предложка #${id}: ${labels[row.status] || row.status}. Повторная публикация не выполнена.`);
+    return;
+  }
+
+  const lock = await pool.query(
+    "SELECT actor_user_id FROM ep_editor_sessions WHERE submission_id = $1", [id]);
+  if (lock.rowCount && String(lock.rows[0].actor_user_id) !== String(userId)) {
+    await notify(userId, `Предложка #${id} уже в работе у другого администратора.`);
     return;
   }
 
@@ -1071,10 +1133,13 @@ async function handleCallback(update) {
 
   if (action === "reject") {
     const changed = await pool.query(
-      "UPDATE submissions SET status = 'rejected' WHERE id = $1 AND status = 'new' RETURNING id", [id]);
+      `UPDATE submissions SET status = 'rejected', decision_actor_id = $2,
+         decision_kind = 'human', decided_at = NOW()
+       WHERE id = $1 AND status = 'new' RETURNING id`, [id, userId]);
     if (!changed.rowCount) return;
     await pool.query("DELETE FROM ep_editor_sessions WHERE submission_id = $1", [id]);
     await answerCallback(callback.callback_id, `🗑 Предложка #${id} отклонена.`, true);
+    await audit(row.channel_id, userId, "submission_rejected", id);
     console.log("SUBMISSION REJECTED:", id);
     return;
   }
@@ -1105,7 +1170,7 @@ async function handleCallback(update) {
   }
   if (action === "preview") {
     await sendToUser(userId, body);
-    const controls = controlsBody(id, row.title);
+    const controls = controlsBody(id, row.title, access.version);
     controls.text = `👁 Предпросмотр предложки #${id}\nКанал: «${row.title}»\n\n` +
       `Выше исходный вариант без ссылки на отправителя. В канал он ещё не отправлен.`;
     await sendToUser(userId, controls);
@@ -1113,6 +1178,483 @@ async function handleCallback(update) {
   }
   await publishPrepared(row, userId, callback.callback_id, body);
 }
+
+// ---------- Доступ администраторов: строго отдельно для каждого канала ----------
+// Подписка остаётся у канала. Эта версия не включает ИИ и не изменяет права MAX.
+// Для будущей автоматизации есть moderation_mode и тип автора решения.
+// Любой неизвестный режим запрещает публикацию, а не включает автоматику.
+
+async function rememberUser(user) {
+  if (!user || user.user_id == null || user.is_bot) return;
+  await pool.query(`
+    INSERT INTO users(max_user_id, first_name, last_name) VALUES ($1, $2, $3)
+    ON CONFLICT (max_user_id) DO UPDATE SET
+      first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name
+  `, [user.user_id, user.first_name ?? null, user.last_name ?? null]);
+}
+
+async function maxAdministrators(chatId) {
+  const result = await maxRequest(`/chats/${encodeURIComponent(chatId)}/members/admins`);
+  if (!Array.isArray(result.members)) throw new Error("MAX returned no administrator list");
+  return result.members;
+}
+async function maxAdministrator(chatId, userId) {
+  return (await maxAdministrators(chatId)).find(m => String(m.user_id) === String(userId)) || null;
+}
+function memberCanPublish(member) {
+  if (!member || member.is_bot) return false;
+  return Boolean(member.is_owner || (member.is_admin && Array.isArray(member.permissions) &&
+    member.permissions.some(p => ["write", "post_edit_delete_message"].includes(p))));
+}
+function displayName(user) {
+  return ([user?.first_name, user?.last_name].filter(Boolean).join(" ").trim() ||
+    user?.display_name || `ID ${user?.user_id ?? user?.max_user_id}`).slice(0, 70);
+}
+function pageNumber(page) { return Math.max(0, Math.min(100000, Number(page) || 0)); }
+function pageButtons(prefix, page, total) {
+  const rows = [];
+  if (page > 0) rows.push(button("◀️ Назад", `${prefix}_${page - 1}`));
+  if ((page + 1) * ADMIN_PAGE_SIZE < total) rows.push(button("Далее ▶️", `${prefix}_${page + 1}`));
+  return rows;
+}
+async function getChannel(id) {
+  return (await pool.query("SELECT * FROM channels WHERE id = $1", [id])).rows[0] || null;
+}
+async function getGrant(channelId, userId) {
+  return (await pool.query(`
+    SELECT * FROM ep_channel_admins WHERE channel_id = $1 AND max_user_id = $2
+  `, [channelId, userId])).rows[0] || null;
+}
+
+async function channelAccess(channelId, userId, capability = "view") {
+  const channel = await getChannel(channelId);
+  if (!channel?.active || userId == null) return null;
+  const owner = String(channel.owner_user_id) === String(userId);
+  let grant = null;
+  if (!owner) {
+    if (capability === "manage") return null;
+    grant = await getGrant(channel.id, userId);
+    if (!grant?.active) return null;
+    if (capability === "create" && !grant.can_create_posts) return null;
+  }
+  const member = await maxAdministrator(channel.max_chat_id, userId);
+  if (!member || member.is_bot || !(member.is_admin || member.is_owner)) return null;
+  if (["moderate", "create"].includes(capability)) {
+    if (channel.moderation_mode !== "manual" || !memberCanPublish(member)) return null;
+  }
+  return { channel, owner, grant, version: owner ? 0 : Number(grant.version), member,
+    can_create: memberCanPublish(member) && (owner || grant.can_create_posts) };
+}
+
+async function accessibleChannels(userId, capability = "view") {
+  const result = await pool.query(`
+    SELECT c.* FROM channels c WHERE c.active = TRUE
+      AND (c.owner_user_id = $1 OR EXISTS (
+        SELECT 1 FROM ep_channel_admins a WHERE a.channel_id = c.id
+          AND a.max_user_id = $1 AND a.active = TRUE))
+    ORDER BY c.id
+  `, [userId]);
+  const rows = [];
+  for (const channel of result.rows) {
+    try {
+      const access = await channelAccess(channel.id, userId, capability);
+      if (access) rows.push({ ...channel, access_owner: access.owner, can_create: access.can_create });
+    } catch (error) {
+      // При недоступности API список закрывается безопасно: чужие данные не показываются.
+      console.error("CHANNEL ACCESS CHECK ERROR:", channel.id, error.message);
+    }
+  }
+  return rows;
+}
+
+async function audit(channelId, actor, action, targetId = null, details = {}, client = pool) {
+  await client.query(`
+    INSERT INTO ep_audit_events(channel_id, actor_user_id, actor_kind, action, target_id, details)
+    VALUES ($1, $2, 'human', $3, $4, $5::jsonb)
+  `, [channelId, actor, action, targetId == null ? null : String(targetId), JSON.stringify(details)]);
+}
+
+async function requireOwner(channelId, userId) {
+  const access = await channelAccess(channelId, userId, "manage");
+  if (!access?.owner) {
+    await notify(userId, "Эта настройка доступна только владельцу данного канала в EveryPost.");
+    return null;
+  }
+  return access.channel;
+}
+
+async function showChannelAccess(channelId, userId) {
+  const access = await channelAccess(channelId, userId);
+  if (!access) { await notify(userId, "Канал недоступен. Откройте /menu."); return; }
+  const c = access.channel;
+  if (!access.owner) {
+    await sendToUser(userId, {
+      text: `📁 Канал «${shortTitle(c.title)}»\nВаша роль: админ предложки.\n` +
+        `Собственные посты: ${access.grant.can_create_posts ? "разрешены" : "не разрешены"}.\n\n` +
+        "Доступ относится только к этому каналу. Платежи и назначение сотрудников доступны владельцу.",
+      attachments: keyboard([[button("📥 Предложки", "menu_inbox_0")],
+        [button("↩️ Мои каналы", "menu_channels_0")]])
+    });
+    return;
+  }
+  const grants = await pool.query(`
+    SELECT max_user_id, display_name FROM ep_channel_admins
+    WHERE channel_id = $1 AND active = TRUE ORDER BY max_user_id
+  `, [c.id]);
+  await sendToUser(userId, {
+    text: `📁 Канал «${shortTitle(c.title)}»\n\n` +
+      `📥 Предложка: https://max.ru/${BOT_USERNAME}?start=${c.proposal_code}\n\n` +
+      `Назначено админов: ${grants.rowCount}.\n` +
+      "Назначение и разжалование меняют только доступ в EveryPost. " +
+      "Права в самом MAX остаются прежними.",
+    attachments: keyboard([
+      [button("Назначить админом", `access_add_${c.id}_0`),
+       button("Разжаловать", `access_remove_${c.id}_0`)],
+      [button("Админы канала", `access_members_${c.id}_0`)],
+      [button(`Уведомления мне: ${c.notify_owner ? "вкл" : "выкл"}`,
+        `access_notify_${c.id}_${c.notify_owner ? 0 : 1}`)],
+      [button("История действий", `access_log_${c.id}_0`)],
+      [button("↩️ Мои каналы", "menu_channels_0")]
+    ])
+  });
+}
+
+async function showAdminCandidates(channelId, userId, page = 0) {
+  const c = await requireOwner(channelId, userId);
+  if (!c) return;
+  const active = await pool.query(`
+    SELECT max_user_id FROM ep_channel_admins WHERE channel_id = $1 AND active = TRUE
+  `, [c.id]);
+  const assigned = new Set(active.rows.map(r => String(r.max_user_id)));
+  const candidates = (await maxAdministrators(c.max_chat_id)).filter(m =>
+    memberCanPublish(m) && String(m.user_id) !== String(c.owner_user_id) &&
+    !assigned.has(String(m.user_id)));
+  page = pageNumber(page);
+  const rows = candidates.slice(page * ADMIN_PAGE_SIZE, (page + 1) * ADMIN_PAGE_SIZE);
+  const nav = pageButtons(`access_add_${c.id}`, page, candidates.length);
+  await sendToUser(userId, {
+    text: `Назначить админом · «${shortTitle(c.title)}»\n\n` + (candidates.length
+      ? "Выберите человека. Показаны администраторы этого MAX-канала с правом публикации, " +
+        "которым ещё не выдан доступ к EveryPost. Перед тестом человек должен открыть нашего бота и отправить /menu."
+      : "Нет подходящих кандидатов. Добавьте человека администратором ЭТОГО канала в MAX " +
+        "и включите ему право публикации. Попросите его открыть EveryPost и отправить /menu. " +
+        "Затем откройте этот список снова."),
+    attachments: keyboard([
+      ...rows.map(m => [button(displayName(m), `access_grant_${c.id}_${m.user_id}`)]),
+      ...(nav.length ? [nav] : []),
+      [button("↩️ К каналу", `access_channel_${c.id}`)]
+    ])
+  });
+}
+
+async function showChannelAdmins(channelId, userId, page = 0, remove = false) {
+  const c = await requireOwner(channelId, userId);
+  if (!c) return;
+  const result = await pool.query(`
+    SELECT * FROM ep_channel_admins WHERE channel_id = $1 AND active = TRUE ORDER BY max_user_id
+  `, [channelId]);
+  page = pageNumber(page);
+  const rows = result.rows.slice(page * ADMIN_PAGE_SIZE, (page + 1) * ADMIN_PAGE_SIZE);
+  const prefix = remove ? "access_remove" : "access_members";
+  const nav = pageButtons(`${prefix}_${c.id}`, page, result.rowCount);
+  await sendToUser(userId, {
+    text: `${remove ? "Разжаловать" : "Админы канала"} · «${shortTitle(c.title)}»\n\n` +
+      (result.rowCount ? "Выберите человека." : "Назначенных админов пока нет."),
+    attachments: keyboard([
+      ...rows.map(m => [button(m.display_name,
+        `access_${remove ? "revoke" : "person"}_${c.id}_${m.max_user_id}`)]),
+      ...(nav.length ? [nav] : []), [button("↩️ К каналу", `access_channel_${c.id}`)]
+    ])
+  });
+}
+
+async function showAdminPerson(channelId, ownerId, targetId) {
+  const c = await requireOwner(channelId, ownerId);
+  if (!c) return;
+  const grant = await getGrant(c.id, targetId);
+  if (!grant?.active) { await notify(ownerId, "Админ уже разжалован."); return; }
+  await sendToUser(ownerId, {
+    text: `Админ: ${grant.display_name}\nКанал: «${shortTitle(c.title)}»\n\n` +
+      "Предложки: получать, редактировать, публиковать, отклонять.\n" +
+      `Собственные посты: ${grant.can_create_posts ? "разрешены" : "не разрешены"}.`,
+    attachments: keyboard([
+      [button(grant.can_create_posts ? "Запретить свои посты" : "Разрешить свои посты",
+        `access_posts_${c.id}_${targetId}`)],
+      [button("Разжаловать", `access_revoke_${c.id}_${targetId}`)],
+      [button("↩️ К каналу", `access_channel_${c.id}`)]
+    ])
+  });
+}
+
+async function proposeAccessChange(channelId, ownerId, targetId, action) {
+  const c = await requireOwner(channelId, ownerId);
+  if (!c) return;
+  if (String(targetId) === String(c.owner_user_id)) {
+    await notify(ownerId, "Владельцу не нужно назначать эти права, разжаловать его здесь нельзя."); return;
+  }
+  const grant = await getGrant(c.id, targetId);
+  let name = grant?.display_name;
+  if (action === "grant") {
+    if (grant?.active) { await notify(ownerId, "Этот человек уже назначен админом."); return; }
+    const candidate = await maxAdministrator(c.max_chat_id, targetId);
+    if (!memberCanPublish(candidate)) {
+      await notify(ownerId, "У кандидата нет действующих прав администратора на публикацию в этом MAX-канале."); return;
+    }
+    name = displayName(candidate);
+  } else if (!grant?.active) {
+    await notify(ownerId, "Эти права уже сняты. Обновите список."); return;
+  }
+  const nonce = newEditNonce();
+  await pool.query(`
+    INSERT INTO ep_access_intents(nonce, channel_id, owner_user_id, target_user_id, action, expected_version)
+    VALUES ($1, $2, $3, $4, $5, $6)
+  `, [nonce, c.id, ownerId, targetId, action, grant ? Number(grant.version) : 0]);
+  const label = {grant: "Назначить админом", revoke: "Разжаловать",
+    allow_posts: "Разрешить свои посты", deny_posts: "Запретить свои посты"}[action];
+  await sendToUser(ownerId, {
+    text: `${label}: ${name}\nКанал: «${shortTitle(c.title)}»\n\n` +
+      (action === "grant"
+        ? "Человек получит доступ к предложкам только этого канала. " +
+          "Создание собственных постов пока выключено. Платежи и назначение сотрудников недоступны."
+        : action === "revoke"
+          ? "Доступ к предложкам этого канала в EveryPost будет снят. " +
+            "Незавершённая правка будет закрыта. Права в самом MAX не меняются."
+          : "Это отдельное разрешение внутри EveryPost. Право работы с предложкой не изменится."),
+    attachments: keyboard([[button(label, `access_confirm_${nonce}`)],
+      [button("Отмена", `access_abort_${nonce}`)]])
+  });
+}
+
+async function confirmAccessChange(nonce, ownerId) {
+  const selected = await pool.query(`
+    SELECT * FROM ep_access_intents
+    WHERE nonce = $1 AND owner_user_id = $2 AND used = FALSE AND expires_at > NOW()
+  `, [nonce, ownerId]);
+  const intent = selected.rows[0];
+  if (!intent) { await notify(ownerId, "Подтверждение устарело или уже использовано. Откройте канал заново."); return; }
+  const c = await requireOwner(intent.channel_id, ownerId);
+  if (!c) return;
+  if (String(intent.target_user_id) === String(c.owner_user_id)) return;
+  let target = null;
+  if (["grant", "allow_posts"].includes(intent.action)) {
+    target = await maxAdministrator(c.max_chat_id, intent.target_user_id);
+    if (!memberCanPublish(target)) {
+      await notify(ownerId, "Права человека в MAX изменились. Доступ не выдан."); return;
+    }
+  }
+  const client = await pool.connect();
+  let changed;
+  try {
+    await client.query("BEGIN");
+    // Взаимное исключение настроек этого канала плюс одноразовый nonce.
+    await client.query("SELECT id FROM channels WHERE id = $1 FOR UPDATE", [c.id]);
+    const consumed = await client.query(`
+      UPDATE ep_access_intents SET used = TRUE
+      WHERE nonce = $1 AND owner_user_id = $2 AND used = FALSE AND expires_at > NOW()
+      RETURNING *
+    `, [nonce, ownerId]);
+    const current = (await client.query(`
+      SELECT * FROM ep_channel_admins WHERE channel_id = $1 AND max_user_id = $2 FOR UPDATE
+    `, [c.id, intent.target_user_id])).rows[0];
+    if (!consumed.rowCount || Number(current?.version || 0) !== Number(intent.expected_version)) {
+      await client.query("COMMIT");
+      await notify(ownerId, "Права уже изменились. Обновите карточку канала."); return;
+    }
+    const active = intent.action !== "revoke";
+    const allow = intent.action === "allow_posts" ||
+      (intent.action === "revoke" && Boolean(current?.can_create_posts));
+    changed = (await client.query(`
+      INSERT INTO ep_channel_admins(channel_id, max_user_id, display_name, assigned_by,
+        active, can_create_posts, version)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (channel_id, max_user_id) DO UPDATE SET
+        display_name = EXCLUDED.display_name, assigned_by = EXCLUDED.assigned_by,
+        active = EXCLUDED.active, can_create_posts = EXCLUDED.can_create_posts,
+        version = EXCLUDED.version, updated_at = NOW()
+      RETURNING *
+    `, [c.id, intent.target_user_id, target ? displayName(target) : current.display_name,
+      ownerId, active, allow, Number(current?.version || 0) + 1])).rows[0];
+    if (intent.action === "revoke") {
+      await client.query(`
+        DELETE FROM ep_editor_sessions WHERE actor_user_id = $1
+          AND submission_id IN (SELECT id FROM submissions WHERE channel_id = $2)
+      `, [intent.target_user_id, c.id]);
+    }
+    if (["revoke", "deny_posts"].includes(intent.action)) {
+      // Убираем сессию, но не удаляем материалы и историю публикаций.
+      await client.query(`
+        DELETE FROM ep_composer_sessions WHERE actor_user_id = $1
+          AND post_id IN (SELECT id FROM ep_posts WHERE channel_id = $2)
+      `, [intent.target_user_id, c.id]);
+    }
+    await audit(c.id, ownerId, `access_${intent.action}`, intent.target_user_id,
+      { version: changed.version, can_create_posts: changed.can_create_posts }, client);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {}); throw error;
+  } finally { client.release(); }
+  const text = intent.action === "grant" ? "✅ Админ назначен."
+    : intent.action === "revoke" ? "✅ Админ разжалован." : "✅ Разрешение обновлено.";
+  await notify(ownerId, `${text}\n${changed.display_name} · «${shortTitle(c.title)}»`);
+  try {
+    await sendToUser(changed.max_user_id, {text:
+      intent.action === "revoke"
+        ? `Доступ к каналу «${shortTitle(c.title)}» в EveryPost снят. ` +
+          "Новые предложки не будут присылаться, прежние кнопки больше не дают доступа."
+        : `Вам выдан доступ к предложкам канала «${shortTitle(c.title)}».\n` +
+          `Собственные посты: ${changed.can_create_posts ? "разрешены" : "не разрешены"}.\n` +
+          "Отправьте /menu, чтобы открыть управление. Старые карточки после изменения прав нужно открыть заново из меню."
+    });
+  } catch (error) {
+    await notify(ownerId, "Права сохранены, но уведомление человеку не доставлено. " +
+      "Попросите его открыть EveryPost и отправить /menu.");
+    console.error("ADMIN NOTIFICATION ERROR:", error.message);
+  }
+}
+
+async function showAccessLog(channelId, ownerId, page = 0) {
+  const c = await requireOwner(channelId, ownerId);
+  if (!c) return;
+  page = pageNumber(page);
+  const result = await pool.query(`
+    SELECT a.*, u.first_name, u.last_name FROM ep_audit_events a
+    LEFT JOIN users u ON u.max_user_id = a.actor_user_id
+    WHERE a.channel_id = $1 ORDER BY a.id DESC LIMIT $2 OFFSET $3
+  `, [c.id, ADMIN_PAGE_SIZE + 1, page * ADMIN_PAGE_SIZE]);
+  const labels = {access_grant: "Назначен админ", access_revoke: "Админ разжалован",
+    access_allow_posts: "Разрешены свои посты", access_deny_posts: "Запрещены свои посты",
+    edit_started: "Открыта правка", edit_saved: "Сохранена правка",
+    submission_published: "Предложка опубликована", submission_rejected: "Предложка отклонена",
+    own_post_published: "Собственный пост опубликован", owner_notifications: "Уведомления владельцу"};
+  const rows = result.rows.slice(0, ADMIN_PAGE_SIZE);
+  const nav = [];
+  if (page > 0) nav.push(button("◀️ Назад", `access_log_${c.id}_${page - 1}`));
+  if (result.rowCount > ADMIN_PAGE_SIZE) nav.push(button("Далее ▶️", `access_log_${c.id}_${page + 1}`));
+  await sendToUser(ownerId, {
+    text: `История · «${shortTitle(c.title)}»\nВремя UTC.\n\n` + (rows.length
+      ? rows.map(r => `${new Date(r.created_at).toISOString().slice(0,16).replace("T", " ")} · ` +
+          `${displayName({ ...r, user_id: r.actor_user_id })}\n` +
+          `${labels[r.action] || r.action}${r.target_id ? ` · #${r.target_id}` : ""}`).join("\n\n")
+      : "Новых записей пока нет. Действия до этой версии в историю не добавляются."),
+    attachments: keyboard([...(nav.length ? [nav] : []),
+      [button("↩️ К каналу", `access_channel_${c.id}`)]])
+  });
+}
+
+async function handleAccessCallback(update) {
+  const cb = update.callback;
+  const ownerId = cb?.user?.user_id;
+  const value = typeof cb?.payload === "string" ? cb.payload : "";
+  if (!value.startsWith("access_") || ownerId == null) return false;
+  await answerCallback(cb.callback_id);
+  let m;
+  if ((m = value.match(/^access_channel_(\d+)$/))) {
+    await showChannelAccess(m[1], ownerId);
+  } else if ((m = value.match(/^access_(add|remove|members|log)_(\d+)_(\d+)$/))) {
+    if (m[1] === "add") await showAdminCandidates(m[2], ownerId, m[3]);
+    else if (m[1] === "log") await showAccessLog(m[2], ownerId, m[3]);
+    else await showChannelAdmins(m[2], ownerId, m[3], m[1] === "remove");
+  } else if ((m = value.match(/^access_(grant|revoke|person|posts)_(\d+)_(\d+)$/))) {
+    if (m[1] === "person") await showAdminPerson(m[2], ownerId, m[3]);
+    else if (m[1] === "posts") {
+      if (!(await requireOwner(m[2], ownerId))) return true;
+      const grant = await getGrant(m[2], m[3]);
+      if (grant?.active) await proposeAccessChange(m[2], ownerId, m[3],
+        grant.can_create_posts ? "deny_posts" : "allow_posts");
+    } else await proposeAccessChange(m[2], ownerId, m[3], m[1]);
+  } else if ((m = value.match(/^access_confirm_([a-f0-9]{24})$/))) {
+    await confirmAccessChange(m[1], ownerId);
+    await answerCallback(cb.callback_id, "Заявка обработана. Результат — в сообщении ниже.", true);
+  } else if ((m = value.match(/^access_abort_([a-f0-9]{24})$/))) {
+    await pool.query(`UPDATE ep_access_intents SET used = TRUE
+      WHERE nonce = $1 AND owner_user_id = $2 AND used = FALSE`, [m[1], ownerId]);
+    await answerCallback(cb.callback_id, "Изменение прав отменено.", true);
+  } else if ((m = value.match(/^access_notify_(\d+)_([01])$/))) {
+    const c = await requireOwner(m[1], ownerId);
+    if (c) {
+      await pool.query("UPDATE channels SET notify_owner = $2 WHERE id = $1", [c.id, m[2] === "1"]);
+      await audit(c.id, ownerId, "owner_notifications", null, { enabled: m[2] === "1" });
+      await notify(ownerId, m[2] === "1" ? "Уведомления вам включены."
+        : "Уведомления вам выключены, когда доступен назначенный админ. " +
+          "Если админам нельзя доставить предложку, она будет отправлена вам. " +
+          "Все материалы по-прежнему доступны вам через «Предложки».");
+      await showChannelAccess(c.id, ownerId);
+    }
+  }
+  return true;
+}
+
+// ---------- Доставка предложок с раздельной проверкой каждого получателя ----------
+
+async function deliverOne(submission, userId) {
+  const access = await channelAccess(submission.channel_id, userId, "moderate");
+  if (!access) return false;
+  await pool.query(`
+    INSERT INTO ep_submission_deliveries(submission_id, recipient_user_id, access_version, original_mid, controls_mid)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (submission_id, recipient_user_id) DO NOTHING
+  `, [submission.id, userId, access.version,
+    access.owner ? submission.owner_forward_mid : null, access.owner ? submission.controls_mid : null]);
+  let delivery = (await pool.query(`
+    SELECT * FROM ep_submission_deliveries WHERE submission_id = $1 AND recipient_user_id = $2
+  `, [submission.id, userId])).rows[0];
+  if (Number(delivery.access_version) !== access.version) {
+    delivery = (await pool.query(`
+      UPDATE ep_submission_deliveries SET access_version = $3, original_mid = NULL,
+        controls_mid = NULL, last_error = NULL, issue_reported = FALSE, updated_at = NOW()
+      WHERE submission_id = $1 AND recipient_user_id = $2 RETURNING *
+    `, [submission.id, userId, access.version])).rows[0];
+  }
+  if (!delivery.original_mid) {
+    const sent = await forwardMessage("user_id", userId, submission.max_message_id);
+    await pool.query(`UPDATE ep_submission_deliveries SET original_mid = $3, updated_at = NOW()
+      WHERE submission_id = $1 AND recipient_user_id = $2`, [submission.id, userId, messageId(sent)]);
+  }
+  if (!delivery.controls_mid) {
+    const card = await sendToUser(userId, controlsBody(submission.id, submission.title, access.version));
+    await pool.query(`UPDATE ep_submission_deliveries SET controls_mid = $3,
+      last_error = NULL, updated_at = NOW() WHERE submission_id = $1 AND recipient_user_id = $2`,
+      [submission.id, userId, messageId(card)]);
+  }
+  return true;
+}
+
+async function deliverSubmission(submission) {
+  const c = await getChannel(submission.channel_id);
+  if (!c?.active || c.moderation_mode !== "manual") return;
+  if (!submission.receipt_sent) {
+    await notify(submission.sender_user_id, "✅ Предложка получена.");
+    await pool.query("UPDATE submissions SET receipt_sent = TRUE WHERE id = $1", [submission.id]);
+  }
+  const members = await pool.query(`SELECT max_user_id FROM ep_channel_admins
+    WHERE channel_id = $1 AND active = TRUE ORDER BY max_user_id`, [c.id]);
+  let deliveredToAdmin = false;
+  let failures = 0;
+  for (const member of members.rows) {
+    try {
+      if (await deliverOne(submission, member.max_user_id)) deliveredToAdmin = true;
+    } catch (error) {
+      failures++;
+      console.error("ADMIN DELIVERY ERROR:", submission.id, error.message);
+      await pool.query(`UPDATE ep_submission_deliveries SET last_error = $3
+        WHERE submission_id = $1 AND recipient_user_id = $2`,
+        [submission.id, member.max_user_id, error.message.slice(0, 1000)]);
+    }
+  }
+  // Ошибка одного получателя не препятствует доставке остальным.
+  let deliveredToOwner = false;
+  if (c.notify_owner || !deliveredToAdmin) {
+    try { deliveredToOwner = await deliverOne(submission, c.owner_user_id); }
+    catch (error) { failures++; console.error("OWNER DELIVERY ERROR:", error.message); }
+  }
+  if (!deliveredToOwner && !deliveredToAdmin && failures === 0) failures = 1;
+  if (failures) {
+    console.log("SUBMISSION DELIVERY INCOMPLETE:", submission.id);
+    throw new Error(`Submission ${submission.id}: ${failures} delivery attempt(s) failed; saved in inbox`);
+  }
+  console.log("SUBMISSION SENT TO ADMINS:", submission.id);
+}
+
 
 // ---------- Меню администратора и собственные посты ----------
 // Собственные посты хранятся отдельно от предложок.
@@ -1137,26 +1679,21 @@ async function getOwnPost(postId) {
 }
 
 async function hasOwnChannel(userId) {
-  const result = await pool.query(`
-    SELECT 1 FROM channels WHERE owner_user_id = $1 AND active = TRUE LIMIT 1
-  `, [userId]);
-  return result.rowCount > 0;
+  return (await accessibleChannels(userId)).length > 0;
 }
 
 async function canUseOwnPost(row, userId) {
-  return Boolean(row && row.active &&
-    String(row.author_user_id) === String(userId) &&
-    String(row.owner_user_id) === String(userId) &&
-    await checkAdministrator(row.max_chat_id, userId));
+  return Boolean(row && String(row.author_user_id) === String(userId) &&
+    await channelAccess(row.channel_id, userId, "create"));
 }
 
-function adminMenuBody() {
+function adminMenuBody(canCreate = true) {
   return {
     text: "EveryPost · Управление каналами\n\n" +
-      "Создайте публикацию или откройте предложки. " +
-      "В канал ничего не отправляется без вашего подтверждения.",
+      "Здесь только каналы, к которым вам выдан доступ. " +
+      "Без подтверждения ничего не публикуется.",
     attachments: keyboard([
-      [button("➕ Создать пост", "menu_create")],
+      ...(canCreate ? [[button("➕ Создать пост", "menu_create")]] : []),
       [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")]
     ])
   };
@@ -1185,57 +1722,44 @@ async function showAdminMenu(userId, switchMode = false) {
   if (switchMode) {
     await pool.query("DELETE FROM proposal_sessions WHERE max_user_id = $1", [userId]);
   }
-  await sendToUser(userId, adminMenuBody());
+  const available = await accessibleChannels(userId);
+  await sendToUser(userId, adminMenuBody(available.some(c => c.can_create)));
 }
 
 async function listMyChannels(userId, page = 0) {
-  page = Math.max(0, Math.min(100000, Number(page) || 0));
-  const result = await pool.query(`
-    SELECT id, title, proposal_code FROM channels
-    WHERE owner_user_id = $1 AND active = TRUE
-    ORDER BY id LIMIT $2 OFFSET $3
-  `, [userId, ADMIN_PAGE_SIZE + 1, page * ADMIN_PAGE_SIZE]);
-  const rows = result.rows.slice(0, ADMIN_PAGE_SIZE);
-  let text = "📁 Мои каналы\n\n";
-  text += rows.length ? rows.map(c =>
-    `«${shortTitle(c.title)}»\nПредложка: https://max.ru/${BOT_USERNAME}?start=${c.proposal_code}`
-  ).join("\n\n") : "На этой странице нет подключённых каналов.";
-  const navigation = [];
-  if (page > 0) navigation.push(button("◀️ Назад", `menu_channels_${page - 1}`));
-  if (result.rows.length > ADMIN_PAGE_SIZE) {
-    navigation.push(button("Далее ▶️", `menu_channels_${page + 1}`));
-  }
+  page = pageNumber(page);
+  const channels = await accessibleChannels(userId);
+  const rows = channels.slice(page * ADMIN_PAGE_SIZE, (page + 1) * ADMIN_PAGE_SIZE);
+  const nav = pageButtons("menu_channels", page, channels.length);
   await sendToUser(userId, {
-    text,
+    text: "📁 Мои каналы\n\n" + (rows.length
+      ? "Выберите канал. Назначать и разжаловать админов может только владелец в EveryPost."
+      : "На этой странице нет доступных каналов."),
     attachments: keyboard([
-      ...(navigation.length ? [navigation] : []),
-      [button("↩️ Меню", "menu_main")]
+      ...rows.map(c => [button(shortTitle(c.title), `access_channel_${c.id}`)]),
+      ...(nav.length ? [nav] : []), [button("↩️ Меню", "menu_main")]
     ])
   });
 }
 
 async function listMySubmissions(userId, page = 0) {
-  page = Math.max(0, Math.min(100000, Number(page) || 0));
+  page = pageNumber(page);
+  const ids = (await accessibleChannels(userId)).map(c => c.id);
   const result = await pool.query(`
-    SELECT s.id, c.title FROM submissions s
-    JOIN channels c ON c.id = s.channel_id
-    WHERE c.owner_user_id = $1 AND c.active = TRUE AND s.status = 'new'
+    SELECT s.id, c.title FROM submissions s JOIN channels c ON c.id = s.channel_id
+    WHERE c.id = ANY($1::bigint[]) AND c.active = TRUE AND s.status = 'new'
     ORDER BY s.id DESC LIMIT $2 OFFSET $3
-  `, [userId, ADMIN_PAGE_SIZE + 1, page * ADMIN_PAGE_SIZE]);
+  `, [ids, ADMIN_PAGE_SIZE + 1, page * ADMIN_PAGE_SIZE]);
   const rows = result.rows.slice(0, ADMIN_PAGE_SIZE);
-  const navigation = [];
-  if (page > 0) navigation.push(button("◀️ Назад", `menu_inbox_${page - 1}`));
-  if (result.rows.length > ADMIN_PAGE_SIZE) {
-    navigation.push(button("Далее ▶️", `menu_inbox_${page + 1}`));
-  }
+  const nav = [];
+  if (page > 0) nav.push(button("◀️ Назад", `menu_inbox_${page - 1}`));
+  if (result.rows.length > ADMIN_PAGE_SIZE) nav.push(button("Далее ▶️", `menu_inbox_${page + 1}`));
   await sendToUser(userId, {
-    text: rows.length
-      ? "📥 Новые предложки\nВыберите материал. Публикация здесь не выполняется."
+    text: rows.length ? "📥 Новые предложки\nВыберите материал."
       : "📥 На этой странице нет новых предложок.",
     attachments: keyboard([
-      ...rows.map(s => [button(`#${s.id} · ${shortTitle(s.title)}`, `inboxopen_${s.id}`)]),
-      ...(navigation.length ? [navigation] : []),
-      [button("↩️ Меню", "menu_main")]
+      ...rows.map(x => [button(`#${x.id} · ${shortTitle(x.title)}`, `inboxopen_${x.id}`)]),
+      ...(nav.length ? [nav] : []), [button("↩️ Меню", "menu_main")]
     ])
   });
 }
@@ -1243,25 +1767,17 @@ async function listMySubmissions(userId, page = 0) {
 async function showChannelPicker(session, page = 0) {
   const current = await getComposer(session.actor_user_id);
   if (!current || current.nonce !== session.nonce || current.stage !== "choose_channel") return;
-  page = Math.max(0, Math.min(100000, Number(page) || 0));
-  const result = await pool.query(`
-    SELECT id, title FROM channels
-    WHERE owner_user_id = $1 AND active = TRUE
-    ORDER BY id LIMIT $2 OFFSET $3
-  `, [session.actor_user_id, ADMIN_PAGE_SIZE + 1, page * ADMIN_PAGE_SIZE]);
-  const rows = result.rows.slice(0, ADMIN_PAGE_SIZE);
-  const navigation = [];
-  if (page > 0) navigation.push(button("◀️ Назад", `cpage_${session.nonce}_${page - 1}`));
-  if (result.rows.length > ADMIN_PAGE_SIZE) {
-    navigation.push(button("Далее ▶️", `cpage_${session.nonce}_${page + 1}`));
-  }
+  page = pageNumber(page);
+  const channels = await accessibleChannels(session.actor_user_id, "create");
+  const rows = channels.slice(page * ADMIN_PAGE_SIZE, (page + 1) * ADMIN_PAGE_SIZE);
+  const nav = pageButtons(`cpage_${session.nonce}`, page, channels.length);
   await sendToUser(session.actor_user_id, {
     text: "➕ Создать пост\n\n" + (rows.length
-      ? "Выберите канал для публикации. Здесь показаны только ваши подключённые каналы."
-      : "На этой странице нет активных каналов. Вернитесь назад или отмените создание."),
+      ? "Выберите канал для публикации."
+      : "Нет доступных каналов для собственных постов. Попросите владельца выдать это право."),
     attachments: keyboard([
       ...rows.map(c => [button(shortTitle(c.title), `cpick_${session.nonce}_${c.id}`)]),
-      ...(navigation.length ? [navigation] : []),
+      ...(nav.length ? [nav] : []),
       [button("↩️ Отменить создание", `ccancel_${session.nonce}`)]
     ])
   });
@@ -1276,7 +1792,10 @@ async function beginComposer(userId) {
   }
   const current = await getComposer(userId);
   if (current) { await resumeComposer(current); return; }
-  if (!(await hasOwnChannel(userId))) { await showAdminMenu(userId); return; }
+  if (!(await accessibleChannels(userId, "create")).length) {
+    await notify(userId, "Создание собственных постов не разрешено. Доступ к предложкам остаётся отдельным правом.");
+    await showAdminMenu(userId); return;
+  }
   const created = await pool.query(`
     INSERT INTO ep_composer_sessions(actor_user_id, nonce, stage)
     VALUES ($1, $2, 'choose_channel')
@@ -1288,11 +1807,9 @@ async function beginComposer(userId) {
 }
 
 async function choosePostChannel(session, channelId) {
-  const selected = await pool.query(`
-    SELECT * FROM channels WHERE id = $1 AND owner_user_id = $2 AND active = TRUE
-  `, [channelId, session.actor_user_id]);
-  const channel = selected.rows[0];
-  if (!channel || !(await checkAdministrator(channel.max_chat_id, session.actor_user_id))) {
+  const access = await channelAccess(channelId, session.actor_user_id, "create");
+  const channel = access?.channel;
+  if (!channel) {
     await notify(session.actor_user_id,
       "Канал недоступен или у вас нет действующих прав администратора. Выберите другой канал.");
     return;
@@ -1593,6 +2110,10 @@ async function handleComposerMessage(message) {
 }
 
 async function publishOwnPost(session, row, callbackId) {
+  if (!(await canUseOwnPost(row, session.actor_user_id))) {
+    await notify(session.actor_user_id, "Публикация остановлена: доступ к каналу изменился.");
+    return;
+  }
   // Публикуем ровно сохранённый предпросмотр. Нет forward, sender и чужих кнопок.
   // Уникальный nonce делает кнопки старой редакции недействительными.
   const claimed = await pool.query(`
@@ -1603,7 +2124,10 @@ async function publishOwnPost(session, row, callbackId) {
         WHERE e.post_id = ep_posts.id AND e.actor_user_id = $2
           AND e.nonce = $3 AND e.stage = 'preview')
       AND EXISTS (SELECT 1 FROM channels c WHERE c.id = ep_posts.channel_id
-        AND c.owner_user_id = $2 AND c.active = TRUE)
+        AND c.active = TRUE AND c.moderation_mode = 'manual'
+        AND (c.owner_user_id = $2 OR EXISTS (
+          SELECT 1 FROM ep_channel_admins a WHERE a.channel_id = c.id
+            AND a.max_user_id = $2 AND a.active = TRUE AND a.can_create_posts = TRUE)))
     RETURNING *
   `, [row.id, session.actor_user_id, session.nonce]);
   if (!claimed.rowCount) {
@@ -1641,6 +2165,7 @@ async function publishOwnPost(session, row, callbackId) {
     `✅ Пост #${row.id} опубликован в канале «${shortTitle(row.title)}».`, true);
   await notify(session.actor_user_id,
     `✅ Пост #${row.id} опубликован в канале «${shortTitle(row.title)}».`);
+  await audit(row.channel_id, session.actor_user_id, "own_post_published", row.id);
   console.log("OWN POST PUBLISHED:", row.id);
   await showAdminMenu(session.actor_user_id, true);
 }
@@ -1671,7 +2196,8 @@ async function handleAdminCallback(update) {
       return true;
     }
     await forwardMessage("user_id", userId, row.max_message_id);
-    await sendToUser(userId, controlsBody(row.id, row.title));
+    const access = await channelAccess(row.channel_id, userId, "moderate");
+    if (access) await sendToUser(userId, controlsBody(row.id, row.title, access.version));
     return true;
   }
 
