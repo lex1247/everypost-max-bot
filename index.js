@@ -5,7 +5,7 @@ import https from "node:https";
 import tls from "node:tls";
 
 // EveryPost: предложка, анонимная публикация, редактор, права, черновики и расписание.
-// Версия schedule-1. Системный планировщик работает только при запущенном процессе.
+// Версия schedule-2. Системный планировщик работает только при запущенном процессе.
 // На Free нет гарантии отправки в срок. Просроченные >5 минут задания удерживаются.
 // Черновики сохраняются в PostgreSQL. Медиа остаются вложениями MAX по токенам;
 // эта версия не создаёт собственную бессрочную резервную копию медиафайлов.
@@ -16,7 +16,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "schedule-1";
+const VERSION = "schedule-2";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -3166,10 +3166,12 @@ async function changeScheduledPost(id,revision,userId,action,callbackId,confirme
     await notify(userId,"Карточка устарела, публикация уже началась или нет доступа. Откройте «Отложенные»."); return;
   }
   if (action==="move") { await beginSchedulePicker(q.post_id,userId,q); return; }
-  if (!confirmed) {
-    const questions={cancel:"Снять с расписания и сохранить в черновиках?",edit:"Снять с расписания и открыть редактор? После правки нужно заново нажать «Отложить».",now:"Опубликовать этот пост сейчас вместо назначенного времени?"};
+  // «Опубликовать сейчас» запускается одним нажатием, без второго вопроса.
+  // Проверки доступа, статуса и версии карточки выполняются независимо от подтверждения.
+  if (!confirmed && action !== "now") {
+    const questions={cancel:"Снять с расписания и сохранить в черновиках?",edit:"Снять с расписания и открыть редактор? После правки нужно заново нажать «Отложить»."};
     await sendToUser(userId,{text:`Пост #${q.post_id} · «${shortTitle(q.title)}»\n\n${questions[action]}`,attachments:keyboard([
-      [button(action==="now"?"🚀 Опубликовать сейчас":action==="edit"?"✏️ Снять и редактировать":"↩️ Снять с отложки",`sx_${action}_${q.id}_${q.revision}`)],
+      [button(action==="edit"?"✏️ Снять и редактировать":"↩️ Снять с отложки",`sx_${action}_${q.id}_${q.revision}`)],
       [button("Не менять",`so_${q.id}`)]])}); return;
   }
   if (action==="edit" && (await getComposer(userId)||await getEditorSession(userId))) {
