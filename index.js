@@ -5,7 +5,8 @@ import https from "node:https";
 import tls from "node:tls";
 
 // EveryPost: предложка, анонимная публикация, редактор, права, черновики и расписание.
-// Версия calendar-miniapp-1: календарь внутри Mini App MAX.
+// Версия auto-delete-calendar-1: дата удаления через тот же Mini App.
+// Удаление выключено по умолчанию, копии в групповом чате не затрагиваются.
 // Нативное удержание кнопки отправки MAX не изменяется.
 // Основа menu-chat-1. Быстрые команды MAX и отдельный чат обсуждений для канала.
 // Это не нативная привязка комментариев MAX: кнопка открывает общую группу.
@@ -25,7 +26,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "calendar-miniapp-1";
+const VERSION = "auto-delete-calendar-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -961,6 +962,82 @@ async function initDatabase() {
     );
     CREATE INDEX IF NOT EXISTS ep_calendar_receipt_actor ON ep_calendar_receipts(actor_user_id);
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ep_publications (
+      id BIGSERIAL PRIMARY KEY,
+      target_key TEXT NOT NULL UNIQUE,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      actor_user_id BIGINT NOT NULL,
+      capability TEXT NOT NULL CHECK (capability IN ('moderate','create')),
+      message_id TEXT NOT NULL,
+      body_snapshot JSONB,
+      published_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      legacy_time BOOLEAN NOT NULL DEFAULT FALSE,
+      status TEXT NOT NULL DEFAULT 'published',
+      deleted_at TIMESTAMPTZ,
+      UNIQUE(channel_id,message_id)
+    );
+    CREATE TABLE IF NOT EXISTS ep_auto_deletions (
+      target_key TEXT PRIMARY KEY,
+      channel_id BIGINT NOT NULL REFERENCES channels(id),
+      capability TEXT NOT NULL CHECK (capability IN ('moderate','create')),
+      due_at TIMESTAMPTZ,
+      timezone TEXT NOT NULL,
+      requested_by BIGINT NOT NULL,
+      access_version INTEGER NOT NULL,
+      enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      status TEXT NOT NULL DEFAULT 'disabled',
+      revision INTEGER NOT NULL DEFAULT 1,
+      channel_mid TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      dispatch_started_at TIMESTAMPTZ,
+      last_error TEXT,
+      deleted_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS ep_auto_delete_due ON ep_auto_deletions(due_at)
+      WHERE enabled = TRUE AND status = 'scheduled';
+    CREATE TABLE IF NOT EXISTS ep_delete_sessions (
+      actor_user_id BIGINT PRIMARY KEY,
+      target_key TEXT NOT NULL UNIQUE,
+      nonce TEXT NOT NULL UNIQUE,
+      expected_revision INTEGER NOT NULL,
+      expected_status TEXT NOT NULL,
+      draft_revision INTEGER NOT NULL,
+      schedule_revision INTEGER NOT NULL,
+      access_version INTEGER NOT NULL,
+      timezone TEXT NOT NULL,
+      day_key TEXT NOT NULL,
+      hour INTEGER NOT NULL CHECK (hour BETWEEN 0 AND 23),
+      minute INTEGER NOT NULL CHECK (minute BETWEEN 0 AND 59),
+      card_mid TEXT,
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 minutes')
+    );
+    CREATE TABLE IF NOT EXISTS ep_delete_intents (
+      nonce TEXT PRIMARY KEY,
+      target_key TEXT NOT NULL,
+      actor_user_id BIGINT NOT NULL,
+      expected_revision INTEGER NOT NULL,
+      access_version INTEGER NOT NULL,
+      used BOOLEAN NOT NULL DEFAULT FALSE,
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '5 minutes')
+    );
+    -- Только опубликованные сообщения; настройки удаления не включаются.
+    INSERT INTO ep_publications(target_key,channel_id,actor_user_id,capability,message_id,body_snapshot,published_at,legacy_time)
+      SELECT 'p_' || p.id::text,p.channel_id,p.author_user_id,
+        CASE WHEN p.source_submission_id IS NULL THEN 'create' ELSE 'moderate' END,
+        p.published_mid,COALESCE(p.published_body,p.body),p.updated_at,TRUE
+      FROM ep_posts p WHERE p.status='published' AND p.published_mid IS NOT NULL
+      ON CONFLICT DO NOTHING;
+    INSERT INTO ep_publications(target_key,channel_id,actor_user_id,capability,message_id,body_snapshot,published_at,legacy_time)
+      SELECT 's_' || s.id::text,s.channel_id,COALESCE(s.decision_actor_id,c.owner_user_id),'moderate',s.published_mid,
+        s.published_body,COALESCE(s.decided_at,s.created_at),TRUE
+      FROM submissions s JOIN channels c ON c.id=s.channel_id
+      WHERE s.status='published' AND s.published_mid IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM ep_publications r WHERE r.channel_id=s.channel_id AND r.message_id=s.published_mid)
+      ON CONFLICT DO NOTHING;
+  `);
   console.log("DATABASE READY");
 }
 
@@ -1014,6 +1091,8 @@ async function handleStart(update) {
   const userId = update.user?.user_id;
   if (userId == null) return;
   await rememberUser(update.user);
+  const deleteForm=await getDeletionSession(userId);
+  if(deleteForm){await renderDeletionLaunch(deleteForm);return;}
   const styleInput=await getStyleInput(userId);
   if(styleInput){await promptStyleInput(styleInput);return;}
   const timing = await getScheduleSession(userId);
@@ -1068,7 +1147,8 @@ function controlsBody(submissionId, title, accessVersion = 0) {
       [action("publish", "🚀 Опубликовать"), action("edit", "✏️ Редактировать")],
       [action("preview", "👁 Предпросмотр"), action("reject", "🗑 Отклонить")],
       [action("savedraft", "💾 Сохранить черновик"), action("schedule", "🕒 Отложить")],
-      [button("🎨 Оформление и кнопки", `fmt_sub_${submissionId}${suffix}`)]
+      [button("🎨 Оформление и кнопки", `fmt_sub_${submissionId}${suffix}`)],
+      [button("🗑 Автоудаление: выкл", `ads_${submissionId}${suffix}`)]
     ])
   };
 }
@@ -1083,6 +1163,8 @@ async function handleMessage(update) {
   if (chatType && chatType !== "dialog") return;
   await rememberUser(sender);
   if (await handleQuickCommand(message)) return;
+  const deletionForm=await getDeletionSession(sender.user_id);
+  if(deletionForm){await notify(sender.user_id,"Открыт календарь удаления. Выберите дату в нём или отправьте /cancel. Этот текст не опубликован.");return;}
   if(await handleStyleMessage(message))return;
   // Повторная доставка уже записанной предложки сохраняет прежнее назначение.
   let found = await pool.query(`
@@ -1378,6 +1460,7 @@ function draftControls(session, title) {
       ...styleControls("e", session.nonce, session.post_style),
       [editorButton("editsave", session, "💾 Сохранить черновик"),
        editorButton("editschedule", session, "🕒 Отложить")],
+      [editorButton("ade", session, "🗑 Автоудаление: выкл")],
       [editorButton("again", session, "✏️ Изменить ещё"),
        editorButton("cancel", session, "↩️ Отменить правку")]
     ])
@@ -1645,6 +1728,8 @@ async function publishPrepared(row, userId, callbackId, body, session = null) {
     await notify(userId, "Публикация остановлена: доступ к каналу изменился.");
     return;
   }
+  try { await assertPublicationWindow(deletionKey("s",row.id)); }
+  catch(e) { await notify(userId,e.message); return; }
   // Claim и снимок будущего поста сохраняются одним запросом.
   // Старые кнопки исходной предложки не обходят открытый редактор.
   const claimed = session
@@ -1671,16 +1756,19 @@ async function publishPrepared(row, userId, callbackId, body, session = null) {
 
   let accepted = false;
   try {
-    const published = await sendMessage("chat_id", row.max_chat_id, body);
+    const published = await dispatchWithDeletionGuard("s", row, userId, body);
     accepted = true;
-    await pool.query(`
-      UPDATE submissions SET status = 'published', published_mid = $2, last_error = NULL,
-        decision_actor_id = $3, decision_kind = 'human', decided_at = NOW()
-      WHERE id = $1
-    `, [row.id, messageId(published), userId]);
+    const finish=await pool.connect();
+    try {
+      await finish.query("BEGIN");
+      await finish.query(`UPDATE submissions SET status='published',published_mid=$2,last_error=NULL,
+        decision_actor_id=$3,decision_kind='human',decided_at=NOW() WHERE id=$1`,[row.id,messageId(published),userId]);
+      await recordPublication("s",row,userId,body,published,finish);
+      await finish.query("COMMIT");
+    } catch(e) { await finish.query("ROLLBACK").catch(()=>{});throw e; } finally { finish.release(); }
   } catch (error) {
     // При сетевой неопределённости не делаем автоматический повтор публикации.
-    const definiteRejection = !accepted && error.status >= 400 && error.status < 500 && error.status !== 408;
+    const definiteRejection = !accepted && (error.deliveryNotStarted || (error.status >= 400 && error.status < 500 && error.status !== 408));
     await pool.query("UPDATE submissions SET status = $2, last_error = $3 WHERE id = $1",
       [row.id, definiteRejection ? "new" : "needs_check", error.message.slice(0, 1000)]);
     await notify(userId, definiteRejection
@@ -1702,6 +1790,7 @@ async function handleCallback(update) {
   // Настройки доступа не меняются из групп или пересланных чужих карточек.
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
+  if (await handleDeletionCallback(update)) return;
   if (await handleStyleCallback(update)) return;
   if (await handleDiscussionCallback(update)) return;
   if (await handleSchedulingCallback(update)) return;
@@ -2183,7 +2272,18 @@ async function confirmAccessChange(nonce, ownerId) {
             AND ($3 = 'revoke' OR source_submission_id IS NULL))
       `, [intent.target_user_id, c.id, intent.action]);
     }
+    if (["revoke", "deny_posts"].includes(intent.action)) {
+      await client.query(`UPDATE ep_auto_deletions SET status='paused',revision=revision+1,
+        last_error='Права назначившего удаление отозваны. Владелец должен настроить удаление заново.',updated_at=NOW()
+        WHERE channel_id=$1 AND requested_by=$2 AND enabled=TRUE AND status IN ('armed','scheduled')
+          AND ($3='revoke' OR capability='create')`,[c.id,intent.target_user_id,intent.action]);
+      await client.query(`DELETE FROM ep_delete_sessions WHERE actor_user_id=$1 AND target_key IN
+        (SELECT target_key FROM ep_auto_deletions WHERE channel_id=$2)`,[intent.target_user_id,c.id]);
+    }
     if (["allow_posts", "deny_posts"].includes(intent.action)) {
+      await client.query(`UPDATE ep_auto_deletions SET access_version=$3 WHERE channel_id=$1 AND requested_by=$2
+        AND enabled=TRUE AND status IN ('armed','scheduled') AND ($4='allow_posts' OR capability='moderate')`,
+        [c.id,intent.target_user_id,changed.version,intent.action]);
       // Версия общего доступа изменилась, но право на предложку осталось прежним.
       // При revoke старые задачи не возобновляются ни здесь, ни после повторного grant.
       await client.query(`UPDATE ep_schedules AS q SET access_version = $3
@@ -2231,6 +2331,8 @@ async function showAccessLog(channelId, ownerId, page = 0) {
     access_allow_posts: "Разрешены свои посты", access_deny_posts: "Запрещены свои посты",
     edit_started: "Открыта правка", edit_saved: "Сохранена правка",
     submission_published: "Предложка опубликована", submission_rejected: "Предложка отклонена",
+    auto_delete_set: "Настроено автоудаление", auto_delete_disabled: "Автоудаление выключено",
+    delete_now_requested: "Запрошено удаление сейчас", post_auto_deleted: "Пост удалён",
     own_post_published: "Собственный пост опубликован", owner_notifications: "Уведомления владельцу",
     draft_saved: "Черновик сохранён", draft_deleted: "Черновик удалён",
     submission_draft_saved: "Предложка сохранена в черновик"};
@@ -2383,7 +2485,9 @@ async function getOwnPost(postId) {
     SELECT p.*, c.title, c.max_chat_id, c.owner_user_id, c.active
     FROM ep_posts p JOIN channels c ON c.id = p.channel_id WHERE p.id = $1
   `, [postId]);
-  return result.rows[0] || null;
+  const row = result.rows[0] || null;
+  if (row) row.deletion_policy = await getDeletionPolicy(deletionKey("p",row.id));
+  return row;
 }
 
 async function hasOwnChannel(userId) {
@@ -2413,12 +2517,15 @@ function adminMenuBody(canCreate = true) {
     attachments: keyboard([
       ...(canCreate ? [[button("➕ Создать пост", "menu_create")]] : []),
       [button("📝 Черновики", "menu_drafts_0"), button("🕒 Отложенные", "menu_scheduled_all_0")],
-      [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")]
+      [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")],
+      [button("📤 Опубликованные", "publist_0")]
     ])
   };
 }
 
 async function showAdminMenu(userId, switchMode = false) {
+  const deleteForm=await getDeletionSession(userId);
+  if(deleteForm){await renderDeletionLaunch(deleteForm);return;}
   const styleInput=await getStyleInput(userId);
   if(styleInput){await promptStyleInput(styleInput);return;}
   const timing = await getScheduleSession(userId);
@@ -2586,13 +2693,14 @@ async function sendComposerPrompt(session) {
 function ownPostControls(session, row) {
   return {
     text: `👁 ${row.is_saved ? "Черновик" : "Новый пост"} #${row.id}\nКанал: «${shortTitle(row.title)}»\n\n` +
-      "Выше показан вариант для публикации. Он ещё не отправлен в канал.",
+      "Выше показан вариант для публикации. Он ещё не отправлен в канал.\n" + deletionTimeText(row.deletion_policy),
     attachments: keyboard([
       [button("🚀 Опубликовать", `cpublish_${session.nonce}`),
        button("💾 Сохранить черновик", `csave_${session.nonce}`)],
       [button("✏️ Изменить текст", `ctext_${session.nonce}`),
        button("📎 Заменить материал", `creplace_${session.nonce}`)],
       [button("🕒 Отложить", `cschedule_${session.nonce}`)],
+      [button(row.deletion_policy?.enabled ? "🗑 Изменить автоудаление" : "🗑 Автоудаление: выкл", `adp_${session.nonce}`)],
       ...styleControls("p",session.nonce,row.post_style),
       ...(row.is_saved ? [[button("🗑 Удалить черновик", `ddelete_${session.nonce}`)]] : []),
       [button(row.is_saved ? "↩️ Закрыть без сохранения" : "↩️ Отменить пост",
@@ -2856,6 +2964,8 @@ async function handleComposerMessage(message) {
 }
 
 async function publishOwnPost(session, row, callbackId) {
+  try { await assertPublicationWindow(deletionKey("p",row.id)); }
+  catch(e) { await notify(session.actor_user_id,e.message); return; }
   if (!(await canUseOwnPost(row, session.actor_user_id))) {
     await notify(session.actor_user_id, "Публикация остановлена: доступ к каналу изменился."); return;
   }
@@ -2897,7 +3007,7 @@ async function publishOwnPost(session, row, callbackId) {
   }
   let accepted = false;
   try {
-    const sent = await sendMessage("chat_id", row.max_chat_id, claimed.rows[0].published_body);
+    const sent = await dispatchWithDeletionGuard("p", row, session.actor_user_id, claimed.rows[0].published_body);
     accepted = true;
     const mid = messageId(sent);
     const finish = await pool.connect();
@@ -2910,6 +3020,7 @@ async function publishOwnPost(session, row, callbackId) {
           last_error = NULL, decision_actor_id = $3, decision_kind = 'human', decided_at = NOW()
           WHERE id = $1`, [row.source_submission_id, mid, session.actor_user_id]);
       }
+      await recordPublication("p",row,session.actor_user_id,claimed.rows[0].published_body,sent,finish);
       await finish.query("DELETE FROM ep_composer_sessions WHERE actor_user_id = $1 AND nonce = $2",
         [session.actor_user_id, session.nonce]);
       await audit(row.channel_id, session.actor_user_id,
@@ -2920,7 +3031,7 @@ async function publishOwnPost(session, row, callbackId) {
       await finish.query("ROLLBACK").catch(() => {}); throw error;
     } finally { finish.release(); }
   } catch (error) {
-    const definiteRejection = !accepted && error.status >= 400 && error.status < 500 && error.status !== 408;
+    const definiteRejection = !accepted && (error.deliveryNotStarted || (error.status >= 400 && error.status < 500 && error.status !== 408));
     const failed = await pool.connect();
     try {
       await failed.query("BEGIN");
@@ -2936,7 +3047,7 @@ async function publishOwnPost(session, row, callbackId) {
       await failed.query("ROLLBACK").catch(() => {}); throw e;
     } finally { failed.release(); }
     await notify(session.actor_user_id, definiteRejection
-      ? `MAX не принял пост #${row.id}. Черновик сохранён; причина есть в Logs.`
+      ? `Пост #${row.id} не отправлен. Черновик сохранён. ${error.message.slice(0,500)}`
       : `Результат публикации #${row.id} не подтверждён. Проверьте канал. ` +
         "Повторная отправка остановлена, чтобы не создать дубль. Для меню отправьте /menu.");
     console.error("POST PUBLISH ERROR:", error.message); return;
@@ -3618,6 +3729,7 @@ async function confirmSchedule(session, callbackId) {
          Number(old.revision) === Number(session.expected_revision)
        : fresh.status === "draft" && (!old || old.status === "cancelled"));
     if (valid && choiceValid(form)) {
+      await assertPublicationWindow(deletionKey("p",post.id),due,client);
       saved = (await client.query(`INSERT INTO ep_schedules(post_id,status,due_at,timezone,scheduled_by,access_version,body_snapshot)
         VALUES ($1,'scheduled',$2,$3,$4,$5,$6::jsonb)
         ON CONFLICT(post_id) DO UPDATE SET status = 'scheduled', due_at = EXCLUDED.due_at,
@@ -3736,15 +3848,17 @@ async function showScheduledPost(id,userId,preview=true) {
     try { await sendToUser(userId,q.body_snapshot); }
     catch(e) { await notify(userId,"Не удалось показать медиа. Расписание не изменено."); console.error("SCHEDULE PREVIEW ERROR:",e.message); }
   }
+  const deletePolicy=await getDeletionPolicy(deletionKey("p",q.post_id));
   const controls=[];
   if (["scheduled","paused"].includes(q.status)) {
+    controls.push([button(deletePolicy?.enabled?"🗑 Изменить автоудаление":"🗑 Автоудаление: выкл",`addp_${q.post_id}`)]);
     controls.push([button("🕒 Изменить время",`st_move_${q.id}_${q.revision}`)]);
     controls.push([button("✏️ Редактировать",`st_edit_${q.id}_${q.revision}`),button("🚀 Опубликовать сейчас",`st_now_${q.id}_${q.revision}`)]);
     controls.push([button("↩️ Снять с отложки",`st_cancel_${q.id}_${q.revision}`)]);
   }
   controls.push([button("🕒 Отложенные","menu_scheduled_all_0")]);
   await sendToUser(userId,{text:`🕒 Пост #${q.post_id}\nКанал: «${shortTitle(q.title)}»\n`+
-    `${timeLabel(q.due_at,q.timezone)} · ${zoneLabel(q.timezone,q.due_at)}\nСтатус: ${scheduleLabel(q.status)}`+
+    `${timeLabel(q.due_at,q.timezone)} · ${zoneLabel(q.timezone,q.due_at)}\nСтатус: ${scheduleLabel(q.status)}\n${deletionTimeText(deletePolicy)}`+
     (q.last_error ? `\n\n${q.last_error.slice(0,350)}` : "")+
     (q.status==="needs_check" ? "\nПроверьте сам канал. Повторная отправка заблокирована, чтобы не создать дубль." : ""),attachments:keyboard(controls)});
 }
@@ -3764,6 +3878,10 @@ async function changeScheduledPost(id,revision,userId,action,callbackId,confirme
   }
   if (action==="edit" && (await getComposer(userId)||await getEditorSession(userId))) {
     await notify(userId,"Сначала завершите открытую правку. Расписание не изменено."); return;
+  }
+  if(action==="now") {
+    const reason=await publicationWindowError(deletionKey("p",q.post_id));
+    if(reason){await notify(userId,reason);return;}
   }
   const client=await pool.connect(); let changed;
   try {
@@ -3894,6 +4012,7 @@ async function dispatchScheduled(q) {
     if(!q.body_snapshot||Object.hasOwn(q.body_snapshot,"link")||Object.hasOwn(q.body_snapshot,"sender")){
       const e=new Error("Небезопасный формат публикации. Отправка остановлена.");e.deliveryNotStarted=true;throw e;
     }
+    await assertPublicationWindow(deletionKey("p",q.post_id));
     await pool.query("UPDATE ep_schedules SET dispatch_started_at=NOW() WHERE id=$1 AND status='sending'",[q.id]);
     lastApiCall=Date.now();
     return maxRequest(`/messages?chat_id=${encodeURIComponent(q.max_chat_id)}`,"POST",q.body_snapshot);
@@ -3925,6 +4044,8 @@ async function processOneScheduled() {
     const source=await getSubmission(q.source_submission_id);
     if(source?.status!=="drafted"){await holdScheduled(q,"Исходная предложка уже обработана. Отправка остановлена.");return;}
   }
+  const deletionConflict=await publicationWindowError(deletionKey("p",q.post_id));
+  if(deletionConflict){await holdScheduled(q,deletionConflict);return;}
   const client=await pool.connect();let claimed;
   try{
     await client.query("BEGIN");
@@ -3951,6 +4072,7 @@ async function processOneScheduled() {
       await finish.query("UPDATE ep_schedules SET status='published',published_mid=$2,published_at=NOW(),last_error=NULL,revision=revision+1,updated_at=NOW() WHERE id=$1",[q.id,mid]);
       if(q.source_submission_id)await finish.query(`UPDATE submissions SET status='published',published_mid=$2,last_error=NULL,
         decision_actor_id=$3,decision_kind='human',decided_at=NOW() WHERE id=$1`,[q.source_submission_id,mid,q.scheduled_by]);
+      await recordPublication("p",post,q.scheduled_by,q.body_snapshot,sent,finish);
       await finish.query("DELETE FROM ep_schedule_sessions WHERE post_id=$1",[q.post_id]);
       await audit(q.channel_id,q.scheduled_by,"scheduled_published",q.post_id,{schedule_id:q.id},finish);
       await finish.query("COMMIT");
@@ -3965,6 +4087,7 @@ async function processOneScheduled() {
 }
 
 async function handleUpdate(update) {
+  if(update.update_type==="everypost_delete_saved")return handleDeletionSavedNotice(update);
   if (update.update_type === "everypost_calendar_saved") {
     return handleCalendarSavedNotice(update);
   }
@@ -3992,6 +4115,7 @@ const QUICK_COMMANDS = [
   { name: "inbox", description: "Предложки" },
   { name: "drafts", description: "Черновики" },
   { name: "scheduled", description: "Отложенные" },
+  { name: "published", description: "Опубликованные и автоудаление" },
   { name: "channels", description: "Мои каналы" },
   { name: "cancel", description: "Отменить текущий ввод" },
   { name: "help", description: "Помощь и команды" }
@@ -4035,20 +4159,27 @@ async function handleQuickCommand(message) {
   if (receipt.rows[0]?.handled) return true;
   await pool.query(`INSERT INTO ep_command_inputs(max_message_id,actor_user_id)
     VALUES ($1,$2) ON CONFLICT DO NOTHING`, [mid,userId]);
+  const deleting = await getDeletionSession(userId);
   const style = await getStyleInput(userId), timing = await getScheduleSession(userId);
   const composing = await getComposer(userId), editing = await getEditorSession(userId);
   if (action === "help") {
     await quickHelp(userId);
   } else if (action === "cancel") {
-    if (style) await cancelStyleInput(style);
+    if (deleting) {
+      const client=await pool.connect();
+      try { await cancelDeletionChoice(client,userId,deleting.nonce); } finally { client.release(); }
+      await returnFromDeletion(deleting.target_key,userId);
+    }
+    else if (style) await cancelStyleInput(style);
     else if (timing) await closeSchedulePicker(timing);
     else if (composing) await cancelComposer(composing, message);
     else if (editing) await cancelEditor(editing, mid);
     else { await notify(userId,"Незавершённого ввода нет. Отложенные посты не изменены."); await showAdminMenu(userId); }
-  } else if (style || timing || composing || editing) {
+  } else if (deleting || style || timing || composing || editing) {
     // Не теряем несохранённую правку при навигации, не подставляем /drafts в текст поста.
     if (action !== "menu") await notify(userId,"Сначала завершите текущую правку или /cancel. Она не потеряна.");
-    if (style) await promptStyleInput(style);
+    if (deleting) await renderDeletionLaunch(deleting);
+    else if (style) await promptStyleInput(style);
     else if (timing) await renderSchedulePicker(timing);
     else if (composing) await resumeComposer(composing);
     else await resumeEditor(editing);
@@ -4061,6 +4192,7 @@ async function handleQuickCommand(message) {
     else if (action === "inbox") await listMySubmissions(userId);
     else if (action === "drafts") await listSavedDrafts(userId);
     else if (action === "scheduled") await listScheduled(userId);
+    else if (action === "published") await listPublishedPosts(userId);
     else if (action === "channels") await listMyChannels(userId);
   }
   await pool.query("UPDATE ep_command_inputs SET handled=TRUE WHERE max_message_id=$1", [mid]);
@@ -4445,6 +4577,8 @@ async function runWorker() {
     // Ошибка фоновой отправки не переоткрывает успешно обработанный webhook.
     try { await processOneScheduled(); }
     catch (error) { console.error("SCHEDULE WORKER ERROR:", error.message); }
+    try { await processOneDeletion(); }
+    catch (error) { console.error("DELETE WORKER ERROR:",error.message); }
     try { await processOneDiscussion(); }
     catch (error) { console.error("DISCUSSION WORKER ERROR:", error.message); }
   } catch (error) {
@@ -4487,6 +4621,462 @@ async function registerWebhook() {
 // ---------- Календарь мини-приложения MAX ----------
 // UI принадлежит EveryPost, а не системному окну отложки MAX.
 // URL мини-приложения нужно один раз указать в настройках бота:
+// ---------- Автоудаление: абсолютная дата в календаре ----------
+// Копии в чате и ответы читателей не затрагиваются. Ни одного удаления
+// по умолчанию: для каждого материала требуется сохранённое владельцем правило.
+const DELETE_KEY = /^(p|s)_([1-9]\d{0,18})$/;
+function deletionKey(kind,id) {
+  const key = `${kind}_${id}`;
+  if (!DELETE_KEY.test(key)) calendarReject(400,"Некорректный материал.");
+  return key;
+}
+function deletionTimeText(policy) {
+  if (!policy?.enabled || !policy.due_at) return "Автоудаление: выкл";
+  const paused = policy.status === "paused" ? " · приостановлено" : "";
+  return `Удаление: ${timeLabel(policy.due_at,policy.timezone)} · ${zoneLabel(policy.timezone,policy.due_at)}${paused}`;
+}
+async function getDeletionPolicy(key,client=pool) {
+  return (await client.query("SELECT * FROM ep_auto_deletions WHERE target_key=$1",[key])).rows[0] || null;
+}
+async function getDeletionTarget(key) {
+  const match = typeof key === "string" && key.match(DELETE_KEY);
+  if (!match) return null;
+  const kind=match[1],id=match[2];
+  const row=kind==="p" ? await getOwnPost(id) : await getSubmission(id);
+  if (!row) return null;
+  const publication=(await pool.query("SELECT * FROM ep_publications WHERE target_key=$1",[key])).rows[0]||null;
+  const policy=await getDeletionPolicy(key);
+  const schedule=kind==="p" ? (await pool.query("SELECT * FROM ep_schedules WHERE post_id=$1",[id])).rows[0]||null : null;
+  return {key,kind,id:String(id),row,publication,policy,schedule,channel_id:row.channel_id,
+    capability:kind==="s"||row.source_submission_id ? "moderate":"create"};
+}
+function memberCanDelete(member) {
+  return Boolean(member && !member.is_bot && (member.is_owner ||
+    (member.is_admin && Array.isArray(member.permissions) &&
+      member.permissions.some(p=>["delete","delete_message"].includes(p)))));
+}
+async function deletionAccess(target,userId,requireDelete=true) {
+  if (!target || userId==null) return null;
+  const access=await channelAccess(target.channel_id,userId,"view");
+  if (!access) return null;
+  if (!access.owner && target.capability==="create" &&
+    (!access.grant.can_create_posts || String(target.row.author_user_id)!==String(userId))) return null;
+  if (requireDelete && !memberCanDelete(access.member)) return null;
+  return access;
+}
+function deletionTargetEditable(target) {
+  if (!target) return false;
+  if (target.publication) return target.publication.status==="published" && target.row.status==="published";
+  return target.kind==="p" && ["draft","scheduled"].includes(target.row.status) &&
+    (!target.schedule || ["cancelled","scheduled","paused"].includes(target.schedule.status));
+}
+async function recordPublication(kind,row,userId,body,result,client=pool) {
+  const key=deletionKey(kind,row.id),mid=messageId(result);
+  const timestamp=result?.message?.timestamp;
+  const publishedAt=Number.isFinite(timestamp) && timestamp>0 ? new Date(timestamp) : new Date();
+  const saved=(await client.query(`INSERT INTO ep_publications
+    (target_key,channel_id,actor_user_id,capability,message_id,body_snapshot,published_at)
+    VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)
+    ON CONFLICT(target_key) DO NOTHING RETURNING *`,
+    [key,row.channel_id,userId,kind==="s"||row.source_submission_id?"moderate":"create",mid,JSON.stringify(body),publishedAt])).rows[0];
+  const existing=saved||(await client.query("SELECT * FROM ep_publications WHERE target_key=$1",[key])).rows[0];
+  if (existing.message_id!==mid) throw new Error("Publication ledger does not match MAX message ID");
+  await client.query(`UPDATE ep_auto_deletions SET channel_mid=$2,
+    status=CASE WHEN enabled=TRUE AND status='armed' THEN 'scheduled' ELSE status END,
+    updated_at=NOW() WHERE target_key=$1`,[key,mid]);
+  return existing;
+}
+async function publicationWindowError(key,at=Date.now(),client=pool) {
+  const p=await getDeletionPolicy(key,client);
+  if (!p?.enabled) return null;
+  if (!["armed","scheduled"].includes(p.status)) return "Автоудаление приостановлено или его состояние изменилось. Измените срок либо отключите автоудаление перед публикацией.";
+  if (!p.due_at || new Date(p.due_at).getTime()<=new Date(at).getTime()) {
+    return "Время публикации должно быть раньше автоудаления. Измените одну из дат либо отключите автоудаление. Даты автоматически не изменены.";
+  }
+  return null;
+}
+async function assertPublicationWindow(key,at=Date.now(),client=pool) {
+  const reason=await publicationWindowError(key,at,client);
+  if(reason){const error=new CalendarError(409,reason);error.deliveryNotStarted=true;throw error;}
+}
+async function dispatchWithDeletionGuard(kind,row,userId,body) {
+  const task=apiTail.catch(()=>{}).then(async()=>{
+    await sleep(Math.max(0,650-(Date.now()-lastApiCall)));
+    await assertPublicationWindow(deletionKey(kind,row.id));
+    if(!body||Object.hasOwn(body,"link")||Object.hasOwn(body,"sender")) {
+      const e=new Error("Небезопасный формат публикации.");e.deliveryNotStarted=true;throw e;
+    }
+    const access=await channelAccess(row.channel_id,userId,kind==="s"||row.source_submission_id?"moderate":"create");
+    if(!access){const e=new Error("Права перед отправкой изменились.");e.deliveryNotStarted=true;throw e;}
+    lastApiCall=Date.now();
+    return maxRequest(`/messages?chat_id=${encodeURIComponent(row.max_chat_id)}`,"POST",body);
+  });
+  apiTail=task.catch(()=>{});
+  return task.then(async result=>{await safeRememberDiscussion(row.max_chat_id,body,result);return result;});
+}
+
+// ---------- Выбор даты удаления в том же Mini App ----------
+async function getDeletionSession(userId) {
+  await pool.query("DELETE FROM ep_delete_sessions WHERE actor_user_id=$1 AND expires_at<=NOW()",[userId]);
+  return (await pool.query("SELECT * FROM ep_delete_sessions WHERE actor_user_id=$1",[userId])).rows[0]||null;
+}
+async function beginDeletionCalendar(key,userId) {
+  await pool.query("DELETE FROM ep_delete_sessions WHERE expires_at<=NOW()");
+  const current=await getDeletionSession(userId);
+  if(current){await renderDeletionLaunch(current);return;}
+  if(await getScheduleSession(userId) || await getComposer(userId) || await getEditorSession(userId) || await getStyleInput(userId)) {
+    await notify(userId,"Сначала сохраните или закройте текущий редактор/календарь. Материал не потерян.");return;
+  }
+  const target=await getDeletionTarget(key),access=await deletionAccess(target,userId);
+  if(!access){await notify(userId,"Нет доступа к удалению: нужны доступ к этому материалу в EveryPost и право удаления постов в самом MAX.");return;}
+  if(!deletionTargetEditable(target)||target.policy?.status==="deleting") {
+    await notify(userId,"Материал уже отправляется, удаляется или его состояние изменилось. Откройте актуальную карточку.");return;
+  }
+  const other=target.kind==="p" ? await pool.query("SELECT actor_user_id FROM ep_composer_sessions WHERE post_id=$1",[target.id]) : {rowCount:0};
+  if(other.rowCount){await notify(userId,"Материал открыт в редакторе. Сначала сохраните его.");return;}
+  const timezone=target.policy?.timezone||target.schedule?.timezone||access.channel.timezone||"Europe/Moscow";
+  const earliest=target.schedule && ["scheduled","paused"].includes(target.schedule.status)
+    ? Math.max(Date.now(),new Date(target.schedule.due_at).getTime()) : Date.now();
+  // Время лишь предлагается в форме. Пока пользователь не сохранит — ничего не включено.
+  const defaultAt=Math.max(target.policy?.enabled?new Date(target.policy.due_at).getTime():0,earliest+10*60000);
+  const parts=localParts(Math.ceil(defaultAt/60000)*60000,timezone);
+  const made=await pool.query(`INSERT INTO ep_delete_sessions(actor_user_id,target_key,nonce,
+    expected_revision,expected_status,draft_revision,schedule_revision,access_version,timezone,day_key,hour,minute)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    ON CONFLICT DO NOTHING RETURNING *`,[userId,key,newEditNonce(),target.policy?.revision||0,target.row.status,
+      target.kind==="p"?target.row.draft_revision:0,target.schedule?.revision||0,access.version,timezone,dateKey(parts),parts.hour,parts.minute]);
+  if(!made.rowCount){await notify(userId,"Для материала уже открыт календарь. Закройте старый выбор или дождитесь его завершения.");return;}
+  await renderDeletionLaunch(made.rows[0]);
+}
+async function renderDeletionLaunch(session) {
+  const target=await getDeletionTarget(session.target_key);
+  if(!await deletionAccess(target,session.actor_user_id))return;
+  const body={text:`🗑 Когда удалить пост?\nКанал: «${shortTitle(target.row.title)}»\n${deletionTimeText(target.policy)}\n\n`+
+    "Выберите дату и время в календаре. Удалится только пост в канале; копия в чате и ответы читателей останутся.",attachments:keyboard([
+    [{type:"open_app",text:"📅 Открыть календарь",web_app:BOT_USERNAME,payload:`ad_${session.nonce}`}],
+    [button("↩️ Назад",`adclose_${session.nonce}`)]
+  ])};
+  const result=await sendToUser(session.actor_user_id,body);
+  await pool.query("UPDATE ep_delete_sessions SET card_mid=$3 WHERE actor_user_id=$1 AND nonce=$2",[session.actor_user_id,session.nonce,messageId(result)]);
+}
+async function checkedDeletionSession(userId,nonce) {
+  const session=await getDeletionSession(userId);
+  if(!session||nonce&&session.nonce!==nonce)calendarReject(409,"Календарь удаления закрыт. Откройте актуальную карточку поста.");
+  const target=await getDeletionTarget(session.target_key),access=await deletionAccess(target,userId);
+  if(!access||access.version!==Number(session.access_version))calendarReject(403,"Права изменились. Дата удаления не сохранена.");
+  if(!deletionTargetEditable(target)||target.policy?.status==="deleting"||
+    Number(target.policy?.revision||0)!==Number(session.expected_revision)||
+    target.row.status!==session.expected_status||
+    (target.kind==="p"&&Number(target.row.draft_revision)!==Number(session.draft_revision))||
+    Number(target.schedule?.revision||0)!==Number(session.schedule_revision)) {
+    calendarReject(409,"Пост или расписание изменились. Закройте календарь и откройте заново.");
+  }
+  return {session,target,access};
+}
+function deletionStateBody(session,target,now=Date.now()) {
+  const today=dateKey(localParts(now,session.timezone));
+  const scheduled=target.schedule&&["scheduled","paused"].includes(target.schedule.status);
+  return {ok:true,state:"editing",mode:"delete",version:VERSION,nonce:session.nonce,postId:target.id,
+    title:shortTitle(target.row.title),timezone:session.timezone,zoneLabel:zoneLabel(session.timezone,now),
+    serverNow:now,today,maxDay:shiftDay(today,SCHEDULE_HORIZON_DAYS),day:session.day_key,
+    hour:Number(session.hour),minute:Number(session.minute),expiresAt:new Date(session.expires_at).toISOString(),
+    rescheduling:false,canDisable:Boolean(target.policy?.enabled),
+    minAt:scheduled?new Date(target.schedule.due_at).toISOString():null,
+    publicationLabel:scheduled?timeLabel(target.schedule.due_at,session.timezone):null,
+    currentDeletionLabel:deletionTimeText(target.policy),
+    published:Boolean(target.publication)};
+}
+async function saveDeletionChoice(client,userId,nonce,input,disable=false) {
+  const previous=await getCalendarReceipt(nonce,userId);
+  if(previous){
+    if(previous.mode!=="delete"||previous.state!=="saved")calendarReject(409,"Этот выбор уже закрыт.");
+    return {...previous,replayed:true};
+  }
+  const {session,target,access}=await checkedDeletionSession(userId,nonce);
+  const choice=disable?null:validateCalendarChoice(input,session.timezone);
+  if(choice&&target.schedule&&["scheduled","paused"].includes(target.schedule.status)&&
+    choice.due.getTime()<=new Date(target.schedule.due_at).getTime()) {
+    calendarReject(400,"Удаление должно быть позже публикации. Выберите другое время; расписание не изменено.");
+  }
+  if(disable&&!target.policy?.enabled)calendarReject(409,"Автоудаление уже выключено.");
+  let result;
+  try{
+    await client.query("BEGIN");
+    const form=(await client.query("SELECT * FROM ep_delete_sessions WHERE actor_user_id=$1 AND nonce=$2 AND expires_at>NOW() FOR UPDATE",[userId,nonce])).rows[0];
+    const locked=(await client.query("SELECT * FROM ep_auto_deletions WHERE target_key=$1 FOR UPDATE",[target.key])).rows[0];
+    if(!form||Number(locked?.revision||0)!==Number(session.expected_revision)||locked?.status==="deleting")calendarReject(409,"Дата удаления уже изменилась.");
+    const status=disable?"disabled":target.publication?"scheduled":"armed";
+    const saved=(await client.query(`INSERT INTO ep_auto_deletions(target_key,channel_id,capability,
+      due_at,timezone,requested_by,access_version,enabled,status,channel_mid)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT(target_key) DO UPDATE SET due_at=EXCLUDED.due_at,timezone=EXCLUDED.timezone,
+        requested_by=EXCLUDED.requested_by,access_version=EXCLUDED.access_version,enabled=EXCLUDED.enabled,
+        status=EXCLUDED.status,channel_mid=EXCLUDED.channel_mid,revision=ep_auto_deletions.revision+1,
+        attempts=0,next_at=NOW(),dispatch_started_at=NULL,last_error=NULL,updated_at=NOW()
+      RETURNING *`,[target.key,target.channel_id,target.capability,choice?.due||null,session.timezone,
+        userId,access.version,!disable,status,target.publication?.message_id||null])).rows[0];
+    await client.query("DELETE FROM ep_delete_sessions WHERE actor_user_id=$1 AND nonce=$2",[userId,nonce]);
+    result={ok:true,state:"saved",mode:"delete",disabled:disable,postId:target.id,
+      title:shortTitle(target.row.title),dueAt:choice?.due.toISOString()||null,timezone:session.timezone,
+      label:choice?timeLabel(choice.due,session.timezone):"Автоудаление выключено",
+      zoneLabel:zoneLabel(session.timezone,choice?.due||Date.now()),revision:saved.revision};
+    await client.query("INSERT INTO ep_calendar_receipts(nonce,actor_user_id,result) VALUES($1,$2,$3::jsonb)",[nonce,userId,JSON.stringify(result)]);
+    await audit(target.channel_id,userId,disable?"auto_delete_disabled":"auto_delete_set",target.key,
+      {due_at:result.dueAt,timezone:session.timezone},client);
+    await client.query(`INSERT INTO ep_webhook_jobs(event_key,payload) VALUES($1,$2::jsonb)
+      ON CONFLICT(event_key) DO NOTHING`,["delete_saved:"+nonce,JSON.stringify({update_type:"everypost_delete_saved",
+        actor_user_id:userId,target_key:target.key,card_mid:session.card_mid||null,revision:saved.revision})]);
+    await client.query("COMMIT");
+  }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e;}
+  console.log(disable?"AUTO DELETE DISABLED:":"AUTO DELETE SET:",target.key,result.dueAt||"");
+  return result;
+}
+async function cancelDeletionChoice(client,userId,nonce) {
+  const previous=await getCalendarReceipt(nonce,userId);
+  if(previous)return {...previous,replayed:true};
+  const session=await getDeletionSession(userId);
+  if(!session||session.nonce!==nonce)calendarReject(409,"Выбор уже закрыт.");
+  const result={ok:true,state:"cancelled",mode:"delete",message:"Время удаления не изменено. Материал сохранён."};
+  try{
+    await client.query("BEGIN");
+    const changed=await client.query("DELETE FROM ep_delete_sessions WHERE actor_user_id=$1 AND nonce=$2 RETURNING *",[userId,nonce]);
+    if(!changed.rowCount)calendarReject(409,"Выбор уже изменился.");
+    await client.query("INSERT INTO ep_calendar_receipts(nonce,actor_user_id,result) VALUES($1,$2,$3::jsonb)",[nonce,userId,JSON.stringify(result)]);
+    await client.query("COMMIT");
+  }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e;}
+  return result;
+}
+async function returnFromDeletion(key,userId) {
+  const target=await getDeletionTarget(key);
+  if(!await deletionAccess(target,userId,false))return;
+  if(target.publication){await showPublishedPost(target.publication.id,userId,false);return;}
+  if(target.schedule&&["scheduled","paused"].includes(target.schedule.status)) {
+    await showScheduledPost(target.schedule.id,userId,false);return;
+  }
+  if(target.kind==="p"&&target.row.status==="draft")await openSavedDraft(target.id,userId);
+}
+async function handleDeletionSavedNotice(update) {
+  const target=await getDeletionTarget(update.target_key);
+  if(!await deletionAccess(target,update.actor_user_id,false))return;
+  if(update.card_mid){try{await queueMaxWrite(`/messages?message_id=${encodeURIComponent(update.card_mid)}`,"PUT",{
+    text:`✅ ${deletionTimeText(target.policy)}\nКанал: «${shortTitle(target.row.title)}»`,attachments:[]});}
+    catch(e){console.error("DELETE CARD UPDATE ERROR:",e.message);}}
+  // Другой редактор/календарь, открытый после сохранения, не перехватываем.
+  if(await getScheduleSession(update.actor_user_id)||await getDeletionSession(update.actor_user_id)||
+    await getComposer(update.actor_user_id)||await getEditorSession(update.actor_user_id))return;
+  await returnFromDeletion(target.key,update.actor_user_id);
+}
+
+// ---------- Опубликованные посты и немедленное удаление ----------
+async function listPublishedPosts(userId,page=0) {
+  page=pageNumber(page);
+  const channels=await accessibleChannels(userId,"view");
+  const ids=channels.map(c=>String(c.id));
+  const found=ids.length ? await pool.query(`SELECT p.*,c.title FROM ep_publications p JOIN channels c ON c.id=p.channel_id
+    WHERE p.channel_id=ANY($1::bigint[]) AND (c.owner_user_id=$2 OR p.capability='moderate' OR p.actor_user_id=$2)
+    ORDER BY p.published_at DESC,p.id DESC`,[ids,userId]):{rows:[]};
+  const rows=found.rows.slice(page*ADMIN_PAGE_SIZE,(page+1)*ADMIN_PAGE_SIZE);
+  await sendToUser(userId,{text:"📤 Опубликованные\n\nПосты, отправленные через EveryPost. Откройте материал, чтобы настроить удаление.",
+    attachments:keyboard([...rows.map(r=>[button(`${shortTitle(r.title).slice(0,32)} · #${r.id}${r.status==="deleted"?" · удалён":""}`,`pubopen_${r.id}`)]),
+      ...(pageButtons("publist",page,found.rows.length).length?[pageButtons("publist",page,found.rows.length)]:[]),[button("↩️ Меню","menu_main")]])});
+}
+async function publishedTarget(publicationId,userId,requireDelete=false) {
+  const pub=(await pool.query("SELECT * FROM ep_publications WHERE id=$1",[publicationId])).rows[0];
+  const target=pub?await getDeletionTarget(pub.target_key):null;
+  const access=await deletionAccess(target,userId,requireDelete);
+  if(!access)return null;
+  return {target,access};
+}
+async function showPublishedPost(publicationId,userId,preview=true) {
+  const data=await publishedTarget(publicationId,userId);
+  if(!data){await notify(userId,"Этот пост недоступен.");return;}
+  const {target,access}=data,pub=target.publication;
+  if(preview&&pub.status==="published"&&pub.body_snapshot) {
+    try{await sendToUser(userId,pub.body_snapshot);}catch(e){console.error("PUBLISHED PREVIEW ERROR:",e.message);}
+  }
+  const timezone=target.policy?.timezone||access.channel.timezone||"Europe/Moscow";
+  const text=`📤 Пост #${pub.id}\nКанал: «${shortTitle(target.row.title)}»\n`+
+    `Публикация: ${timeLabel(pub.published_at,timezone)}${pub.legacy_time?" (время из прежней записи)":""}\n`+
+    (pub.status==="deleted"?"Пост удалён из канала.":deletionTimeText(target.policy))+
+    (target.policy?.last_error?`\n\n${target.policy.last_error.slice(0,450)}`:"")+"\n\nУдаление касается только поста в канале. Копия в чате и ответы остаются.";
+  const controls=[];
+  if(pub.status==="published"&&memberCanDelete(access.member)) {
+    controls.push([button(target.policy?.enabled?"🗑 Изменить автоудаление":"🗑 Автоудаление: выкл",`adpub_${pub.id}`)]);
+    controls.push([button("🗑 Удалить сейчас",`delnow_${pub.id}`)]);
+  }
+  controls.push([button("📤 Опубликованные","publist_0")]);
+  await sendToUser(userId,{text,attachments:keyboard(controls)});
+}
+async function prepareImmediateDeletion(publicationId,userId) {
+  const data=await publishedTarget(publicationId,userId,true);
+  if(!data||data.target.publication.status!=="published") {await notify(userId,"Нет доступа либо пост уже удалён.");return;}
+  const {target,access}=data;
+  if(target.policy?.status==="deleting"){await notify(userId,"Удаление уже началось. Дождитесь результата.");return;}
+  const nonce=newEditNonce();
+  await pool.query(`INSERT INTO ep_delete_intents(nonce,target_key,actor_user_id,expected_revision,access_version)
+    VALUES($1,$2,$3,$4,$5)`,[nonce,target.key,userId,target.policy?.revision||0,access.version]);
+  await sendToUser(userId,{text:`Удалить опубликованный пост #${publicationId} из канала «${shortTitle(target.row.title)}» сейчас?\n\nЭто нельзя отменить. Копия в чате не удаляется.`,
+    attachments:keyboard([[button("🗑 Удалить сейчас",`delconfirm_${nonce}`)],[button("Не удалять",`pubopen_${publicationId}`)]])});
+}
+async function confirmImmediateDeletion(nonce,userId) {
+  const intent=(await pool.query("SELECT * FROM ep_delete_intents WHERE nonce=$1 AND actor_user_id=$2 AND used=FALSE AND expires_at>NOW()",[nonce,userId])).rows[0];
+  const target=intent?await getDeletionTarget(intent.target_key):null,access=await deletionAccess(target,userId);
+  if(!intent||!access||access.version!==Number(intent.access_version)||target.publication?.status!=="published"||
+    Number(target.policy?.revision||0)!==Number(intent.expected_revision)||target.policy?.status==="deleting") {
+    await notify(userId,"Подтверждение устарело или права изменились. Откройте пост заново.");return;
+  }
+  const client=await pool.connect();
+  try{
+    await client.query("BEGIN");
+    const claimed=await client.query("UPDATE ep_delete_intents SET used=TRUE WHERE nonce=$1 AND used=FALSE RETURNING *",[nonce]);
+    if(claimed.rowCount){
+      await client.query(`INSERT INTO ep_auto_deletions(target_key,channel_id,capability,due_at,timezone,requested_by,access_version,enabled,status,channel_mid)
+        VALUES($1,$2,$3,NOW(),$4,$5,$6,TRUE,'scheduled',$7)
+        ON CONFLICT(target_key) DO UPDATE SET due_at=NOW(),enabled=TRUE,status='scheduled',requested_by=EXCLUDED.requested_by,
+          access_version=EXCLUDED.access_version,channel_mid=EXCLUDED.channel_mid,revision=ep_auto_deletions.revision+1,
+          attempts=0,next_at=NOW(),dispatch_started_at=NULL,last_error=NULL,updated_at=NOW()`,
+        [target.key,target.channel_id,target.capability,access.channel.timezone||"Europe/Moscow",userId,access.version,target.publication.message_id]);
+      await client.query("DELETE FROM ep_delete_sessions WHERE target_key=$1",[target.key]);
+      await audit(target.channel_id,userId,"delete_now_requested",target.key,{},client);
+    }
+    await client.query("COMMIT");
+  }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e;}finally{client.release();}
+  await notify(userId,"Удаление поставлено в очередь. Результат придёт отдельным сообщением.");
+}
+
+async function handleDeletionCallback(update) {
+  const cb=update.callback,userId=cb?.user?.user_id;
+  const value=typeof cb?.payload==="string"?cb.payload:"";
+  if(userId==null)return false;
+  const session=await getDeletionSession(userId);
+  const close=value.match(/^adclose_([a-f0-9]{24})$/);
+  if(close){
+    await answerCallback(cb.callback_id);
+    if(!session||session.nonce!==close[1])return true;
+    const client=await pool.connect();
+    try{await cancelDeletionChoice(client,userId,session.nonce);}finally{client.release();}
+    await returnFromDeletion(session.target_key,userId);return true;
+  }
+  if(session){await answerCallback(cb.callback_id,"Сначала завершите выбор даты удаления.");await renderDeletionLaunch(session);return true;}
+  const source=value.match(/^ads_(\d+)(?:_a(\d+))?$/),edit=value.match(/^ade_(\d+)_([a-f0-9]{24})$/),own=value.match(/^adp_([a-f0-9]{24})$/);
+  const target=value.match(/^addp_(\d+)$/),published=value.match(/^adpub_(\d+)$/),listing=value.match(/^publist_(\d+)$/);
+  const open=value.match(/^pubopen_(\d+)$/),now=value.match(/^delnow_(\d+)$/),confirm=value.match(/^delconfirm_([a-f0-9]{24})$/);
+  if(!source&&!edit&&!own&&!target&&!published&&!listing&&!open&&!now&&!confirm)return false;
+  await answerCallback(cb.callback_id);
+  if(listing){await listPublishedPosts(userId,listing[1]);return true;}
+  if(open){await showPublishedPost(open[1],userId);return true;}
+  if(now){await prepareImmediateDeletion(now[1],userId);return true;}
+  if(confirm){await confirmImmediateDeletion(confirm[1],userId);return true;}
+  if(await getScheduleSession(userId)||await getStyleInput(userId)){await notify(userId,"Завершите открытый выбор времени или оформление.");return true;}
+  if(published){const data=await publishedTarget(published[1],userId,true);if(data)await beginDeletionCalendar(data.target.key,userId);return true;}
+  if(target){await beginDeletionCalendar(deletionKey("p",target[1]),userId);return true;}
+  if(own){
+    const composing=await getComposer(userId),row=composing?await getOwnPost(composing.post_id):null;
+    if(!composing||composing.nonce!==own[1]||!row){await notify(userId,"Откройте последний предпросмотр.");return true;}
+    const context=await getDeletionTarget(deletionKey("p",row.id));
+    if(!await deletionAccess(context,userId)){await notify(userId,"Для автоудаления нужны права удаления в MAX.");return true;}
+    const saved=await saveComposerDraft(composing,row,cb.callback_id,true);
+    if(saved)await beginDeletionCalendar(deletionKey("p",saved.id),userId);
+    return true;
+  }
+  const row=await getSubmission((source||edit)[1]);
+  const access=row?await channelAccess(row.channel_id,userId,"moderate"):null;
+  if(!access||!memberCanDelete(access.member)||source&&!access.owner&&Number(source[2])!==access.version){
+    await notify(userId,"Нет доступа или не выдано право удаления в MAX.");return true;
+  }
+  const editor=edit?await getEditorSession(userId):null;
+  if(edit&&(!editor||editor.nonce!==edit[2]||String(editor.submission_id)!==edit[1])) {await notify(userId,"Предпросмотр устарел.");return true;}
+  const saved=await saveSubmissionDraft(row,userId,cb.callback_id,editor,true);
+  if(saved)await beginDeletionCalendar(deletionKey("p",saved.id),userId);
+  return true;
+}
+
+// ---------- Выполнение удаления: под общей блокировкой worker ----------
+async function deletionNotice(target,policy,text) {
+  const ids=new Set([String(target.row.owner_user_id)]);
+  try{if(await deletionAccess(target,policy.requested_by,false))ids.add(String(policy.requested_by));}catch{}
+  for(const id of ids)await notify(id,text);
+}
+async function pauseDeletion(policy,reason) {
+  const result=await pool.query(`UPDATE ep_auto_deletions SET status='paused',revision=revision+1,last_error=$3,
+    dispatch_started_at=NULL,updated_at=NOW() WHERE target_key=$1 AND revision=$2
+    AND status IN ('armed','scheduled','deleting') RETURNING *`,[policy.target_key,policy.revision,reason.slice(0,1000)]);
+  if(result.rowCount){
+    const target=await getDeletionTarget(policy.target_key);
+    if(target)await deletionNotice(target,result.rows[0],`⚠️ Автоудаление приостановлено · «${shortTitle(target.row.title)}»\n${reason}\nОткройте /published и настройте удаление заново.`);
+  }
+}
+async function processOneDeletion() {
+  const selected=await pool.query(`SELECT * FROM ep_auto_deletions WHERE enabled=TRUE
+    AND (status='deleting' OR (status='scheduled' AND due_at<=NOW() AND next_at<=NOW()))
+    ORDER BY due_at,target_key LIMIT 1`);
+  const policy=selected.rows[0];if(!policy)return;
+  // DELETE по одному сохранённому message_id можно повторить после сетевого сбоя.
+  // Но 404/неподтверждённое удаление не выдаётся за успешное удаление.
+  let target=await getDeletionTarget(policy.target_key);
+  if(!target?.publication||target.publication.message_id!==policy.channel_mid||target.publication.status!=="published"){
+    await pauseDeletion(policy,"Не совпадает запись опубликованного сообщения. Нужна проверка канала.");return;
+  }
+  try{
+    const access=await deletionAccess(target,policy.requested_by);
+    if(!access||access.version!==Number(policy.access_version)) {
+      await pauseDeletion(policy,"Права назначившего удаление изменились. Владелец должен повторно выбрать дату.");return;
+    }
+    const claimed=await pool.query(`UPDATE ep_auto_deletions SET status='deleting',attempts=attempts+1,updated_at=NOW()
+      WHERE target_key=$1 AND revision=$2 AND enabled=TRUE AND status IN ('scheduled','deleting') RETURNING *`,[policy.target_key,policy.revision]);
+    if(!claimed.rowCount)return;
+    const attempt=claimed.rows[0];
+    const task=apiTail.catch(()=>{}).then(async()=>{
+      await sleep(Math.max(0,650-(Date.now()-lastApiCall)));
+      const fresh=await getDeletionPolicy(policy.target_key),t=await getDeletionTarget(policy.target_key);
+      const rights=await deletionAccess(t,policy.requested_by);
+      if(!fresh?.enabled||fresh.status!=="deleting"||Number(fresh.revision)!==Number(policy.revision)||
+        !rights||rights.version!==Number(policy.access_version)||t.publication?.message_id!==policy.channel_mid) {
+        const e=new Error("Права или состояние удаления изменились перед запросом.");e.stopDeletion=true;throw e;
+      }
+      await pool.query("UPDATE ep_auto_deletions SET dispatch_started_at=NOW() WHERE target_key=$1 AND revision=$2",[policy.target_key,policy.revision]);
+      lastApiCall=Date.now();
+      const result=await maxRequest(`/messages?message_id=${encodeURIComponent(policy.channel_mid)}`,"DELETE");
+      if(result.success!==true){const e=new Error("MAX не подтвердил удаление. Проверьте канал.");e.stopDeletion=true;throw e;}
+      return result;
+    });
+    apiTail=task.catch(()=>{});
+    try{await task;}
+    catch(e){
+      const transient=!e.stopDeletion&&(!e.status||e.status===408||e.status===429||e.status>=500);
+      if(transient&&attempt.attempts<8){
+        const delay=Math.min(300,30*2**Math.min(4,attempt.attempts-1));
+        await pool.query(`UPDATE ep_auto_deletions SET status='scheduled',next_at=NOW()+($3::int * INTERVAL '1 second'),last_error=$4,
+          dispatch_started_at=NULL,updated_at=NOW() WHERE target_key=$1 AND revision=$2`,[policy.target_key,policy.revision,delay,e.message.slice(0,1000)]);
+        if(attempt.attempts===1)await deletionNotice(target,policy,`⚠️ Удаление пока не подтверждено · «${shortTitle(target.row.title)}». Повторная проверка через ${delay} сек. Не считаем пост удалённым без ответа MAX.`);
+      }else await pauseDeletion(policy,`MAX не подтвердил удаление: ${e.message.slice(0,500)}`);
+      console.error("AUTO DELETE ERROR:",e.message);return;
+    }
+    const client=await pool.connect();
+    try{
+      await client.query("BEGIN");
+      const done=await client.query(`UPDATE ep_auto_deletions SET status='deleted',enabled=FALSE,deleted_at=NOW(),last_error=NULL,
+        revision=revision+1,updated_at=NOW() WHERE target_key=$1 AND revision=$2 RETURNING *`,[policy.target_key,policy.revision]);
+      if(!done.rowCount)throw new Error("Deletion result version changed");
+      await client.query("UPDATE ep_publications SET status='deleted',deleted_at=NOW() WHERE target_key=$1",[policy.target_key]);
+      await client.query("DELETE FROM ep_delete_sessions WHERE target_key=$1",[policy.target_key]);
+      await audit(target.channel_id,policy.requested_by,"post_auto_deleted",policy.target_key,{message_id:policy.channel_mid},client);
+      await client.query("COMMIT");
+    }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e;}finally{client.release();}
+    console.log("AUTO DELETE COMPLETED:",policy.target_key);
+    const late=Date.now()-new Date(policy.due_at).getTime()>60000;
+    await deletionNotice(target,policy,`🗑 Пост удалён из канала «${shortTitle(target.row.title)}».`+
+      (late?"\nУдаление выполнено с опозданием после возобновления работы сервиса.":""));
+  }catch(e){
+    // Ошибка до DELETE или записи результата. Оставляем известный ID и не
+    // утверждаем успех; следующий запуск проверит тот же материал.
+    console.error("AUTO DELETE WORKER ERROR:",e.message);
+    await pool.query(`UPDATE ep_auto_deletions SET next_at=NOW()+INTERVAL '30 seconds',last_error=$3,
+      status=CASE WHEN status='deleting' THEN 'scheduled' ELSE status END,updated_at=NOW()
+      WHERE target_key=$1 AND revision=$2`,[policy.target_key,policy.revision,e.message.slice(0,1000)]);
+  }
+}
+
 // https://everypost-max-bot.onrender.com/calendar
 // Идентификатор пользователя берётся только из проверенной подписи initData.
 const CALENDAR_ORIGIN = new URL(WEBHOOK_URL).origin;
@@ -4610,7 +5200,9 @@ function calendarStateBody(session, post, now = Date.now()) {
     serverNow: now, today, maxDay: shiftDay(today, SCHEDULE_HORIZON_DAYS),
     day: session.day_key, hour: Number(session.hour), minute: Number(session.minute),
     expiresAt: new Date(session.expires_at).toISOString(),
-    rescheduling: Boolean(session.schedule_id)
+    rescheduling: Boolean(session.schedule_id), mode: 'schedule',
+    maxPublishAt: post.deletion_policy?.enabled ? post.deletion_policy.due_at : null,
+    currentDeletionLabel: deletionTimeText(post.deletion_policy)
   };
 }
 function validateCalendarChoice(input, timezone, now = Date.now()) {
@@ -4646,6 +5238,7 @@ async function saveCalendarChoice(client, userId, nonce, input) {
         : fresh.status === 'draft' && fresh.is_saved && (!old || old.status === 'cancelled'));
     if (!valid) calendarReject(409, 'Материал или расписание уже изменились. Закройте это окно и откройте пост заново.');
     validateCalendarChoice(input, session.timezone);
+    await assertPublicationWindow(deletionKey("p",post.id),choice.due,client);
     const saved = (await client.query(`INSERT INTO ep_schedules(post_id,status,due_at,timezone,scheduled_by,access_version,body_snapshot)
       VALUES ($1,'scheduled',$2,$3,$4,$5,$6::jsonb)
       ON CONFLICT(post_id) DO UPDATE SET status='scheduled',due_at=EXCLUDED.due_at,
@@ -4746,10 +5339,23 @@ function calendarEndpoint(action) {
       if (!req.is('application/json')) calendarReject(415, 'Ожидается application/json.');
       const auth = verifyCalendarInitData(req.body?.initData);
       calendarLimit(auth.userId, action !== 'state');
-      const fromStart = /^sc_([a-f0-9]{24})$/.exec(auth.startParam)?.[1] || null;
+      const launch = /^(sc|ad)_([a-f0-9]{24})$/.exec(auth.startParam);
+      const fromStart = launch?.[2] || null;
       const nonce = calendarNonce(req.body?.nonce || fromStart, action === 'state');
       // Сам nonce не даёт прав. Каждый запрос связан с проверенным user.id.
       const result = await withCalendarLock(async client => {
+        const deleting=await getDeletionSession(auth.userId);
+        const initialReceipt=nonce?await getCalendarReceipt(nonce,auth.userId):null;
+        const mode=initialReceipt?.mode || ((deleting && (!nonce || deleting.nonce===nonce)) ? 'delete' :
+          (req.body?.mode==='delete'||launch?.[1]==='ad'?'delete':'schedule'));
+        if(mode==='delete') {
+          if(action==='save'||action==='disable')return saveDeletionChoice(client,auth.userId,nonce,req.body,action==='disable');
+          if(action==='cancel')return cancelDeletionChoice(client,auth.userId,nonce);
+          if(initialReceipt)return {...initialReceipt,replayed:true};
+          const {session,target}=await checkedDeletionSession(auth.userId,nonce);
+          return deletionStateBody(session,target);
+        }
+        if(action==='disable')calendarReject(400,'Это календарь публикации, не удаления.');
         if (action === 'save') return saveCalendarChoice(client, auth.userId, nonce, req.body);
         if (action === 'cancel') return cancelCalendarChoice(client, auth.userId, nonce);
         const receipt = await getCalendarReceipt(nonce, auth.userId);
@@ -4758,7 +5364,7 @@ function calendarEndpoint(action) {
         return calendarStateBody(session, post);
       });
       res.json(result);
-      if (action === 'save') void runWorker();
+      if (action === 'save' || action === 'disable') void runWorker();
     } catch (error) {
       if (!(error instanceof CalendarError)) console.error('CALENDAR API ERROR:', error.message);
       res.status(error instanceof CalendarError ? error.status : 503).json({
@@ -4770,8 +5376,9 @@ function calendarEndpoint(action) {
 app.post('/calendar/api/state', calendarEndpoint('state'));
 app.post('/calendar/api/save', calendarEndpoint('save'));
 app.post('/calendar/api/cancel', calendarEndpoint('cancel'));
+app.post('/calendar/api/disable', calendarEndpoint('disable'));
 
-const CALENDAR_HTML = "<!doctype html>\n<html lang=\"ru\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n<meta name=\"color-scheme\" content=\"dark light\">\n<title>EveryPost · Запланировать пост</title>\n<style nonce=\"__CSP_NONCE__\">\n:root{color-scheme:dark;--bg:#18151b;--panel:#242126;--text:#fbf9fc;--muted:#96919c;--disabled:#4a454f;--accent:#c53780;--control:#37333c;--line:#45404a}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;-webkit-font-smoothing:antialiased}button,input,select{font:inherit}button{cursor:pointer;color:inherit;border:0;background:none;-webkit-tap-highlight-color:transparent}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button:disabled{cursor:default;color:var(--disabled)}[hidden]{display:none!important}\n.viewport{min-height:100svh;display:flex;align-items:flex-end;justify-content:center;padding-top:max(10px,env(safe-area-inset-top))}.sheet{width:100%;max-width:600px;min-height:min(680px,100svh);background:var(--panel);border-radius:26px 26px 0 0;padding:10px 16px max(22px,env(safe-area-inset-bottom));box-shadow:0 -1px 0 #ffffff08}.handle{width:34px;height:4px;border-radius:8px;background:#7a738044;margin:0 auto 15px}.heading{display:grid;grid-template-columns:40px 1fr 40px;align-items:center;margin-bottom:8px}.heading h1{font-size:20px;font-weight:650;text-align:center;letter-spacing:-.5px;margin:0}.cross{width:38px;height:38px;padding:9px;color:var(--text)}svg{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}.context{text-align:center;color:var(--muted);font-size:12px;line-height:1.4;margin:2px 12px 22px;overflow-wrap:anywhere}.context strong{font-weight:500;color:var(--text)}.month-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding:0 9px}.month-label{display:flex;align-items:center;gap:7px;text-align:left;padding:5px 0;font-size:19px;font-weight:650}.month-label svg{width:15px;height:19px;color:var(--accent)}.arrows{display:flex;gap:12px}.arrow{width:36px;height:36px;padding:8px;color:var(--accent)}.week,.days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));text-align:center}.week{font-size:12px;letter-spacing:.6px;font-weight:600;color:var(--muted);margin:0 0 10px}.days{row-gap:6px}.day{width:44px;max-width:100%;height:44px;justify-self:center;border-radius:50%;font-size:22px;padding:0;line-height:44px}.day.selected{background:var(--accent);color:white;font-weight:650}.day.today:not(.selected){color:var(--accent)}.day:not(:disabled):not(.selected):hover{background:#ffffff09}.empty{height:44px}.time-row{display:flex;justify-content:space-between;align-items:center;padding:20px 12px 16px;margin-top:10px}.time-row label{font-size:19px;font-weight:600}.time-control{position:relative;border-radius:9px;background:var(--control);min-width:78px;padding:10px 12px;text-align:center;font-size:21px;font-variant-numeric:tabular-nums}.time-control input{position:absolute;inset:0;width:100%;height:100%;border:0;opacity:0;cursor:pointer;color-scheme:dark}.time-control input::-webkit-calendar-picker-indicator{position:absolute;inset:0;width:auto;height:auto}.note{color:var(--muted);font-size:12px;line-height:1.45;text-align:center;margin:0 10px 8px}.error{font-size:13px;line-height:1.4;color:#ff9ebf;margin:12px 10px;min-height:18px;text-align:center}.primary{display:block;width:100%;background:var(--accent);color:#fff;border:0;border-radius:16px;min-height:54px;padding:13px 12px;font-size:18px;font-weight:600;margin-top:10px;line-height:1.3}.primary:disabled{background:#64344d;color:#c0a0b1}.minor{display:block;margin:14px auto 0;color:var(--muted);font-size:13px}.status{padding:36px 16px;text-align:center;min-height:370px;display:flex;flex-direction:column;align-items:center;justify-content:center}.status .symbol{font-size:48px;margin-bottom:16px}.status h2{font-size:23px;letter-spacing:-.6px;margin:0 0 15px}.status p{color:var(--muted);font-size:15px;line-height:1.5;white-space:pre-line;overflow-wrap:anywhere}.status .primary{max-width:350px}.jump{background:var(--control);border-radius:14px;padding:15px;margin:0 6px 18px;display:flex;gap:8px}.jump select{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;flex:1}.brand{text-align:center;color:var(--muted);opacity:.65;font-size:11px;margin:16px 0 0;letter-spacing:1px}\n@media(min-width:700px){.viewport{padding:24px;align-items:center}.sheet{border-radius:28px;min-height:0;max-width:510px;padding:12px 24px 24px}.day{height:49px;width:49px;line-height:49px}.context{margin-bottom:26px}}\n@media(max-width:360px){.heading h1{font-size:18px}.sheet{padding-left:10px;padding-right:10px}.month-label{font-size:17px}.day{width:38px;height:42px;line-height:42px;font-size:20px}.primary{font-size:16px}}\n@media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#eceaf0;--panel:#fff;--text:#211d24;--muted:#7d7582;--disabled:#ccc7d0;--control:#f0edf2;--line:#ddd7e0}.error{color:#a31850}.time-control input{color-scheme:light}}\n</style>\n<script nonce=\"__CSP_NONCE__\" src=\"https://st.max.ru/js/max-web-app.js\"></script>\n</head>\n<body>\n<main class=\"viewport\"><section class=\"sheet\" aria-label=\"Календарь отложенной публикации\">\n<div class=\"handle\" aria-hidden=\"true\"></div>\n<header class=\"heading\"><button class=\"cross\" id=\"close\" aria-label=\"Закрыть выбор времени\"><svg viewBox=\"0 0 24 24\"><path d=\"m5 5 14 14M19 5 5 19\"/></svg></button><h1>Запланировать пост</h1><span></span></header>\n<div class=\"status\" id=\"status\" role=\"status\"><div class=\"symbol\" id=\"symbol\">◌</div><h2 id=\"statusTitle\">Открываем календарь</h2><p id=\"statusText\">Проверяем доступ к материалу…</p><button id=\"retry\" class=\"primary\" hidden>Повторить</button><button id=\"returnBot\" class=\"minor\">Вернуться в EveryPost</button></div>\n<div id=\"editor\" hidden>\n<p class=\"context\"><strong id=\"channel\"></strong><br><span id=\"zone\"></span></p>\n<div class=\"month-row\"><button id=\"monthLabel\" class=\"month-label\" aria-label=\"Выбрать месяц и год\"><span id=\"monthText\"></span><svg viewBox=\"0 0 16 24\"><path d=\"m5 5 7 7-7 7\"/></svg></button><div class=\"arrows\"><button class=\"arrow\" id=\"prev\" aria-label=\"Предыдущий месяц\"><svg viewBox=\"0 0 24 24\"><path d=\"m15 5-7 7 7 7\"/></svg></button><button class=\"arrow\" id=\"next\" aria-label=\"Следующий месяц\"><svg viewBox=\"0 0 24 24\"><path d=\"m9 5 7 7-7 7\"/></svg></button></div></div>\n<div class=\"jump\" id=\"jump\" hidden><select id=\"jumpMonth\" aria-label=\"Месяц\"></select><select id=\"jumpYear\" aria-label=\"Год\"></select></div>\n<div class=\"week\" aria-hidden=\"true\"><span>ПН</span><span>ВТ</span><span>СР</span><span>ЧТ</span><span>ПТ</span><span>СБ</span><span>ВС</span></div>\n<div class=\"days\" id=\"days\" role=\"group\" aria-label=\"Выбор дня\"></div>\n<div class=\"time-row\"><label for=\"time\">Время</label><div class=\"time-control\"><span id=\"timeText\">--:--</span><input type=\"time\" id=\"time\" step=\"60\" aria-label=\"Время публикации в часовом поясе канала\" required></div></div>\n<p class=\"note\" id=\"oldSchedule\" hidden>До сохранения нового времени действует прежнее расписание.</p>\n<p class=\"error\" id=\"error\" role=\"alert\"></p>\n<button type=\"button\" class=\"primary\" id=\"save\">Отправить</button>\n<p class=\"brand\">EVERYPOST</p>\n</div>\n</section></main>\n<script nonce=\"__CSP_NONCE__\">\n(function(){\n'use strict';\nconst $=id=>document.getElementById(id),months=['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];\nconst monthCases=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];\nconst pad=n=>String(n).padStart(2,'0');\nlet data=null,selected='',view='',busy=false,initData='',nonce=null,delta=0,retryAction=null,uncertain=null;\nconst bridge=()=>window.WebApp;\nfunction parts(at,zone){return Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(at)).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));}\nfunction key(p){return String(p.year)+pad(p.month)+pad(p.day);}\nfunction shifted(day,by){const d=new Date(Date.UTC(Number(day.slice(0,4)),Number(day.slice(4,6))-1,Number(day.slice(6,8))+by));return String(d.getUTCFullYear())+pad(d.getUTCMonth()+1)+pad(d.getUTCDate());}\nfunction instant(day,h,m,zone){const target=Date.UTC(+day.slice(0,4),+day.slice(4,6)-1,+day.slice(6,8),h,m);let at=target;for(let i=0;i<4;i++){const p=parts(at,zone);at+=target-Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute,p.second);}return at;}\nfunction atNow(){return Date.now()+delta;}\nfunction modal(title,text,symbol='!',retry=null){$('editor').hidden=true;$('status').hidden=false;$('statusTitle').textContent=title;$('statusText').textContent=text;$('symbol').textContent=symbol;retryAction=retry;$('retry').hidden=!retry;}\nfunction returnToBot(){const b=bridge();if(typeof b?.close==='function'){b.close();return;}if(typeof b?.openMaxLink==='function'){b.openMaxLink('https://max.ru/id190206555510_3_bot');return;}window.location.href='https://max.ru/id190206555510_3_bot';}\nfunction readLaunch(){\n  const b=bridge(); const hash=new URLSearchParams(location.hash.slice(1));\n  initData=typeof b?.initData==='string'&&b.initData?b.initData:hash.get('WebAppData')||'';\n  const p=new URLSearchParams(initData);\n  const hint=p.get('start_param')||b?.initDataUnsafe?.start_param||hash.get('WebAppStartParam')||new URLSearchParams(location.search).get('WebAppStartParam')||'';\n  const match=typeof hint==='string'?hint.match(/^sc_([a-f0-9]{24})$/):null;\n  nonce=match?match[1]:null;\n}\nasync function request(action,body={}){\n  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),25000);\n  try{\n    const res=await fetch('/calendar/api/'+action,{method:'POST',credentials:'omit',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData,nonce,...body}),signal:controller.signal});\n    let result;try{result=await res.json();}catch{throw new Error('Сервер запускается или временно недоступен. Подождите и повторите.');}\n    if(!res.ok||!result.ok){const e=new Error(result.message||'Не удалось выполнить действие.');e.status=res.status;throw e;}\n    return result;\n  }catch(e){if(e.name==='AbortError')throw new Error('Ответ сервера задерживается. Проверьте результат кнопкой «Повторить».');throw e;}finally{clearTimeout(timer);}\n}\nfunction receipt(result){\n  busy=false;uncertain=null;data=null;\n  if(result.state==='saved')modal('Пост отложен',result.title+'\\n'+result.label+'\\n'+result.zoneLabel+'\\n\\nРасписание также доступно в боте.','✓');\n  else modal('Выбор времени закрыт',result.message||'Расписание не изменено.','✓');\n}\nfunction render(){\n  if(!data)return;\n  const y=Number(view.slice(0,4)),m=Number(view.slice(4,6));\n  const today=key(parts(atNow(),data.timezone));data.today=today;\n  $('monthText').textContent=months[m-1]+' '+y+' г.';\n  $('prev').disabled=busy||view<=today.slice(0,6);$('next').disabled=busy||view>=data.maxDay.slice(0,6);\n  const first=new Date(Date.UTC(y,m-1,1)),offset=(first.getUTCDay()+6)%7,count=new Date(Date.UTC(y,m,0)).getUTCDate();\n  const frag=document.createDocumentFragment();\n  for(let i=0;i<offset;i++){const blank=document.createElement('span');blank.className='empty';blank.setAttribute('aria-hidden','true');frag.append(blank);}\n  for(let d=1;d<=count;d++){\n    const k=view+pad(d),btn=document.createElement('button');btn.type='button';btn.className='day'+(k===selected?' selected':'')+(k===today?' today':'');btn.textContent=String(d);\n    btn.disabled=busy||k<today||k>data.maxDay;btn.setAttribute('aria-label',d+' '+monthCases[m-1]+' '+y);btn.setAttribute('aria-pressed',String(k===selected));\n    btn.addEventListener('click',()=>{if(busy)return;selected=k;$('error').textContent='';render();});frag.append(btn);\n  }\n  $('days').replaceChildren(frag);\n  $('time').disabled=busy;$('monthLabel').disabled=busy;$('jumpMonth').disabled=busy;$('jumpYear').disabled=busy;\n  const time=$('time').value; $('timeText').textContent=time||'--:--';\n  let valid=selected>=today&&selected<=data.maxDay&&/^\\d{2}:\\d{2}$/.test(time);\n  if(valid){const [h,mi]=time.split(':').map(Number);valid=instant(selected,h,mi,data.timezone)>atNow()+5000;}\n  const label=selected===today?'сегодня':selected===shifted(today,1)?'завтра':(+selected.slice(6,8))+' '+monthCases[+selected.slice(4,6)-1]+(selected.slice(0,4)!==today.slice(0,4)?' '+selected.slice(0,4):'');\n  $('save').textContent=busy?'Сохраняем…':(data.rescheduling?'Перенести на ':'Отправить ')+label+' в '+(time||'--:--');$('save').disabled=busy||!valid;\n  if(!valid&&!$('error').textContent)$('error').textContent='Выберите время позже текущего в часовом поясе канала.';\n  $('jumpMonth').value=String(m);$('jumpYear').value=String(y);\n}\nfunction jumpSetup(){\n  $('jumpMonth').replaceChildren();months.forEach((name,i)=>{const o=document.createElement('option');o.value=String(i+1);o.textContent=name;$('jumpMonth').append(o);});\n  $('jumpYear').replaceChildren();for(let y=+data.today.slice(0,4);y<=+data.maxDay.slice(0,4);y++){const o=document.createElement('option');o.value=String(y);o.textContent=String(y);$('jumpYear').append(o);}\n}\nasync function load(){\n  readLaunch();\n  if(!initData){modal('Откройте через EveryPost','В личном чате бота нажмите «Отложить», затем «Открыть календарь». Без авторизации MAX время сохранить нельзя.','↗',load);return;}\n  modal('Открываем календарь','Проверяем доступ к материалу…','◌');\n  try{\n    const result=await request('state');if(result.state!=='editing'){receipt(result);return;}\n    data=result;nonce=result.nonce;delta=Number(result.serverNow)-Date.now();selected=data.day;view=selected.slice(0,6);\n    $('channel').textContent=data.title+' · пост #'+data.postId;$('zone').textContent=data.zoneLabel;$('time').value=pad(data.hour)+':'+pad(data.minute);$('oldSchedule').hidden=!data.rescheduling;\n    $('error').textContent='';$('jump').hidden=true;$('status').hidden=true;$('editor').hidden=false;busy=false;jumpSetup();render();\n  }catch(e){modal('Календарь не открыт',e.message,'!',load);}\n}\nasync function checkUncertain(){\n  if(!uncertain){await load();return;}\n  try{const r=await request(uncertain.action,uncertain.body);receipt(r);}\n  catch(e){modal('Не удалось подтвердить результат',e.message+'\\nПовтор проверяет ту же операцию и не создаёт второй пост.','!',checkUncertain);}\n}\nasync function save(){\n  if(!data||busy||$('save').disabled)return;\n  const [hour,minute]=$('time').value.split(':').map(Number),body={day:selected,hour,minute};\n  busy=true;$('error').textContent='';render();\n  try{receipt(await request('save',body));}\n  catch(e){\n    busy=false;\n    if(e.status&&e.status<500){$('error').textContent=e.message;render();}\n    else{uncertain={action:'save',body};modal('Проверяем сохранение',e.message+'\\nНе создавайте второй пост: повтор безопасно проверит этот же выбор времени.','!',checkUncertain);}\n  }\n}\nasync function close(){\n  if(busy)return;\n  if(!data){returnToBot();return;}\n  busy=true;render();\n  try{receipt(await request('cancel'));returnToBot();}\n  catch(e){busy=false;uncertain={action:'cancel',body:{}};modal('Не удалось закрыть выбор',e.message,'!',checkUncertain);}\n}\n$('save').addEventListener('click',save);$('close').addEventListener('click',close);$('returnBot').addEventListener('click',returnToBot);$('retry').addEventListener('click',()=>retryAction?.());\n$('time').addEventListener('input',()=>{$('error').textContent='';render();});\n$('monthLabel').addEventListener('click',()=>{$('jump').hidden=!$('jump').hidden;});\nfunction changeView(shift){if(!data||busy)return;const d=new Date(Date.UTC(+view.slice(0,4),+view.slice(4,6)-1+shift,1));view=String(d.getUTCFullYear())+pad(d.getUTCMonth()+1);render();}\n$('prev').addEventListener('click',()=>changeView(-1));$('next').addEventListener('click',()=>changeView(1));\nfunction applyJump(){if(!data||busy)return;let v=$('jumpYear').value+pad($('jumpMonth').value);v=v<data.today.slice(0,6)?data.today.slice(0,6):v>data.maxDay.slice(0,6)?data.maxDay.slice(0,6):v;view=v;render();}\n$('jumpMonth').addEventListener('change',applyJump);$('jumpYear').addEventListener('change',applyJump);\ntry{bridge()?.BackButton?.show();bridge()?.BackButton?.onClick(close);}catch{}\nsetInterval(()=>{if(data&&!busy)render();},15000);\nload();\n})();\n</script>\n</body></html>\n";
+const CALENDAR_HTML = "<!doctype html>\n<html lang=\"ru\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n<meta name=\"color-scheme\" content=\"dark light\">\n<title>EveryPost · Календарь</title>\n<style nonce=\"__CSP_NONCE__\">\n:root{color-scheme:dark;--bg:#18151b;--panel:#242126;--text:#fbf9fc;--muted:#96919c;--disabled:#4a454f;--accent:#c53780;--control:#37333c;--line:#45404a}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;-webkit-font-smoothing:antialiased}button,input,select{font:inherit}button{cursor:pointer;color:inherit;border:0;background:none;-webkit-tap-highlight-color:transparent}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button:disabled{cursor:default;color:var(--disabled)}[hidden]{display:none!important}\n.viewport{min-height:100svh;display:flex;align-items:flex-end;justify-content:center;padding-top:max(10px,env(safe-area-inset-top))}.sheet{width:100%;max-width:600px;min-height:min(680px,100svh);background:var(--panel);border-radius:26px 26px 0 0;padding:10px 16px max(22px,env(safe-area-inset-bottom));box-shadow:0 -1px 0 #ffffff08}.handle{width:34px;height:4px;border-radius:8px;background:#7a738044;margin:0 auto 15px}.heading{display:grid;grid-template-columns:40px 1fr 40px;align-items:center;margin-bottom:8px}.heading h1{font-size:20px;font-weight:650;text-align:center;letter-spacing:-.5px;margin:0}.cross{width:38px;height:38px;padding:9px;color:var(--text)}svg{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}.context{text-align:center;color:var(--muted);font-size:12px;line-height:1.4;margin:2px 12px 22px;overflow-wrap:anywhere}.context strong{font-weight:500;color:var(--text)}.month-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding:0 9px}.month-label{display:flex;align-items:center;gap:7px;text-align:left;padding:5px 0;font-size:19px;font-weight:650}.month-label svg{width:15px;height:19px;color:var(--accent)}.arrows{display:flex;gap:12px}.arrow{width:36px;height:36px;padding:8px;color:var(--accent)}.week,.days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));text-align:center}.week{font-size:12px;letter-spacing:.6px;font-weight:600;color:var(--muted);margin:0 0 10px}.days{row-gap:6px}.day{width:44px;max-width:100%;height:44px;justify-self:center;border-radius:50%;font-size:22px;padding:0;line-height:44px}.day.selected{background:var(--accent);color:white;font-weight:650}.day.today:not(.selected){color:var(--accent)}.day:not(:disabled):not(.selected):hover{background:#ffffff09}.empty{height:44px}.time-row{display:flex;justify-content:space-between;align-items:center;padding:20px 12px 16px;margin-top:10px}.time-row label{font-size:19px;font-weight:600}.time-control{position:relative;border-radius:9px;background:var(--control);min-width:78px;padding:10px 12px;text-align:center;font-size:21px;font-variant-numeric:tabular-nums}.time-control input{position:absolute;inset:0;width:100%;height:100%;border:0;opacity:0;cursor:pointer;color-scheme:dark}.time-control input::-webkit-calendar-picker-indicator{position:absolute;inset:0;width:auto;height:auto}.note{color:var(--muted);font-size:12px;line-height:1.45;text-align:center;margin:0 10px 8px}.error{font-size:13px;line-height:1.4;color:#ff9ebf;margin:12px 10px;min-height:18px;text-align:center}.primary{display:block;width:100%;background:var(--accent);color:#fff;border:0;border-radius:16px;min-height:54px;padding:13px 12px;font-size:18px;font-weight:600;margin-top:10px;line-height:1.3}.primary:disabled{background:#64344d;color:#c0a0b1}.minor{display:block;margin:14px auto 0;color:var(--muted);font-size:13px}.status{padding:36px 16px;text-align:center;min-height:370px;display:flex;flex-direction:column;align-items:center;justify-content:center}.status .symbol{font-size:48px;margin-bottom:16px}.status h2{font-size:23px;letter-spacing:-.6px;margin:0 0 15px}.status p{color:var(--muted);font-size:15px;line-height:1.5;white-space:pre-line;overflow-wrap:anywhere}.status .primary{max-width:350px}.jump{background:var(--control);border-radius:14px;padding:15px;margin:0 6px 18px;display:flex;gap:8px}.jump select{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;flex:1}.secondary{display:block;width:100%;padding:13px;margin-top:8px;border-radius:12px;background:var(--control);color:var(--text);font-size:15px}.brand{text-align:center;color:var(--muted);opacity:.65;font-size:11px;margin:16px 0 0;letter-spacing:1px}\n@media(min-width:700px){.viewport{padding:24px;align-items:center}.sheet{border-radius:28px;min-height:0;max-width:510px;padding:12px 24px 24px}.day{height:49px;width:49px;line-height:49px}.context{margin-bottom:26px}}\n@media(max-width:360px){.heading h1{font-size:18px}.sheet{padding-left:10px;padding-right:10px}.month-label{font-size:17px}.day{width:38px;height:42px;line-height:42px;font-size:20px}.primary{font-size:16px}}\n@media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#eceaf0;--panel:#fff;--text:#211d24;--muted:#7d7582;--disabled:#ccc7d0;--control:#f0edf2;--line:#ddd7e0}.error{color:#a31850}.time-control input{color-scheme:light}}\n</style>\n<script nonce=\"__CSP_NONCE__\" src=\"https://st.max.ru/js/max-web-app.js\"></script>\n</head>\n<body>\n<main class=\"viewport\"><section class=\"sheet\" aria-label=\"Календарь отложенной публикации\">\n<div class=\"handle\" aria-hidden=\"true\"></div>\n<header class=\"heading\"><button class=\"cross\" id=\"close\" aria-label=\"Закрыть выбор времени\"><svg viewBox=\"0 0 24 24\"><path d=\"m5 5 14 14M19 5 5 19\"/></svg></button><h1 id=\"heading\">Запланировать пост</h1><span></span></header>\n<div class=\"status\" id=\"status\" role=\"status\"><div class=\"symbol\" id=\"symbol\">◌</div><h2 id=\"statusTitle\">Открываем календарь</h2><p id=\"statusText\">Проверяем доступ к материалу…</p><button id=\"retry\" class=\"primary\" hidden>Повторить</button><button id=\"returnBot\" class=\"minor\">Вернуться в EveryPost</button></div>\n<div id=\"editor\" hidden>\n<p class=\"context\"><strong id=\"channel\"></strong><br><span id=\"zone\"></span></p>\n<div class=\"month-row\"><button id=\"monthLabel\" class=\"month-label\" aria-label=\"Выбрать месяц и год\"><span id=\"monthText\"></span><svg viewBox=\"0 0 16 24\"><path d=\"m5 5 7 7-7 7\"/></svg></button><div class=\"arrows\"><button class=\"arrow\" id=\"prev\" aria-label=\"Предыдущий месяц\"><svg viewBox=\"0 0 24 24\"><path d=\"m15 5-7 7 7 7\"/></svg></button><button class=\"arrow\" id=\"next\" aria-label=\"Следующий месяц\"><svg viewBox=\"0 0 24 24\"><path d=\"m9 5 7 7-7 7\"/></svg></button></div></div>\n<div class=\"jump\" id=\"jump\" hidden><select id=\"jumpMonth\" aria-label=\"Месяц\"></select><select id=\"jumpYear\" aria-label=\"Год\"></select></div>\n<div class=\"week\" aria-hidden=\"true\"><span>ПН</span><span>ВТ</span><span>СР</span><span>ЧТ</span><span>ПТ</span><span>СБ</span><span>ВС</span></div>\n<div class=\"days\" id=\"days\" role=\"group\" aria-label=\"Выбор дня\"></div>\n<div class=\"time-row\"><label for=\"time\">Время</label><div class=\"time-control\"><span id=\"timeText\">--:--</span><input type=\"time\" id=\"time\" step=\"60\" aria-label=\"Время публикации в часовом поясе канала\" required></div></div>\n<p class=\"note\" id=\"oldSchedule\" hidden>До сохранения нового времени действует прежнее расписание.</p>\n<p class=\"note\" id=\"deleteNote\" hidden></p>\n<p class=\"error\" id=\"error\" role=\"alert\"></p>\n<button type=\"button\" class=\"primary\" id=\"save\">Отправить</button>\n<button type=\"button\" class=\"secondary\" id=\"disableDeletion\" hidden>Отключить автоудаление</button>\n<p class=\"brand\">EVERYPOST</p>\n</div>\n</section></main>\n<script nonce=\"__CSP_NONCE__\">\n(function(){\n'use strict';\nconst $=id=>document.getElementById(id),months=['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];\nconst monthCases=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];\nconst pad=n=>String(n).padStart(2,'0');\nlet data=null,selected='',view='',busy=false,initData='',nonce=null,mode='schedule',delta=0,retryAction=null,uncertain=null;\nconst bridge=()=>window.WebApp;\nfunction parts(at,zone){return Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(at)).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));}\nfunction key(p){return String(p.year)+pad(p.month)+pad(p.day);}\nfunction shifted(day,by){const d=new Date(Date.UTC(Number(day.slice(0,4)),Number(day.slice(4,6))-1,Number(day.slice(6,8))+by));return String(d.getUTCFullYear())+pad(d.getUTCMonth()+1)+pad(d.getUTCDate());}\nfunction instant(day,h,m,zone){const target=Date.UTC(+day.slice(0,4),+day.slice(4,6)-1,+day.slice(6,8),h,m);let at=target;for(let i=0;i<4;i++){const p=parts(at,zone);at+=target-Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute,p.second);}return at;}\nfunction atNow(){return Date.now()+delta;}\nfunction modal(title,text,symbol='!',retry=null){$('editor').hidden=true;$('status').hidden=false;$('statusTitle').textContent=title;$('statusText').textContent=text;$('symbol').textContent=symbol;retryAction=retry;$('retry').hidden=!retry;}\nfunction returnToBot(){const b=bridge();if(typeof b?.close==='function'){b.close();return;}if(typeof b?.openMaxLink==='function'){b.openMaxLink('https://max.ru/id190206555510_3_bot');return;}window.location.href='https://max.ru/id190206555510_3_bot';}\nfunction readLaunch(){\n  const b=bridge(); const hash=new URLSearchParams(location.hash.slice(1));\n  initData=typeof b?.initData==='string'&&b.initData?b.initData:hash.get('WebAppData')||'';\n  const p=new URLSearchParams(initData);\n  const hint=p.get('start_param')||b?.initDataUnsafe?.start_param||hash.get('WebAppStartParam')||new URLSearchParams(location.search).get('WebAppStartParam')||'';\n  const match=typeof hint==='string'?hint.match(/^(sc|ad)_([a-f0-9]{24})$/):null;\n  nonce=match?match[2]:null;mode=match?.[1]==='ad'?'delete':'schedule';\n}\nasync function request(action,body={}){\n  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),25000);\n  try{\n    const res=await fetch('/calendar/api/'+action,{method:'POST',credentials:'omit',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData,nonce,mode,...body}),signal:controller.signal});\n    let result;try{result=await res.json();}catch{throw new Error('Сервер запускается или временно недоступен. Подождите и повторите.');}\n    if(!res.ok||!result.ok){const e=new Error(result.message||'Не удалось выполнить действие.');e.status=res.status;throw e;}\n    return result;\n  }catch(e){if(e.name==='AbortError')throw new Error('Ответ сервера задерживается. Проверьте результат кнопкой «Повторить».');throw e;}finally{clearTimeout(timer);}\n}\nfunction receipt(result){\n  busy=false;uncertain=null;data=null;\n  if(result.state==='saved'&&result.mode==='delete')modal(result.disabled?'Автоудаление выключено':'Автоудаление настроено',result.title+'\\n'+result.label+'\\n'+result.zoneLabel+'\\n\\nУдалится только пост в канале.','✓');\n  else if(result.state==='saved')modal('Пост отложен',result.title+'\\n'+result.label+'\\n'+result.zoneLabel+'\\n\\nРасписание также доступно в боте.','✓');\n  else modal('Выбор времени закрыт',result.message||'Расписание не изменено.','✓');\n}\nfunction render(){\n  if(!data)return;\n  const y=Number(view.slice(0,4)),m=Number(view.slice(4,6));\n  const today=key(parts(atNow(),data.timezone));data.today=today;\n  $('monthText').textContent=months[m-1]+' '+y+' г.';\n  $('prev').disabled=busy||view<=today.slice(0,6);$('next').disabled=busy||view>=data.maxDay.slice(0,6);\n  const first=new Date(Date.UTC(y,m-1,1)),offset=(first.getUTCDay()+6)%7,count=new Date(Date.UTC(y,m,0)).getUTCDate();\n  const frag=document.createDocumentFragment();\n  for(let i=0;i<offset;i++){const blank=document.createElement('span');blank.className='empty';blank.setAttribute('aria-hidden','true');frag.append(blank);}\n  for(let d=1;d<=count;d++){\n    const k=view+pad(d),btn=document.createElement('button');btn.type='button';btn.className='day'+(k===selected?' selected':'')+(k===today?' today':'');btn.textContent=String(d);\n    btn.disabled=busy||k<today||k>data.maxDay;btn.setAttribute('aria-label',d+' '+monthCases[m-1]+' '+y);btn.setAttribute('aria-pressed',String(k===selected));\n    btn.addEventListener('click',()=>{if(busy)return;selected=k;$('error').textContent='';render();});frag.append(btn);\n  }\n  $('days').replaceChildren(frag);\n  $('time').disabled=busy;$('monthLabel').disabled=busy;$('jumpMonth').disabled=busy;$('jumpYear').disabled=busy;\n  const time=$('time').value; $('timeText').textContent=time||'--:--';\n  let valid=selected>=today&&selected<=data.maxDay&&/^\\d{2}:\\d{2}$/.test(time);\n  if(valid){const [h,mi]=time.split(':').map(Number);const at=instant(selected,h,mi,data.timezone);valid=at>atNow()+5000;\n    if(data.mode==='delete'&&data.minAt)valid=valid&&at>new Date(data.minAt).getTime();\n    if(data.mode!=='delete'&&data.maxPublishAt)valid=valid&&at<new Date(data.maxPublishAt).getTime();}\n  const label=selected===today?'сегодня':selected===shifted(today,1)?'завтра':(+selected.slice(6,8))+' '+monthCases[+selected.slice(4,6)-1]+(selected.slice(0,4)!==today.slice(0,4)?' '+selected.slice(0,4):'');\n  $('save').textContent=busy?'Сохраняем…':(data.mode==='delete'?'Удалить ':data.rescheduling?'Перенести на ':'Отправить ')+label+' в '+(time||'--:--');$('save').disabled=busy||!valid;$('disableDeletion').disabled=busy;\n  if(!valid&&!$('error').textContent)$('error').textContent=data.mode==='delete'?'Выберите время позже текущего и позже публикации.':data.maxPublishAt?'Публикация должна быть раньше удаления и позже текущего времени.':'Выберите время позже текущего в часовом поясе канала.';\n  $('jumpMonth').value=String(m);$('jumpYear').value=String(y);\n}\nfunction jumpSetup(){\n  $('jumpMonth').replaceChildren();months.forEach((name,i)=>{const o=document.createElement('option');o.value=String(i+1);o.textContent=name;$('jumpMonth').append(o);});\n  $('jumpYear').replaceChildren();for(let y=+data.today.slice(0,4);y<=+data.maxDay.slice(0,4);y++){const o=document.createElement('option');o.value=String(y);o.textContent=String(y);$('jumpYear').append(o);}\n}\nasync function load(){\n  readLaunch();\n  if(!initData){modal('Откройте через EveryPost','В EveryPost нажмите «Отложить» или «Автоудаление», затем «Открыть календарь». Без авторизации MAX время сохранить нельзя.','↗',load);return;}\n  modal('Открываем календарь','Проверяем доступ к материалу…','◌');\n  try{\n    const result=await request('state');if(result.state!=='editing'){receipt(result);return;}\n    data=result;nonce=result.nonce;mode=result.mode||'schedule';delta=Number(result.serverNow)-Date.now();selected=data.day;view=selected.slice(0,6);\n    $('heading').textContent=mode==='delete'?'Когда удалить пост?':'Запланировать пост';\n    document.title='EveryPost · '+(mode==='delete'?'Автоудаление':'Отложка');\n    document.querySelector('.sheet').setAttribute('aria-label',mode==='delete'?'Календарь удаления поста':'Календарь отложенной публикации');\n    $('time').setAttribute('aria-label',mode==='delete'?'Время удаления в часовом поясе канала':'Время публикации в часовом поясе канала');\n    $('disableDeletion').hidden=mode!=='delete'||!data.canDisable;\n    $('deleteNote').hidden=false;$('deleteNote').textContent=mode==='delete'?\n      (data.publicationLabel?'Публикация: '+data.publicationLabel+'. ':'')+'Удалится только пост в канале. Копия в чате останется.':(data.currentDeletionLabel||'');\n    $('channel').textContent=data.title+' · пост #'+data.postId;$('zone').textContent=data.zoneLabel;$('time').value=pad(data.hour)+':'+pad(data.minute);$('oldSchedule').hidden=!data.rescheduling;\n    $('error').textContent='';$('jump').hidden=true;$('status').hidden=true;$('editor').hidden=false;busy=false;jumpSetup();render();\n  }catch(e){modal('Календарь не открыт',e.message,'!',load);}\n}\nasync function checkUncertain(){\n  if(!uncertain){await load();return;}\n  try{const r=await request(uncertain.action,uncertain.body);receipt(r);}\n  catch(e){modal('Не удалось подтвердить результат',e.message+'\\nПовтор проверяет ту же операцию и не создаёт второй пост.','!',checkUncertain);}\n}\nasync function save(){\n  if(!data||busy||$('save').disabled)return;\n  const [hour,minute]=$('time').value.split(':').map(Number),body={day:selected,hour,minute};\n  busy=true;$('error').textContent='';render();\n  try{receipt(await request('save',body));}\n  catch(e){\n    busy=false;\n    if(e.status&&e.status<500){$('error').textContent=e.message;render();}\n    else{uncertain={action:'save',body};modal('Проверяем сохранение',e.message+'\\nНе создавайте второй пост: повтор безопасно проверит этот же выбор времени.','!',checkUncertain);}\n  }\n}\nasync function close(){\n  if(busy)return;\n  if(!data){returnToBot();return;}\n  busy=true;render();\n  try{receipt(await request('cancel'));returnToBot();}\n  catch(e){busy=false;uncertain={action:'cancel',body:{}};modal('Не удалось закрыть выбор',e.message,'!',checkUncertain);}\n}\n$('disableDeletion').addEventListener('click',async()=>{\n  if(!data||busy||!data.canDisable)return;\n  busy=true;render();\n  try{receipt(await request('disable'));}\n  catch(e){busy=false;if(e.status&&e.status<500){$('error').textContent=e.message;render();}\n    else{uncertain={action:'disable',body:{}};modal('Проверяем сохранение',e.message,'!',checkUncertain);}}\n});\n$('save').addEventListener('click',save);$('close').addEventListener('click',close);$('returnBot').addEventListener('click',returnToBot);$('retry').addEventListener('click',()=>retryAction?.());\n$('time').addEventListener('input',()=>{$('error').textContent='';render();});\n$('monthLabel').addEventListener('click',()=>{$('jump').hidden=!$('jump').hidden;});\nfunction changeView(shift){if(!data||busy)return;const d=new Date(Date.UTC(+view.slice(0,4),+view.slice(4,6)-1+shift,1));view=String(d.getUTCFullYear())+pad(d.getUTCMonth()+1);render();}\n$('prev').addEventListener('click',()=>changeView(-1));$('next').addEventListener('click',()=>changeView(1));\nfunction applyJump(){if(!data||busy)return;let v=$('jumpYear').value+pad($('jumpMonth').value);v=v<data.today.slice(0,6)?data.today.slice(0,6):v>data.maxDay.slice(0,6)?data.maxDay.slice(0,6):v;view=v;render();}\n$('jumpMonth').addEventListener('change',applyJump);$('jumpYear').addEventListener('change',applyJump);\ntry{bridge()?.BackButton?.show();bridge()?.BackButton?.onClick(close);}catch{}\nsetInterval(()=>{if(data&&!busy)render();},15000);\nload();\n})();\n</script>\n</body></html>\n";
 function calendarHtml(nonce) { return CALENDAR_HTML.replaceAll("__CSP_NONCE__", nonce); }
 
 async function start() {
