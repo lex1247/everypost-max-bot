@@ -5,7 +5,9 @@ import https from "node:https";
 import tls from "node:tls";
 
 // EveryPost: предложка, анонимная публикация, редактор, права, черновики и расписание.
-// Версия menu-chat-1. Быстрые команды MAX и отдельный чат обсуждений для канала.
+// Версия calendar-miniapp-1: календарь внутри Mini App MAX.
+// Нативное удержание кнопки отправки MAX не изменяется.
+// Основа menu-chat-1. Быстрые команды MAX и отдельный чат обсуждений для канала.
 // Это не нативная привязка комментариев MAX: кнопка открывает общую группу.
 // Автокопирование только новых постов EveryPost — по отдельному включению владельцем.
 // Существующие черновики и отложенные сохраняют свои снимки оформления.
@@ -23,7 +25,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "menu-chat-1";
+const VERSION = "calendar-miniapp-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -949,6 +951,15 @@ async function initDatabase() {
     );
     CREATE INDEX IF NOT EXISTS ep_discussion_pending
       ON ep_discussion_jobs(id) WHERE status IN ('pending','sending');
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ep_calendar_receipts (
+      nonce TEXT PRIMARY KEY,
+      actor_user_id BIGINT NOT NULL,
+      result JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS ep_calendar_receipt_actor ON ep_calendar_receipts(actor_user_id);
   `);
   console.log("DATABASE READY");
 }
@@ -3530,7 +3541,7 @@ async function renderSchedulePicker(session, callbackId = null) {
   if (!current || current.nonce !== session.nonce) return;
   const post = await getOwnPost(session.post_id);
   if (!(await canUseOwnPost(post, session.actor_user_id))) return;
-  const body = schedulePickerBody(session, post.title);
+  const body = calendarLaunchBody(session, post.title);
   // Обновляем одну управляющую карточку. Никаких пустых callback-ответов.
   if (callbackId) {
     try {
@@ -3954,6 +3965,10 @@ async function processOneScheduled() {
 }
 
 async function handleUpdate(update) {
+  if (update.update_type === "everypost_calendar_saved") {
+    return handleCalendarSavedNotice(update);
+  }
+
   console.log("UPDATE TYPE:", update.update_type);
   switch (update.update_type) {
     case "bot_added": return handleBotAdded(update);
@@ -4468,6 +4483,297 @@ async function registerWebhook() {
   }
 }
 
+
+// ---------- Календарь мини-приложения MAX ----------
+// UI принадлежит EveryPost, а не системному окну отложки MAX.
+// URL мини-приложения нужно один раз указать в настройках бота:
+// https://everypost-max-bot.onrender.com/calendar
+// Идентификатор пользователя берётся только из проверенной подписи initData.
+const CALENDAR_ORIGIN = new URL(WEBHOOK_URL).origin;
+const CALENDAR_MAX_AGE_SECONDS = 3600;
+const calendarRate = new Map();
+
+class CalendarError extends Error {
+  constructor(status, message) { super(message); this.status = status; this.publicMessage = message; }
+}
+function calendarReject(status, message) { throw new CalendarError(status, message); }
+function verifyCalendarInitData(raw, now = Date.now()) {
+  if (typeof raw !== 'string' || raw.length > 16000 || !raw) {
+    calendarReject(401, 'Откройте календарь кнопкой в EveryPost внутри MAX.');
+  }
+  const params = new URLSearchParams(raw);
+  const seen = new Set();
+  for (const [key] of params) {
+    if (!key || seen.has(key)) calendarReject(401, 'Повторяющиеся параметры запуска. Откройте календарь заново.');
+    seen.add(key);
+  }
+  const hash = params.get('hash');
+  if (!hash || !/^[a-fA-F0-9]{64}$/.test(hash)) calendarReject(401, 'MAX не передал корректную подпись запуска.');
+  params.delete('hash');
+  const line = Array.from(params.entries()).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([key, value]) => `${key}=${value}`).join('\n');
+  const secret = crypto.createHmac('sha256', 'WebAppData').update(TOKEN).digest();
+  const actual = crypto.createHmac('sha256', secret).update(line).digest();
+  if (!crypto.timingSafeEqual(actual, Buffer.from(hash, 'hex'))) calendarReject(401, 'Подпись MAX не прошла проверку.');
+  const auth = params.get('auth_date');
+  if (!auth || !/^\d{1,12}$/.test(auth)) calendarReject(401, 'Некорректное время авторизации.');
+  const age = Math.floor(now / 1000) - Number(auth);
+  if (age < -60 || age > CALENDAR_MAX_AGE_SECONDS) calendarReject(401, 'Сеанс MAX истёк. Закройте календарь и откройте его заново.');
+  let user;
+  try { user = JSON.parse(params.get('user') || '{}'); } catch { calendarReject(401, 'Некорректные данные пользователя MAX.'); }
+  const id = user?.id;
+  if (!((typeof id === 'number' && Number.isSafeInteger(id) && id > 0) ||
+      (typeof id === 'string' && /^[1-9]\d{0,17}$/.test(id)))) calendarReject(401, 'MAX не передал ID пользователя.');
+  return { userId: String(id), startParam: params.get('start_param') || '', authDate: Number(auth) };
+}
+function calendarNonce(value, optional = false) {
+  if ((value === undefined || value === null || value === '') && optional) return null;
+  if (typeof value !== 'string' || !/^[a-f0-9]{24}$/.test(value)) calendarReject(400, 'Некорректная карточка календаря.');
+  return value;
+}
+function calendarLimit(userId, write) {
+  const now = Date.now();
+  if (calendarRate.size > 10000) for (const [key, v] of calendarRate) if (now - v.at >= 60000) calendarRate.delete(key);
+  const key = `${userId}:${write ? 'write' : 'read'}`;
+  let slot = calendarRate.get(key);
+  if (!slot || now - slot.at >= 60000) { slot = { at: now, count: 0 }; calendarRate.set(key, slot); }
+  if (++slot.count > (write ? 15 : 60)) calendarReject(429, 'Слишком много нажатий. Подождите минуту.');
+}
+async function withCalendarLock(fn) {
+  // Та же блокировка, что у webhook/планировщика. Ожидающие запросы
+  // возвращают соединения пулу, чтобы не блокировать владельца блокировки.
+  const until = Date.now() + 8000;
+  let client = null;
+  for (;;) {
+    const candidate = await pool.connect();
+    let locked;
+    try {
+      const r = await candidate.query('SELECT pg_try_advisory_lock(19471, 1) AS locked');
+      locked = r.rows[0]?.locked === true;
+    } catch (error) { candidate.release(error); throw error; }
+    if (locked) { client = candidate; break; }
+    candidate.release();
+    if (Date.now() >= until) calendarReject(503, 'Сервис занят отправкой. Повторите через несколько секунд.');
+    await sleep(150);
+  }
+  let bad;
+  try { return await fn(client); }
+  finally {
+    try { await client.query('SELECT pg_advisory_unlock(19471, 1)'); } catch (e) { bad = e; }
+    client.release(bad);
+  }
+}
+async function getCalendarReceipt(nonce, userId) {
+  if (!nonce) return null;
+  return (await pool.query('SELECT result FROM ep_calendar_receipts WHERE nonce=$1 AND actor_user_id=$2', [nonce, userId])).rows[0]?.result || null;
+}
+async function checkedCalendarSession(userId, requestedNonce = null) {
+  const session = await getScheduleSession(userId);
+  if (!session || (requestedNonce && session.nonce !== requestedNonce)) {
+    calendarReject(409, 'Этот выбор времени уже закрыт. Откройте пост в боте и нажмите «Отложить» заново.');
+  }
+  const post = await getOwnPost(session.post_id);
+  if (!post || String(session.actor_user_id) !== String(userId)) calendarReject(403, 'Нет доступа к этому материалу.');
+  const access = await channelAccess(post.channel_id, userId, post.source_submission_id ? 'moderate' : 'create');
+  if (!access || access.version !== Number(session.access_version) ||
+      (!access.owner && String(post.author_user_id) !== String(userId))) {
+    calendarReject(403, 'Права изменились. Сохранение расписания запрещено.');
+  }
+  if (post.source_submission_id) {
+    const source = await getSubmission(post.source_submission_id);
+    if (!source || String(source.channel_id) !== String(post.channel_id) || source.status !== 'drafted') {
+      calendarReject(409, 'Исходная предложка уже обработана или изменена.');
+    }
+  }
+  if (!post.body || Object.hasOwn(post.body, 'link') || Object.hasOwn(post.body, 'sender') ||
+      Number(post.draft_revision) !== Number(session.draft_revision)) {
+    calendarReject(409, 'Материал изменился. Откройте актуальный предпросмотр.');
+  }
+  if (session.schedule_id) {
+    const schedule = await getSchedule(session.schedule_id);
+    if (!schedule || String(schedule.post_id) !== String(post.id) ||
+        !['scheduled','paused'].includes(schedule.status) || post.status !== 'scheduled' ||
+        Number(schedule.revision) !== Number(session.expected_revision)) {
+      calendarReject(409, 'Расписание уже изменилось или отправка началась. Обновите «Отложенные».');
+    }
+  } else if (post.status !== 'draft' || !post.is_saved) {
+    calendarReject(409, 'Этот пост уже не является сохранённым черновиком.');
+  }
+  return { session, post, access };
+}
+function calendarStateBody(session, post, now = Date.now()) {
+  const today = dateKey(localParts(now, session.timezone));
+  return {
+    ok: true, state: 'editing', version: VERSION, nonce: session.nonce,
+    postId: String(post.id), title: shortTitle(post.title),
+    timezone: session.timezone, zoneLabel: zoneLabel(session.timezone, now),
+    serverNow: now, today, maxDay: shiftDay(today, SCHEDULE_HORIZON_DAYS),
+    day: session.day_key, hour: Number(session.hour), minute: Number(session.minute),
+    expiresAt: new Date(session.expires_at).toISOString(),
+    rescheduling: Boolean(session.schedule_id)
+  };
+}
+function validateCalendarChoice(input, timezone, now = Date.now()) {
+  const day = input?.day, hour = input?.hour, minute = input?.minute;
+  if (typeof day !== 'string' || !validDay(day) || !Number.isInteger(hour) || !Number.isInteger(minute)) {
+    calendarReject(400, 'Выберите существующие дату и время.');
+  }
+  let due;
+  try { due = civilTime(day, hour, minute, timezone); }
+  catch { calendarReject(400, 'Выберите существующие дату и время.'); }
+  const today = dateKey(localParts(now, timezone));
+  if (day < today || day > shiftDay(today, SCHEDULE_HORIZON_DAYS)) calendarReject(400, 'Дата вне доступного периода.');
+  if (due <= now + 5000) calendarReject(400, 'Это время уже прошло или слишком близко. Выберите следующую минуту.');
+  return { day, hour, minute, due: new Date(due) };
+}
+async function saveCalendarChoice(client, userId, nonce, input) {
+  const receipt = await getCalendarReceipt(nonce, userId);
+  if (receipt) {
+    if (receipt.state !== 'saved') calendarReject(409, 'Этот календарь уже закрыт без сохранения.');
+    return { ...receipt, replayed: true };
+  }
+  const { session, post, access } = await checkedCalendarSession(userId, nonce);
+  const choice = validateCalendarChoice(input, session.timezone);
+  let result;
+  try {
+    await client.query('BEGIN');
+    const form = (await client.query('SELECT * FROM ep_schedule_sessions WHERE actor_user_id=$1 AND nonce=$2 AND expires_at>NOW() FOR UPDATE', [userId, nonce])).rows[0];
+    const fresh = (await client.query('SELECT * FROM ep_posts WHERE id=$1 FOR UPDATE', [post.id])).rows[0];
+    const old = (await client.query('SELECT * FROM ep_schedules WHERE post_id=$1 FOR UPDATE', [post.id])).rows[0];
+    const valid = form && fresh && Number(fresh.draft_revision) === Number(session.draft_revision) &&
+      (session.schedule_id
+        ? old && String(old.id) === String(session.schedule_id) && ['scheduled','paused'].includes(old.status) && fresh.status === 'scheduled' && Number(old.revision) === Number(session.expected_revision)
+        : fresh.status === 'draft' && fresh.is_saved && (!old || old.status === 'cancelled'));
+    if (!valid) calendarReject(409, 'Материал или расписание уже изменились. Закройте это окно и откройте пост заново.');
+    validateCalendarChoice(input, session.timezone);
+    const saved = (await client.query(`INSERT INTO ep_schedules(post_id,status,due_at,timezone,scheduled_by,access_version,body_snapshot)
+      VALUES ($1,'scheduled',$2,$3,$4,$5,$6::jsonb)
+      ON CONFLICT(post_id) DO UPDATE SET status='scheduled',due_at=EXCLUDED.due_at,
+        timezone=EXCLUDED.timezone,scheduled_by=EXCLUDED.scheduled_by,
+        access_version=EXCLUDED.access_version,body_snapshot=EXCLUDED.body_snapshot,
+        revision=ep_schedules.revision+1,attempts=0,next_at=NOW(),
+        locked_at=NULL,dispatch_started_at=NULL,last_error=NULL,updated_at=NOW()
+      RETURNING *`, [post.id, choice.due, session.timezone, userId, access.version, JSON.stringify(fresh.body)])).rows[0];
+    await client.query("UPDATE ep_posts SET status='scheduled',is_saved=TRUE,saved_at=NOW(),updated_at=NOW() WHERE id=$1", [post.id]);
+    await client.query('DELETE FROM ep_schedule_sessions WHERE actor_user_id=$1 AND nonce=$2', [userId, nonce]);
+    result = {
+      ok: true, state: 'saved', postId: String(post.id), scheduleId: String(saved.id),
+      title: shortTitle(post.title), dueAt: choice.due.toISOString(),
+      timezone: session.timezone, label: timeLabel(choice.due, session.timezone),
+      zoneLabel: zoneLabel(session.timezone, choice.due)
+    };
+    await client.query('INSERT INTO ep_calendar_receipts(nonce,actor_user_id,result) VALUES($1,$2,$3::jsonb)', [nonce, userId, JSON.stringify(result)]);
+    await audit(post.channel_id, userId, session.schedule_id ? 'schedule_moved' : 'post_scheduled', post.id,
+      { due_at: choice.due.toISOString(), timezone: session.timezone, interface: 'calendar-miniapp' }, client);
+    // Уведомление — отдельная задача в той же транзакции. Даже при потере
+    // HTTP-ответа сохранённое расписание и результат не теряются.
+    await client.query(`INSERT INTO ep_webhook_jobs(event_key,payload) VALUES($1,$2::jsonb)
+      ON CONFLICT(event_key) DO NOTHING`, [
+        'calendar_saved:' + nonce,
+        JSON.stringify({update_type: 'everypost_calendar_saved', actor_user_id: userId,
+          schedule_id: String(saved.id), card_mid: session.card_mid || null})
+      ]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  }
+  console.log('CALENDAR SCHEDULE SAVED:', post.id, result.dueAt);
+  return result;
+}
+async function cancelCalendarChoice(client, userId, nonce) {
+  const receipt = await getCalendarReceipt(nonce, userId);
+  if (receipt) return { ...receipt, replayed: true };
+  // Отмена лишь снимает форму этого пользователя. Она не меняет пост,
+  // старое расписание и не требует восстанавливать уже отозванные права.
+  const session = await getScheduleSession(userId);
+  if (!session || session.nonce !== nonce) calendarReject(409, 'Выбор времени уже закрыт.');
+  const result = { ok: true, state: 'cancelled', rescheduling: Boolean(session.schedule_id),
+    message: session.schedule_id ? 'Прежнее расписание не изменено.' : 'Пост сохранён в черновиках. Время не назначено.' };
+  try {
+    await client.query('BEGIN');
+    const changed = await client.query('DELETE FROM ep_schedule_sessions WHERE actor_user_id=$1 AND nonce=$2 RETURNING *', [userId, nonce]);
+    if (!changed.rowCount) calendarReject(409, 'Выбор времени уже изменился.');
+    await client.query('INSERT INTO ep_calendar_receipts(nonce,actor_user_id,result) VALUES($1,$2,$3::jsonb)', [nonce, userId, JSON.stringify(result)]);
+    await client.query('COMMIT');
+  } catch(error) { await client.query('ROLLBACK').catch(() => {}); throw error; }
+  return result;
+}
+function calendarLaunchBody(session, title) {
+  return {
+    text: `🕒 Запланировать пост #${session.post_id}\nКанал: «${shortTitle(title)}»\n${zoneLabel(session.timezone)}\n\n` +
+      (session.schedule_id ? 'До сохранения нового времени действует прежнее расписание.\n\n' : '') +
+      'Откройте календарь: выберите день и время, затем нажмите одну кнопку отправки.',
+    attachments: keyboard([
+      [{ type: 'open_app', text: '📅 Открыть календарь', web_app: BOT_USERNAME, payload: `sc_${session.nonce}` }],
+      [pickerButton(session, 'cancel', session.schedule_id ? '↩️ Оставить прежнее время' : '↩️ К предпросмотру')]
+    ])
+  };
+}
+async function handleCalendarSavedNotice(update) {
+  const q = await getSchedule(update.schedule_id);
+  if (!q) return;
+  const access = await scheduleAccess(q, update.actor_user_id);
+  if (!access) return;
+  if (update.card_mid) {
+    try {
+      await queueMaxWrite(`/messages?message_id=${encodeURIComponent(update.card_mid)}`, 'PUT', {
+        text: `✅ Время сохранено\nКанал: «${shortTitle(q.title)}»\n${timeLabel(q.due_at, q.timezone)} · ${zoneLabel(q.timezone, q.due_at)}`,
+        attachments: []
+      });
+    } catch (error) { console.error('CALENDAR CARD UPDATE ERROR:', error.message); }
+  }
+  await showScheduledPost(q.id, update.actor_user_id, false);
+}
+function calendarHeaders(res) {
+  res.set('Cache-Control', 'no-store');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('X-Content-Type-Options', 'nosniff');
+}
+app.get('/calendar', (req, res) => {
+  calendarHeaders(res);
+  const nonce = crypto.randomBytes(18).toString('base64');
+  res.set('Content-Security-Policy', `default-src 'none'; script-src 'nonce-${nonce}' https://st.max.ru; style-src 'nonce-${nonce}'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors https://max.ru https://*.max.ru`);
+  res.type('html').send(calendarHtml(nonce));
+});
+function calendarEndpoint(action) {
+  return async (req, res) => {
+    calendarHeaders(res);
+    try {
+      if (!ready) calendarReject(503, 'Сервис запускается. Повторите через несколько секунд.');
+      const origin = req.get('Origin');
+      if (origin && origin !== CALENDAR_ORIGIN) calendarReject(403, 'Запрос с другого сайта запрещён.');
+      if (!req.is('application/json')) calendarReject(415, 'Ожидается application/json.');
+      const auth = verifyCalendarInitData(req.body?.initData);
+      calendarLimit(auth.userId, action !== 'state');
+      const fromStart = /^sc_([a-f0-9]{24})$/.exec(auth.startParam)?.[1] || null;
+      const nonce = calendarNonce(req.body?.nonce || fromStart, action === 'state');
+      // Сам nonce не даёт прав. Каждый запрос связан с проверенным user.id.
+      const result = await withCalendarLock(async client => {
+        if (action === 'save') return saveCalendarChoice(client, auth.userId, nonce, req.body);
+        if (action === 'cancel') return cancelCalendarChoice(client, auth.userId, nonce);
+        const receipt = await getCalendarReceipt(nonce, auth.userId);
+        if (receipt) return { ...receipt, replayed: true };
+        const {session, post} = await checkedCalendarSession(auth.userId, nonce);
+        return calendarStateBody(session, post);
+      });
+      res.json(result);
+      if (action === 'save') void runWorker();
+    } catch (error) {
+      if (!(error instanceof CalendarError)) console.error('CALENDAR API ERROR:', error.message);
+      res.status(error instanceof CalendarError ? error.status : 503).json({
+        ok: false, message: error instanceof CalendarError ? error.publicMessage : 'Не удалось проверить или сохранить данные. Повторите запрос; дублирование расписания защищено.'
+      });
+    }
+  };
+}
+app.post('/calendar/api/state', calendarEndpoint('state'));
+app.post('/calendar/api/save', calendarEndpoint('save'));
+app.post('/calendar/api/cancel', calendarEndpoint('cancel'));
+
+const CALENDAR_HTML = "<!doctype html>\n<html lang=\"ru\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n<meta name=\"color-scheme\" content=\"dark light\">\n<title>EveryPost · Запланировать пост</title>\n<style nonce=\"__CSP_NONCE__\">\n:root{color-scheme:dark;--bg:#18151b;--panel:#242126;--text:#fbf9fc;--muted:#96919c;--disabled:#4a454f;--accent:#c53780;--control:#37333c;--line:#45404a}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;-webkit-font-smoothing:antialiased}button,input,select{font:inherit}button{cursor:pointer;color:inherit;border:0;background:none;-webkit-tap-highlight-color:transparent}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button:disabled{cursor:default;color:var(--disabled)}[hidden]{display:none!important}\n.viewport{min-height:100svh;display:flex;align-items:flex-end;justify-content:center;padding-top:max(10px,env(safe-area-inset-top))}.sheet{width:100%;max-width:600px;min-height:min(680px,100svh);background:var(--panel);border-radius:26px 26px 0 0;padding:10px 16px max(22px,env(safe-area-inset-bottom));box-shadow:0 -1px 0 #ffffff08}.handle{width:34px;height:4px;border-radius:8px;background:#7a738044;margin:0 auto 15px}.heading{display:grid;grid-template-columns:40px 1fr 40px;align-items:center;margin-bottom:8px}.heading h1{font-size:20px;font-weight:650;text-align:center;letter-spacing:-.5px;margin:0}.cross{width:38px;height:38px;padding:9px;color:var(--text)}svg{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}.context{text-align:center;color:var(--muted);font-size:12px;line-height:1.4;margin:2px 12px 22px;overflow-wrap:anywhere}.context strong{font-weight:500;color:var(--text)}.month-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding:0 9px}.month-label{display:flex;align-items:center;gap:7px;text-align:left;padding:5px 0;font-size:19px;font-weight:650}.month-label svg{width:15px;height:19px;color:var(--accent)}.arrows{display:flex;gap:12px}.arrow{width:36px;height:36px;padding:8px;color:var(--accent)}.week,.days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));text-align:center}.week{font-size:12px;letter-spacing:.6px;font-weight:600;color:var(--muted);margin:0 0 10px}.days{row-gap:6px}.day{width:44px;max-width:100%;height:44px;justify-self:center;border-radius:50%;font-size:22px;padding:0;line-height:44px}.day.selected{background:var(--accent);color:white;font-weight:650}.day.today:not(.selected){color:var(--accent)}.day:not(:disabled):not(.selected):hover{background:#ffffff09}.empty{height:44px}.time-row{display:flex;justify-content:space-between;align-items:center;padding:20px 12px 16px;margin-top:10px}.time-row label{font-size:19px;font-weight:600}.time-control{position:relative;border-radius:9px;background:var(--control);min-width:78px;padding:10px 12px;text-align:center;font-size:21px;font-variant-numeric:tabular-nums}.time-control input{position:absolute;inset:0;width:100%;height:100%;border:0;opacity:0;cursor:pointer;color-scheme:dark}.time-control input::-webkit-calendar-picker-indicator{position:absolute;inset:0;width:auto;height:auto}.note{color:var(--muted);font-size:12px;line-height:1.45;text-align:center;margin:0 10px 8px}.error{font-size:13px;line-height:1.4;color:#ff9ebf;margin:12px 10px;min-height:18px;text-align:center}.primary{display:block;width:100%;background:var(--accent);color:#fff;border:0;border-radius:16px;min-height:54px;padding:13px 12px;font-size:18px;font-weight:600;margin-top:10px;line-height:1.3}.primary:disabled{background:#64344d;color:#c0a0b1}.minor{display:block;margin:14px auto 0;color:var(--muted);font-size:13px}.status{padding:36px 16px;text-align:center;min-height:370px;display:flex;flex-direction:column;align-items:center;justify-content:center}.status .symbol{font-size:48px;margin-bottom:16px}.status h2{font-size:23px;letter-spacing:-.6px;margin:0 0 15px}.status p{color:var(--muted);font-size:15px;line-height:1.5;white-space:pre-line;overflow-wrap:anywhere}.status .primary{max-width:350px}.jump{background:var(--control);border-radius:14px;padding:15px;margin:0 6px 18px;display:flex;gap:8px}.jump select{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;flex:1}.brand{text-align:center;color:var(--muted);opacity:.65;font-size:11px;margin:16px 0 0;letter-spacing:1px}\n@media(min-width:700px){.viewport{padding:24px;align-items:center}.sheet{border-radius:28px;min-height:0;max-width:510px;padding:12px 24px 24px}.day{height:49px;width:49px;line-height:49px}.context{margin-bottom:26px}}\n@media(max-width:360px){.heading h1{font-size:18px}.sheet{padding-left:10px;padding-right:10px}.month-label{font-size:17px}.day{width:38px;height:42px;line-height:42px;font-size:20px}.primary{font-size:16px}}\n@media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#eceaf0;--panel:#fff;--text:#211d24;--muted:#7d7582;--disabled:#ccc7d0;--control:#f0edf2;--line:#ddd7e0}.error{color:#a31850}.time-control input{color-scheme:light}}\n</style>\n<script nonce=\"__CSP_NONCE__\" src=\"https://st.max.ru/js/max-web-app.js\"></script>\n</head>\n<body>\n<main class=\"viewport\"><section class=\"sheet\" aria-label=\"Календарь отложенной публикации\">\n<div class=\"handle\" aria-hidden=\"true\"></div>\n<header class=\"heading\"><button class=\"cross\" id=\"close\" aria-label=\"Закрыть выбор времени\"><svg viewBox=\"0 0 24 24\"><path d=\"m5 5 14 14M19 5 5 19\"/></svg></button><h1>Запланировать пост</h1><span></span></header>\n<div class=\"status\" id=\"status\" role=\"status\"><div class=\"symbol\" id=\"symbol\">◌</div><h2 id=\"statusTitle\">Открываем календарь</h2><p id=\"statusText\">Проверяем доступ к материалу…</p><button id=\"retry\" class=\"primary\" hidden>Повторить</button><button id=\"returnBot\" class=\"minor\">Вернуться в EveryPost</button></div>\n<div id=\"editor\" hidden>\n<p class=\"context\"><strong id=\"channel\"></strong><br><span id=\"zone\"></span></p>\n<div class=\"month-row\"><button id=\"monthLabel\" class=\"month-label\" aria-label=\"Выбрать месяц и год\"><span id=\"monthText\"></span><svg viewBox=\"0 0 16 24\"><path d=\"m5 5 7 7-7 7\"/></svg></button><div class=\"arrows\"><button class=\"arrow\" id=\"prev\" aria-label=\"Предыдущий месяц\"><svg viewBox=\"0 0 24 24\"><path d=\"m15 5-7 7 7 7\"/></svg></button><button class=\"arrow\" id=\"next\" aria-label=\"Следующий месяц\"><svg viewBox=\"0 0 24 24\"><path d=\"m9 5 7 7-7 7\"/></svg></button></div></div>\n<div class=\"jump\" id=\"jump\" hidden><select id=\"jumpMonth\" aria-label=\"Месяц\"></select><select id=\"jumpYear\" aria-label=\"Год\"></select></div>\n<div class=\"week\" aria-hidden=\"true\"><span>ПН</span><span>ВТ</span><span>СР</span><span>ЧТ</span><span>ПТ</span><span>СБ</span><span>ВС</span></div>\n<div class=\"days\" id=\"days\" role=\"group\" aria-label=\"Выбор дня\"></div>\n<div class=\"time-row\"><label for=\"time\">Время</label><div class=\"time-control\"><span id=\"timeText\">--:--</span><input type=\"time\" id=\"time\" step=\"60\" aria-label=\"Время публикации в часовом поясе канала\" required></div></div>\n<p class=\"note\" id=\"oldSchedule\" hidden>До сохранения нового времени действует прежнее расписание.</p>\n<p class=\"error\" id=\"error\" role=\"alert\"></p>\n<button type=\"button\" class=\"primary\" id=\"save\">Отправить</button>\n<p class=\"brand\">EVERYPOST</p>\n</div>\n</section></main>\n<script nonce=\"__CSP_NONCE__\">\n(function(){\n'use strict';\nconst $=id=>document.getElementById(id),months=['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];\nconst monthCases=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];\nconst pad=n=>String(n).padStart(2,'0');\nlet data=null,selected='',view='',busy=false,initData='',nonce=null,delta=0,retryAction=null,uncertain=null;\nconst bridge=()=>window.WebApp;\nfunction parts(at,zone){return Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(at)).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));}\nfunction key(p){return String(p.year)+pad(p.month)+pad(p.day);}\nfunction shifted(day,by){const d=new Date(Date.UTC(Number(day.slice(0,4)),Number(day.slice(4,6))-1,Number(day.slice(6,8))+by));return String(d.getUTCFullYear())+pad(d.getUTCMonth()+1)+pad(d.getUTCDate());}\nfunction instant(day,h,m,zone){const target=Date.UTC(+day.slice(0,4),+day.slice(4,6)-1,+day.slice(6,8),h,m);let at=target;for(let i=0;i<4;i++){const p=parts(at,zone);at+=target-Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute,p.second);}return at;}\nfunction atNow(){return Date.now()+delta;}\nfunction modal(title,text,symbol='!',retry=null){$('editor').hidden=true;$('status').hidden=false;$('statusTitle').textContent=title;$('statusText').textContent=text;$('symbol').textContent=symbol;retryAction=retry;$('retry').hidden=!retry;}\nfunction returnToBot(){const b=bridge();if(typeof b?.close==='function'){b.close();return;}if(typeof b?.openMaxLink==='function'){b.openMaxLink('https://max.ru/id190206555510_3_bot');return;}window.location.href='https://max.ru/id190206555510_3_bot';}\nfunction readLaunch(){\n  const b=bridge(); const hash=new URLSearchParams(location.hash.slice(1));\n  initData=typeof b?.initData==='string'&&b.initData?b.initData:hash.get('WebAppData')||'';\n  const p=new URLSearchParams(initData);\n  const hint=p.get('start_param')||b?.initDataUnsafe?.start_param||hash.get('WebAppStartParam')||new URLSearchParams(location.search).get('WebAppStartParam')||'';\n  const match=typeof hint==='string'?hint.match(/^sc_([a-f0-9]{24})$/):null;\n  nonce=match?match[1]:null;\n}\nasync function request(action,body={}){\n  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),25000);\n  try{\n    const res=await fetch('/calendar/api/'+action,{method:'POST',credentials:'omit',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData,nonce,...body}),signal:controller.signal});\n    let result;try{result=await res.json();}catch{throw new Error('Сервер запускается или временно недоступен. Подождите и повторите.');}\n    if(!res.ok||!result.ok){const e=new Error(result.message||'Не удалось выполнить действие.');e.status=res.status;throw e;}\n    return result;\n  }catch(e){if(e.name==='AbortError')throw new Error('Ответ сервера задерживается. Проверьте результат кнопкой «Повторить».');throw e;}finally{clearTimeout(timer);}\n}\nfunction receipt(result){\n  busy=false;uncertain=null;data=null;\n  if(result.state==='saved')modal('Пост отложен',result.title+'\\n'+result.label+'\\n'+result.zoneLabel+'\\n\\nРасписание также доступно в боте.','✓');\n  else modal('Выбор времени закрыт',result.message||'Расписание не изменено.','✓');\n}\nfunction render(){\n  if(!data)return;\n  const y=Number(view.slice(0,4)),m=Number(view.slice(4,6));\n  const today=key(parts(atNow(),data.timezone));data.today=today;\n  $('monthText').textContent=months[m-1]+' '+y+' г.';\n  $('prev').disabled=busy||view<=today.slice(0,6);$('next').disabled=busy||view>=data.maxDay.slice(0,6);\n  const first=new Date(Date.UTC(y,m-1,1)),offset=(first.getUTCDay()+6)%7,count=new Date(Date.UTC(y,m,0)).getUTCDate();\n  const frag=document.createDocumentFragment();\n  for(let i=0;i<offset;i++){const blank=document.createElement('span');blank.className='empty';blank.setAttribute('aria-hidden','true');frag.append(blank);}\n  for(let d=1;d<=count;d++){\n    const k=view+pad(d),btn=document.createElement('button');btn.type='button';btn.className='day'+(k===selected?' selected':'')+(k===today?' today':'');btn.textContent=String(d);\n    btn.disabled=busy||k<today||k>data.maxDay;btn.setAttribute('aria-label',d+' '+monthCases[m-1]+' '+y);btn.setAttribute('aria-pressed',String(k===selected));\n    btn.addEventListener('click',()=>{if(busy)return;selected=k;$('error').textContent='';render();});frag.append(btn);\n  }\n  $('days').replaceChildren(frag);\n  $('time').disabled=busy;$('monthLabel').disabled=busy;$('jumpMonth').disabled=busy;$('jumpYear').disabled=busy;\n  const time=$('time').value; $('timeText').textContent=time||'--:--';\n  let valid=selected>=today&&selected<=data.maxDay&&/^\\d{2}:\\d{2}$/.test(time);\n  if(valid){const [h,mi]=time.split(':').map(Number);valid=instant(selected,h,mi,data.timezone)>atNow()+5000;}\n  const label=selected===today?'сегодня':selected===shifted(today,1)?'завтра':(+selected.slice(6,8))+' '+monthCases[+selected.slice(4,6)-1]+(selected.slice(0,4)!==today.slice(0,4)?' '+selected.slice(0,4):'');\n  $('save').textContent=busy?'Сохраняем…':(data.rescheduling?'Перенести на ':'Отправить ')+label+' в '+(time||'--:--');$('save').disabled=busy||!valid;\n  if(!valid&&!$('error').textContent)$('error').textContent='Выберите время позже текущего в часовом поясе канала.';\n  $('jumpMonth').value=String(m);$('jumpYear').value=String(y);\n}\nfunction jumpSetup(){\n  $('jumpMonth').replaceChildren();months.forEach((name,i)=>{const o=document.createElement('option');o.value=String(i+1);o.textContent=name;$('jumpMonth').append(o);});\n  $('jumpYear').replaceChildren();for(let y=+data.today.slice(0,4);y<=+data.maxDay.slice(0,4);y++){const o=document.createElement('option');o.value=String(y);o.textContent=String(y);$('jumpYear').append(o);}\n}\nasync function load(){\n  readLaunch();\n  if(!initData){modal('Откройте через EveryPost','В личном чате бота нажмите «Отложить», затем «Открыть календарь». Без авторизации MAX время сохранить нельзя.','↗',load);return;}\n  modal('Открываем календарь','Проверяем доступ к материалу…','◌');\n  try{\n    const result=await request('state');if(result.state!=='editing'){receipt(result);return;}\n    data=result;nonce=result.nonce;delta=Number(result.serverNow)-Date.now();selected=data.day;view=selected.slice(0,6);\n    $('channel').textContent=data.title+' · пост #'+data.postId;$('zone').textContent=data.zoneLabel;$('time').value=pad(data.hour)+':'+pad(data.minute);$('oldSchedule').hidden=!data.rescheduling;\n    $('error').textContent='';$('jump').hidden=true;$('status').hidden=true;$('editor').hidden=false;busy=false;jumpSetup();render();\n  }catch(e){modal('Календарь не открыт',e.message,'!',load);}\n}\nasync function checkUncertain(){\n  if(!uncertain){await load();return;}\n  try{const r=await request(uncertain.action,uncertain.body);receipt(r);}\n  catch(e){modal('Не удалось подтвердить результат',e.message+'\\nПовтор проверяет ту же операцию и не создаёт второй пост.','!',checkUncertain);}\n}\nasync function save(){\n  if(!data||busy||$('save').disabled)return;\n  const [hour,minute]=$('time').value.split(':').map(Number),body={day:selected,hour,minute};\n  busy=true;$('error').textContent='';render();\n  try{receipt(await request('save',body));}\n  catch(e){\n    busy=false;\n    if(e.status&&e.status<500){$('error').textContent=e.message;render();}\n    else{uncertain={action:'save',body};modal('Проверяем сохранение',e.message+'\\nНе создавайте второй пост: повтор безопасно проверит этот же выбор времени.','!',checkUncertain);}\n  }\n}\nasync function close(){\n  if(busy)return;\n  if(!data){returnToBot();return;}\n  busy=true;render();\n  try{receipt(await request('cancel'));returnToBot();}\n  catch(e){busy=false;uncertain={action:'cancel',body:{}};modal('Не удалось закрыть выбор',e.message,'!',checkUncertain);}\n}\n$('save').addEventListener('click',save);$('close').addEventListener('click',close);$('returnBot').addEventListener('click',returnToBot);$('retry').addEventListener('click',()=>retryAction?.());\n$('time').addEventListener('input',()=>{$('error').textContent='';render();});\n$('monthLabel').addEventListener('click',()=>{$('jump').hidden=!$('jump').hidden;});\nfunction changeView(shift){if(!data||busy)return;const d=new Date(Date.UTC(+view.slice(0,4),+view.slice(4,6)-1+shift,1));view=String(d.getUTCFullYear())+pad(d.getUTCMonth()+1);render();}\n$('prev').addEventListener('click',()=>changeView(-1));$('next').addEventListener('click',()=>changeView(1));\nfunction applyJump(){if(!data||busy)return;let v=$('jumpYear').value+pad($('jumpMonth').value);v=v<data.today.slice(0,6)?data.today.slice(0,6):v>data.maxDay.slice(0,6)?data.maxDay.slice(0,6):v;view=v;render();}\n$('jumpMonth').addEventListener('change',applyJump);$('jumpYear').addEventListener('change',applyJump);\ntry{bridge()?.BackButton?.show();bridge()?.BackButton?.onClick(close);}catch{}\nsetInterval(()=>{if(data&&!busy)render();},15000);\nload();\n})();\n</script>\n</body></html>\n";
+function calendarHtml(nonce) { return CALENDAR_HTML.replaceAll("__CSP_NONCE__", nonce); }
+
 async function start() {
   await initDatabase();
   ready = true;
@@ -4475,6 +4781,7 @@ async function start() {
     console.log(`EveryPost ${VERSION} started on port ${PORT}`);
     void registerWebhook();
     void registerCommands();
+    console.log("CALENDAR UI READY: /calendar");
   });
   setInterval(() => void runWorker(), 700).unref();
 }
