@@ -1,0 +1,50 @@
+# One NEW Free web service. Existing MAX service/database are referenced, not managed.
+services:
+  - type: web
+    name: everypost-telegram-bot
+    runtime: python
+    region: oregon
+    plan: free
+    branch: telegram-posting
+    numInstances: 1
+    buildCommand: python build_check.py
+    startCommand: python -u app.py
+    healthCheckPath: /health
+    autoDeployTrigger: off
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: WEB_MODE
+        value: "1"
+      - key: REQUIRE_MIGRATION
+        value: "1"
+      - key: DATA_DIR
+        value: /tmp/everypost-cache
+      - key: DATABASE_URL
+        fromDatabase:
+          name: everypost-db
+          property: connectionString
+      - key: MAX_BOT_TOKEN
+        fromService:
+          name: everypost-max-bot
+          type: web
+          envVarKey: MAX_BOT_TOKEN
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: MIGRATION_TOKEN
+        sync: false
+      - key: EXPECTED_TG_BOT_USERNAME
+        value: EveryPost_bot
+      - key: FREE_TEST_MODE
+        value: "1"
+      - key: LLM_PROVIDER
+        value: llm7
+      - key: LLM7_MODEL
+        value: minimax-m2.7
+      - key: LLM7_APPROVED
+        value: "1"
+      - key: POLL_SECONDS
+        value: "30"

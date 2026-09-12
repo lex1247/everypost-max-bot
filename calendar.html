@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>EveryPost · Календарь</title>
+<style nonce="__CSP_NONCE__">
+:root{color-scheme:dark;--bg:#18151b;--panel:#242126;--text:#fbf9fc;--muted:#96919c;--disabled:#4a454f;--accent:#c53780;--control:#37333c;--line:#45404a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}button,input,select{font:inherit}button{cursor:pointer;color:inherit;border:0;background:none;-webkit-tap-highlight-color:transparent}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button:disabled{cursor:default;color:var(--disabled)}[hidden]{display:none!important}
+.viewport{min-height:100svh;display:flex;align-items:flex-end;justify-content:center;padding-top:max(10px,env(safe-area-inset-top))}.sheet{width:100%;max-width:600px;min-height:min(680px,100svh);background:var(--panel);border-radius:26px 26px 0 0;padding:10px 16px max(22px,env(safe-area-inset-bottom));box-shadow:0 -1px 0 #ffffff08}.handle{width:34px;height:4px;border-radius:8px;background:#7a738044;margin:0 auto 15px}.heading{display:grid;grid-template-columns:40px 1fr 40px;align-items:center;margin-bottom:8px}.heading h1{font-size:20px;font-weight:650;text-align:center;letter-spacing:-.5px;margin:0}.cross{width:38px;height:38px;padding:9px;color:var(--text)}svg{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}.context{text-align:center;color:var(--muted);font-size:12px;line-height:1.4;margin:2px 12px 22px;overflow-wrap:anywhere}.context strong{font-weight:500;color:var(--text)}.month-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding:0 9px}.month-label{display:flex;align-items:center;gap:7px;text-align:left;padding:5px 0;font-size:19px;font-weight:650}.month-label svg{width:15px;height:19px;color:var(--accent)}.arrows{display:flex;gap:12px}.arrow{width:36px;height:36px;padding:8px;color:var(--accent)}.week,.days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));text-align:center}.week{font-size:12px;letter-spacing:.6px;font-weight:600;color:var(--muted);margin:0 0 10px}.days{row-gap:6px}.day{width:44px;max-width:100%;height:44px;justify-self:center;border-radius:50%;font-size:22px;padding:0;line-height:44px}.day.selected{background:var(--accent);color:white;font-weight:650}.day.today:not(.selected){color:var(--accent)}.day:not(:disabled):not(.selected):hover{background:#ffffff09}.empty{height:44px}.time-row{display:flex;justify-content:space-between;align-items:center;padding:20px 12px 16px;margin-top:10px}.time-row label{font-size:19px;font-weight:600}.time-control{position:relative;border-radius:9px;background:var(--control);min-width:78px;padding:10px 12px;text-align:center;font-size:21px;font-variant-numeric:tabular-nums}.time-control input{position:absolute;inset:0;width:100%;height:100%;border:0;opacity:0;cursor:pointer;color-scheme:dark}.time-control input::-webkit-calendar-picker-indicator{position:absolute;inset:0;width:auto;height:auto}.note{color:var(--muted);font-size:12px;line-height:1.45;text-align:center;margin:0 10px 8px}.error{font-size:13px;line-height:1.4;color:#ff9ebf;margin:12px 10px;min-height:18px;text-align:center}.primary{display:block;width:100%;background:var(--accent);color:#fff;border:0;border-radius:16px;min-height:54px;padding:13px 12px;font-size:18px;font-weight:600;margin-top:10px;line-height:1.3}.primary:disabled{background:#64344d;color:#c0a0b1}.minor{display:block;margin:14px auto 0;color:var(--muted);font-size:13px}.status{padding:36px 16px;text-align:center;min-height:370px;display:flex;flex-direction:column;align-items:center;justify-content:center}.status .symbol{font-size:48px;margin-bottom:16px}.status h2{font-size:23px;letter-spacing:-.6px;margin:0 0 15px}.status p{color:var(--muted);font-size:15px;line-height:1.5;white-space:pre-line;overflow-wrap:anywhere}.status .primary{max-width:350px}.jump{background:var(--control);border-radius:14px;padding:15px;margin:0 6px 18px;display:flex;gap:8px}.jump select{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;flex:1}.secondary{display:block;width:100%;padding:13px;margin-top:8px;border-radius:12px;background:var(--control);color:var(--text);font-size:15px}.brand{text-align:center;color:var(--muted);opacity:.65;font-size:11px;margin:16px 0 0;letter-spacing:1px}
+@media(min-width:700px){.viewport{padding:24px;align-items:center}.sheet{border-radius:28px;min-height:0;max-width:510px;padding:12px 24px 24px}.day{height:49px;width:49px;line-height:49px}.context{margin-bottom:26px}}
+@media(max-width:360px){.heading h1{font-size:18px}.sheet{padding-left:10px;padding-right:10px}.month-label{font-size:17px}.day{width:38px;height:42px;line-height:42px;font-size:20px}.primary{font-size:16px}}
+@media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#eceaf0;--panel:#fff;--text:#211d24;--muted:#7d7582;--disabled:#ccc7d0;--control:#f0edf2;--line:#ddd7e0}.error{color:#a31850}.time-control input{color-scheme:light}}
+</style>
+<script nonce="__CSP_NONCE__" src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+<main class="viewport"><section class="sheet" aria-label="Календарь отложенной публикации">
+<div class="handle" aria-hidden="true"></div>
+<header class="heading"><button class="cross" id="close" aria-label="Закрыть выбор времени"><svg viewBox="0 0 24 24"><path d="m5 5 14 14M19 5 5 19"/></svg></button><h1 id="heading">Запланировать пост</h1><span></span></header>
+<div class="status" id="status" role="status"><div class="symbol" id="symbol">◌</div><h2 id="statusTitle">Открываем календарь</h2><p id="statusText">Проверяем доступ к материалу…</p><button id="retry" class="primary" hidden>Повторить</button><button id="returnBot" class="minor">Вернуться в EveryPost</button></div>
+<div id="editor" hidden>
+<p class="context"><strong id="channel"></strong><br><span id="zone"></span></p>
+<div class="month-row"><button id="monthLabel" class="month-label" aria-label="Выбрать месяц и год"><span id="monthText"></span><svg viewBox="0 0 16 24"><path d="m5 5 7 7-7 7"/></svg></button><div class="arrows"><button class="arrow" id="prev" aria-label="Предыдущий месяц"><svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></svg></button><button class="arrow" id="next" aria-label="Следующий месяц"><svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg></button></div></div>
+<div class="jump" id="jump" hidden><select id="jumpMonth" aria-label="Месяц"></select><select id="jumpYear" aria-label="Год"></select></div>
+<div class="week" aria-hidden="true"><span>ПН</span><span>ВТ</span><span>СР</span><span>ЧТ</span><span>ПТ</span><span>СБ</span><span>ВС</span></div>
+<div class="days" id="days" role="group" aria-label="Выбор дня"></div>
+<div class="time-row"><label for="time">Время</label><div class="time-control"><span id="timeText">--:--</span><input type="time" id="time" step="60" aria-label="Время публикации в часовом поясе канала" required></div></div>
+<p class="note" id="oldSchedule" hidden>До сохранения нового времени действует прежнее расписание.</p>
+<p class="note" id="deleteNote" hidden></p>
+<p class="error" id="error" role="alert"></p>
+<button type="button" class="primary" id="save">Отправить</button>
+<button type="button" class="secondary" id="disableDeletion" hidden>Отключить автоудаление</button>
+<p class="brand">EVERYPOST</p>
+</div>
+</section></main>
+<script nonce="__CSP_NONCE__">
+(function(){
+'use strict';
+const $=id=>document.getElementById(id),months=['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+const monthCases=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+const pad=n=>String(n).padStart(2,'0');
+let data=null,selected='',view='',busy=false,initData='',nonce=null,mode='schedule',delta=0,retryAction=null,uncertain=null;
+const bridge=()=>window.Telegram?.WebApp;
+function parts(at,zone){return Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(at)).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));}
+function key(p){return String(p.year)+pad(p.month)+pad(p.day);}
+function shifted(day,by){const d=new Date(Date.UTC(Number(day.slice(0,4)),Number(day.slice(4,6))-1,Number(day.slice(6,8))+by));return String(d.getUTCFullYear())+pad(d.getUTCMonth()+1)+pad(d.getUTCDate());}
+function instant(day,h,m,zone){const target=Date.UTC(+day.slice(0,4),+day.slice(4,6)-1,+day.slice(6,8),h,m);let at=target;for(let i=0;i<4;i++){const p=parts(at,zone);at+=target-Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute,p.second);}return at;}
+function atNow(){return Date.now()+delta;}
+function modal(title,text,symbol='!',retry=null){$('editor').hidden=true;$('status').hidden=false;$('statusTitle').textContent=title;$('statusText').textContent=text;$('symbol').textContent=symbol;retryAction=retry;$('retry').hidden=!retry;}
+function returnToBot(){const b=bridge();if(typeof b?.close==='function'){b.close();return;}if(typeof b?.openTelegramLink==='function'){b.openTelegramLink('https://t.me/EveryPost_bot');return;}window.location.href='https://t.me/EveryPost_bot';}
+function readLaunch(){
+  const b=bridge(); const hash=new URLSearchParams(location.hash.slice(1));
+  initData=typeof b?.initData==='string'&&b.initData?b.initData:hash.get('WebAppData')||'';
+  const p=new URLSearchParams(initData);
+  const hint=p.get('start_param')||b?.initDataUnsafe?.start_param||hash.get('WebAppStartParam')||new URLSearchParams(location.search).get('WebAppStartParam')||'';
+  const match=typeof hint==='string'?hint.match(/^(sc|ad)_([a-f0-9]{24})$/):null;
+  nonce=match?match[2]:new URLSearchParams(location.search).get('nonce');mode=new URLSearchParams(location.search).get('mode')||(match?.[1]==='ad'?'delete':'schedule');
+}
+async function request(action,body={}){
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),25000);
+  try{
+    const res=await fetch('/calendar/api/'+action,{method:'POST',credentials:'omit',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData,nonce,mode,...body}),signal:controller.signal});
+    let result;try{result=await res.json();}catch{throw new Error('Сервер запускается или временно недоступен. Подождите и повторите.');}
+    if(!res.ok||!result.ok){const e=new Error(result.message||'Не удалось выполнить действие.');e.status=res.status;throw e;}
+    return result;
+  }catch(e){if(e.name==='AbortError')throw new Error('Ответ сервера задерживается. Проверьте результат кнопкой «Повторить».');throw e;}finally{clearTimeout(timer);}
+}
+function receipt(result){
+  busy=false;uncertain=null;data=null;
+  if(result.state==='saved'&&result.mode==='delete')modal(result.disabled?'Автоудаление выключено':'Автоудаление настроено',result.title+'\n'+result.label+'\n'+result.zoneLabel+'\n\nУдалится только пост в канале.','✓');
+  else if(result.state==='saved')modal('Пост отложен',result.title+'\n'+result.label+'\n'+result.zoneLabel+'\n\nРасписание также доступно в боте.','✓');
+  else modal('Выбор времени закрыт',result.message||'Расписание не изменено.','✓');
+}
+function render(){
+  if(!data)return;
+  const y=Number(view.slice(0,4)),m=Number(view.slice(4,6));
+  const today=key(parts(atNow(),data.timezone));data.today=today;
+  $('monthText').textContent=months[m-1]+' '+y+' г.';
+  $('prev').disabled=busy||view<=today.slice(0,6);$('next').disabled=busy||view>=data.maxDay.slice(0,6);
+  const first=new Date(Date.UTC(y,m-1,1)),offset=(first.getUTCDay()+6)%7,count=new Date(Date.UTC(y,m,0)).getUTCDate();
+  const frag=document.createDocumentFragment();
+  for(let i=0;i<offset;i++){const blank=document.createElement('span');blank.className='empty';blank.setAttribute('aria-hidden','true');frag.append(blank);}
+  for(let d=1;d<=count;d++){
+    const k=view+pad(d),btn=document.createElement('button');btn.type='button';btn.className='day'+(k===selected?' selected':'')+(k===today?' today':'');btn.textContent=String(d);
+    btn.disabled=busy||k<today||k>data.maxDay;btn.setAttribute('aria-label',d+' '+monthCases[m-1]+' '+y);btn.setAttribute('aria-pressed',String(k===selected));
+    btn.addEventListener('click',()=>{if(busy)return;selected=k;$('error').textContent='';render();});frag.append(btn);
+  }
+  $('days').replaceChildren(frag);
+  $('time').disabled=busy;$('monthLabel').disabled=busy;$('jumpMonth').disabled=busy;$('jumpYear').disabled=busy;
+  const time=$('time').value; $('timeText').textContent=time||'--:--';
+  let valid=selected>=today&&selected<=data.maxDay&&/^\d{2}:\d{2}$/.test(time);
+  if(valid){const [h,mi]=time.split(':').map(Number);const at=instant(selected,h,mi,data.timezone);valid=at>atNow()+60000;
+    if(data.mode==='delete'&&data.minAt)valid=valid&&at>new Date(data.minAt).getTime();
+    if(data.mode==='delete'&&data.maxDeleteAt)valid=valid&&at<new Date(data.maxDeleteAt).getTime();
+    if(data.mode!=='delete'&&data.maxPublishAt)valid=valid&&at<new Date(data.maxPublishAt).getTime();}
+  const label=selected===today?'сегодня':selected===shifted(today,1)?'завтра':(+selected.slice(6,8))+' '+monthCases[+selected.slice(4,6)-1]+(selected.slice(0,4)!==today.slice(0,4)?' '+selected.slice(0,4):'');
+  $('save').textContent=busy?'Сохраняем…':(data.mode==='delete'?'Удалить ':data.rescheduling?'Перенести на ':'Отправить ')+label+' в '+(time||'--:--');$('save').disabled=busy||!valid;$('disableDeletion').disabled=busy;
+  if(!valid&&!$('error').textContent)$('error').textContent=data.mode==='delete'?'Выберите время позже текущего и позже публикации.':data.maxPublishAt?'Публикация должна быть раньше удаления и позже текущего времени.':'Выберите время позже текущего в часовом поясе канала.';
+  $('jumpMonth').value=String(m);$('jumpYear').value=String(y);
+}
+function jumpSetup(){
+  $('jumpMonth').replaceChildren();months.forEach((name,i)=>{const o=document.createElement('option');o.value=String(i+1);o.textContent=name;$('jumpMonth').append(o);});
+  $('jumpYear').replaceChildren();for(let y=+data.today.slice(0,4);y<=+data.maxDay.slice(0,4);y++){const o=document.createElement('option');o.value=String(y);o.textContent=String(y);$('jumpYear').append(o);}
+}
+async function load(){
+  readLaunch();
+  if(!initData){modal('Откройте через EveryPost','В EveryPost нажмите «Отложить» или «Автоудаление», затем «Открыть календарь». Без авторизации Telegram время сохранить нельзя.','↗',load);return;}
+  modal('Открываем календарь','Проверяем доступ к материалу…','◌');
+  try{
+    const result=await request('state');if(result.state!=='editing'){receipt(result);return;}
+    data=result;nonce=result.nonce;mode=result.mode||'schedule';delta=Number(result.serverNow)-Date.now();selected=data.day;view=selected.slice(0,6);
+    $('heading').textContent=mode==='delete'?'Когда удалить пост?':'Запланировать пост';
+    document.title='EveryPost · '+(mode==='delete'?'Автоудаление':'Отложка');
+    document.querySelector('.sheet').setAttribute('aria-label',mode==='delete'?'Календарь удаления поста':'Календарь отложенной публикации');
+    $('time').setAttribute('aria-label',mode==='delete'?'Время удаления в часовом поясе канала':'Время публикации в часовом поясе канала');
+    $('disableDeletion').hidden=mode!=='delete'||!data.canDisable;
+    $('deleteNote').hidden=false;$('deleteNote').textContent=mode==='delete'?
+      (data.publicationLabel?'Публикация: '+data.publicationLabel+'. ':'')+'Удалится только пост в канале. Копия в чате останется.':(data.currentDeletionLabel||'');
+    $('channel').textContent=data.title+' · пост #'+data.postId;$('zone').textContent=data.zoneLabel;$('time').value=pad(data.hour)+':'+pad(data.minute);$('oldSchedule').hidden=!data.rescheduling;
+    $('error').textContent='';$('jump').hidden=true;$('status').hidden=true;$('editor').hidden=false;busy=false;jumpSetup();render();
+  }catch(e){modal('Календарь не открыт',e.message,'!',load);}
+}
+async function checkUncertain(){
+  if(!uncertain){await load();return;}
+  try{const r=await request(uncertain.action,uncertain.body);receipt(r);}
+  catch(e){modal('Не удалось подтвердить результат',e.message+'\nПовтор проверяет ту же операцию и не создаёт второй пост.','!',checkUncertain);}
+}
+async function save(){
+  if(!data||busy||$('save').disabled)return;
+  const [hour,minute]=$('time').value.split(':').map(Number),body={day:selected,hour,minute};
+  busy=true;$('error').textContent='';render();
+  try{receipt(await request('save',body));}
+  catch(e){
+    busy=false;
+    if(e.status&&e.status<500){$('error').textContent=e.message;render();}
+    else{uncertain={action:'save',body};modal('Проверяем сохранение',e.message+'\nНе создавайте второй пост: повтор безопасно проверит этот же выбор времени.','!',checkUncertain);}
+  }
+}
+async function close(){
+  if(busy)return;
+  if(!data){returnToBot();return;}
+  busy=true;render();
+  try{receipt(await request('cancel'));returnToBot();}
+  catch(e){busy=false;uncertain={action:'cancel',body:{}};modal('Не удалось закрыть выбор',e.message,'!',checkUncertain);}
+}
+$('disableDeletion').addEventListener('click',async()=>{
+  if(!data||busy||!data.canDisable)return;
+  busy=true;render();
+  try{receipt(await request('disable'));}
+  catch(e){busy=false;if(e.status&&e.status<500){$('error').textContent=e.message;render();}
+    else{uncertain={action:'disable',body:{}};modal('Проверяем сохранение',e.message,'!',checkUncertain);}}
+});
+$('save').addEventListener('click',save);$('close').addEventListener('click',close);$('returnBot').addEventListener('click',returnToBot);$('retry').addEventListener('click',()=>retryAction?.());
+$('time').addEventListener('input',()=>{$('error').textContent='';render();});
+$('monthLabel').addEventListener('click',()=>{$('jump').hidden=!$('jump').hidden;});
+function changeView(shift){if(!data||busy)return;const d=new Date(Date.UTC(+view.slice(0,4),+view.slice(4,6)-1+shift,1));view=String(d.getUTCFullYear())+pad(d.getUTCMonth()+1);render();}
+$('prev').addEventListener('click',()=>changeView(-1));$('next').addEventListener('click',()=>changeView(1));
+function applyJump(){if(!data||busy)return;let v=$('jumpYear').value+pad($('jumpMonth').value);v=v<data.today.slice(0,6)?data.today.slice(0,6):v>data.maxDay.slice(0,6)?data.maxDay.slice(0,6):v;view=v;render();}
+$('jumpMonth').addEventListener('change',applyJump);$('jumpYear').addEventListener('change',applyJump);
+try{bridge()?.BackButton?.show();bridge()?.BackButton?.onClick(close);}catch{}
+setInterval(()=>{if(data&&!busy)render();},15000);
+load();
+})();
+</script>
+</body></html>
