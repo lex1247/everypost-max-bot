@@ -26,7 +26,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "max-trustat-1";
+const VERSION = "max-editorial-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -1040,6 +1040,7 @@ async function initDatabase() {
   `);
   await initMultiDatabase();
   await initCrossDatabase();
+  await initEditorialDatabase();
   console.log("DATABASE READY");
 }
 
@@ -1167,6 +1168,7 @@ async function handleMessage(update) {
   if (chatType && chatType !== "dialog") return;
   await rememberUser(sender);
   if ((await pool.query("SELECT 1 FROM ep_command_inputs WHERE max_message_id=$1 AND handled=TRUE",[mid])).rowCount) return;
+  if (await handleEditorialMessage(message)) return;
   if (await handleCrossMessage(message)) return;
   if (await handleFolderMessage(message)) return;
   if (await handleQuickCommand(message)) return;
@@ -1797,6 +1799,8 @@ async function handleCallback(update) {
   // Настройки доступа не меняются из групп или пересланных чужих карточек.
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
+  if (await handleEditorialCallback(update)) return;
+  if(await editorialInput(update.callback?.user?.user_id)){await notify(update.callback.user.user_id,"Завершите правку или /cancel.");return;}
   if (await handleCrossCallback(update)) return;
   if(await crossForm(update.callback?.user?.user_id)){await notify(update.callback.user.user_id,"Пришлите ссылку источника или /cancel.");return;}
   if (await handleMultiCallback(update)) return;
@@ -2750,6 +2754,8 @@ async function showOwnPostPreview(session) {
       `, [row.id, messageId(preview), current.nonce]);
     }
     if (!row.controls_mid) {
+      const similar=await relatedPublication(row.channel_id,(row.base_body||row.body).text);
+      if(similar)await sendToUser(current.actor_user_id,{text:'Похожая новость уже выходила в этом канале. Проверьте её перед публикацией.',attachments:keyboard([[button('Посмотреть похожий пост',`pubopen_${similar.id}`)]])});
       const controls = await sendToUser(current.actor_user_id, ownPostControls(current, row));
       await pool.query(`
         UPDATE ep_posts SET controls_mid = $2, updated_at = NOW()
@@ -4899,7 +4905,7 @@ async function listPublishedPosts(userId,page=0) {
     WHERE p.channel_id=ANY($1::bigint[]) AND (c.owner_user_id=$2 OR p.capability='moderate' OR p.actor_user_id=$2)
     ORDER BY p.published_at DESC,p.id DESC`,[ids,userId]):{rows:[]};
   const rows=found.rows.slice(page*ADMIN_PAGE_SIZE,(page+1)*ADMIN_PAGE_SIZE);
-  await sendToUser(userId,{text:"📤 Опубликованные\n\nПосты, отправленные через EveryPost. Откройте материал, чтобы настроить удаление.",
+  await sendToUser(userId,{text:"📤 Опубликованные\n\nПосты, отправленные через EveryPost. Откройте материал, чтобы изменить текст или настроить удаление.",
     attachments:keyboard([...rows.map(r=>[button(`${shortTitle(r.title).slice(0,32)} · #${r.id}${r.status==="deleted"?" · удалён":""}`,`pubopen_${r.id}`)]),
       ...(pageButtons("publist",page,found.rows.length).length?[pageButtons("publist",page,found.rows.length)]:[]),[button("↩️ Меню","menu_main")]])});
 }
@@ -4923,6 +4929,7 @@ async function showPublishedPost(publicationId,userId,preview=true) {
     (pub.status==="deleted"?"Пост удалён из канала.":deletionTimeText(target.policy))+
     (target.policy?.last_error?`\n\n${target.policy.last_error.slice(0,450)}`:"")+"\n\nУдаление касается только поста в канале. Копия в чате и ответы остаются.";
   const controls=[];
+  if(pub.status==="published"&&await editorialPublishedAccess(pub.id,userId))controls.push([button("✏️ Изменить опубликованный текст",`we_${pub.id}`)]);
   if(pub.status==="published"&&memberCanDelete(access.member)) {
     controls.push([button(target.policy?.enabled?"🗑 Изменить автоудаление":"🗑 Автоудаление: выкл",`adpub_${pub.id}`)]);
     controls.push([button("🗑 Удалить сейчас",`delnow_${pub.id}`)]);
@@ -5708,14 +5715,23 @@ function crossUsername(value){
   return m[1].toLowerCase();
 }
 async function crossBridge(payload){
-  const body=JSON.stringify(payload),stamp=String(Math.floor(Date.now()/1000));
+  const body=JSON.stringify(payload);
   const key=crypto.createHmac('sha256',TOKEN).update('EveryPost MAX crosspost bridge v1').digest();
-  const signature=crypto.createHmac('sha256',key).update(stamp+'.'+body).digest('hex');
-  const response=await httpsRequest('https://everypost-telegram-bot.onrender.com/max-crosspost',{
-    method:'POST',headers:{'Content-Type':'application/json','X-EveryPost-Time':stamp,'X-EveryPost-Signature':signature},body,timeout:180000});
-  let data;try{data=JSON.parse(response.text);}catch{throw new Error('Сервис обработки запускается. Повторите через минуту.');}
-  if(response.status!==200||!data.ok){const e=new Error(data.message||'Сервис обработки недоступен. Повторите позже.');e.permanent=response.status===422;e.pause=data.pause===true;throw e;}
-  return data;
+  const retryRead=['resolve','fetch','trustat_resolve','trustat_fetch','vk_resolve','vk_fetch'].includes(payload.action);
+  for(let attempt=0;attempt<(retryRead?3:1);attempt++){
+    const stamp=String(Math.floor(Date.now()/1000));
+    const signature=crypto.createHmac('sha256',key).update(stamp+'.'+body).digest('hex');
+    let response;
+    try{response=await httpsRequest('https://everypost-telegram-bot.onrender.com/max-crosspost',{
+      method:'POST',headers:{'Content-Type':'application/json','X-EveryPost-Time':stamp,'X-EveryPost-Signature':signature},body,timeout:65000});}
+    catch(e){if(retryRead&&attempt<2){await sleep(15000);continue;}throw Error('Сервис чтения не ответил. Повторим позже; материалы сохранены.');}
+    let data;try{data=JSON.parse(response.text);}catch{
+      if(retryRead&&attempt<2&&[200,502,503,504].includes(response.status)){await sleep(15000);continue;}
+      throw Error('Сервис обработки запускается. Повторите через минуту.');
+    }
+    if(response.status!==200||!data.ok){const e=new Error(data.message||'Сервис обработки недоступен. Повторите позже.');e.permanent=response.status===422;e.pause=data.pause===true;throw e;}
+    return data;
+  }
 }
 async function crossAccess(route,userId){
   if(!route)return null;
@@ -5734,42 +5750,44 @@ async function crossMenu(userId,page=0){
   await sendToUser(userId,{text:'🔁 Кросспостинг из Telegram\nИсточник → ваш канал MAX. Только новые посты; архив до подключения пропускается.\nУ каждой связки свой режим. Пауза останавливает обработку источника. Уже переданные в очередь MAX посты отменяются отдельно в «Отложенных».\nФото переносятся; видео и неподдерживаемые вложения сохраняются для проверки.',attachments:keyboard([
     ...rows.slice(0,6).map(r=>[button(`${r.enabled?'▶️':'⏸'} ${shortTitle(r.title)}`,`xr_${r.id}`)]),
     ...(page>0?[[button('◀️ Назад',`xc_${page-1}`)]]:[]),...(rows.length>6?[[button('Далее ▶️',`xc_${page+1}`)]]:[]),
-    [button('➕ Подключить источник','xn_0')],[button('↩️ Меню','menu_main')]])});
+    [button('➕ Telegram → MAX','xn_0')],[button('➕ ВК → MAX','vn_0')],[{type:'link',text:'MAX → Telegram',url:'https://t.me/EveryPost_bot?start=maxsources'}],[button('↩️ Меню','menu_main')]])});
 }
-async function crossDestinations(userId,page=0){
+async function crossDestinations(userId,page=0,kind='trustat'){
   page=pageNumber(page);const cs=(await accessibleChannels(userId,'create')).filter(c=>c.access_owner);
-  await sendToUser(userId,{text:'Выберите свой MAX-канал для новых постов из Telegram. Управление автоматической публикацией доступно владельцу.',attachments:keyboard([
-    ...cs.slice(page*6,page*6+6).map(c=>[button(shortTitle(c.title),`xd_${c.id}`)]),
-    ...(page>0?[[button('◀️ Назад',`xn_${page-1}`)]]:[]),...(cs.length>page*6+6?[[button('Далее ▶️',`xn_${page+1}`)]]:[]),[button('↩️ Назад','xc_0')]])});
+  await sendToUser(userId,{text:'Выберите свой MAX-канал для новых постов источника. Управление автоматической публикацией доступно владельцу.',attachments:keyboard([
+    ...cs.slice(page*6,page*6+6).map(c=>[button(shortTitle(c.title),`${kind==='vk'?'vd':'xd'}_${c.id}`)]),
+    ...(page>0?[[button('◀️ Назад',`${kind==='vk'?'vn':'xn'}_${page-1}`)]]:[]),...(cs.length>page*6+6?[[button('Далее ▶️',`${kind==='vk'?'vn':'xn'}_${page+1}`)]]:[]),[button('↩️ Назад','xc_0')]])});
 }
 async function crossLegacyDuplicate(route){
   const exists=(await pool.query("SELECT to_regclass('repost_bot.routes') AS t")).rows[0]?.t;
   if(!exists)return false;
   const c=await getChannel(route.channel_id);
+  if((await pool.query("SELECT 1 FROM repost_bot.sources s JOIN repost_bot.routes r ON r.source=s.id WHERE s.platform='max' AND s.remote=$1 LIMIT 1",[String(c.max_chat_id)])).rowCount)return true;
   return (await pool.query(`SELECT 1 FROM repost_bot.routes r JOIN repost_bot.sources s ON s.id=r.source
-    JOIN repost_bot.destinations d ON d.id=r.destination WHERE s.platform='tg' AND s.remote=$1
-    AND d.platform='max' AND d.remote=$2 LIMIT 1`,[route.peer,String(c.max_chat_id)])).rowCount>0;
+    JOIN repost_bot.destinations d ON d.id=r.destination WHERE s.platform=$3 AND s.remote=$1
+    AND d.platform='max' AND d.remote=$2 LIMIT 1`,[route.peer,String(c.max_chat_id),route.source_kind==='vk'?'vk':'tg'])).rowCount>0;
 }
 async function crossCard(id,userId){
   const r=await crossRoute(id,userId);if(!r){await notify(userId,'Связка недоступна.');return;}
   const c=await getChannel(r.channel_id);
   const counts=(await pool.query(`SELECT i.state,COUNT(*) n FROM ep_cross_items i WHERE route_id=$1 GROUP BY i.state`,[r.id])).rows;
-  await sendToUser(userId,{text:`🔁 ${shortTitle(r.title)} → ${shortTitle(c.title)}\nИсточник: ${r.source_kind==='trustat'?'Trustat · https://t.me/c/'+r.source.slice(8):'https://t.me/'+r.source}\n${r.enabled?'▶️ Включено':'⏸ На паузе'}\nРежим: ${r.mode==='ai'?'Переписать с ИИ':'Как есть'}\n`+
+  await sendToUser(userId,{text:`🔁 ${shortTitle(r.title)} → ${shortTitle(c.title)}\nИсточник: ${r.source_kind==='vk'?'https://vk.com/club'+r.source.slice(3):r.source_kind==='trustat'?'Trustat · https://t.me/c/'+r.source.slice(8):'https://t.me/'+r.source}\n${r.enabled?'▶️ Включено':'⏸ На паузе'}\nРежим: ${r.mode==='ai'?'Переписать с ИИ':'Как есть'}\n`+
     (r.source_kind==='trustat'?'Проверка раз в 5 минут в пределах лимита Trustat. При исчерпании лимита связка встанет на паузу.\n':'')+
     'Режим применяется к новым найденным материалам. Оформление берётся из настроек MAX-канала. Переписывание передаёт текст подключённому сервису ИИ.\n'+
-    counts.map(x=>`${({pending:'Ожидают обработки',failed:'Требуют проверки',queued:'Переданы в очередь MAX'})[x.state]||x.state}: ${x.n}`).join('\n')+
+    counts.map(x=>`${({pending:'Ожидают обработки',failed:'Требуют проверки',queued:'Переданы в очередь MAX',skipped:'Пропущены по фильтрам'})[x.state]||x.state}: ${x.n}`).join('\n')+
+    (r.checked_at?`\nПоследняя проверка: ${timeLabel(r.checked_at,'Europe/Moscow')}`:'')+
     (r.last_error?`\n⚠️ ${r.last_error.slice(0,350)}`:''),attachments:keyboard([
       [button(r.enabled?'⏸ Пауза':'▶️ Включить',`xe_${r.id}_${r.revision}_${r.enabled?0:1}`)],
       [button('Как есть',`xm_${r.id}_${r.revision}_original`),button('Переписать с ИИ',`xm_${r.id}_${r.revision}_ai`)],
-      [button('⚠️ Материалы и ошибки',`xi_${r.id}_0`)],[button('🔄 Обновить',`xr_${r.id}`)],[button('↩️ Кросспостинг','xc_0')]])});
+      [button('⚙️ Правила переноса',`wr_${r.id}`)],[button('⚠️ Материалы и ошибки',`xi_${r.id}_0`)],[button('🔄 Обновить',`xr_${r.id}`)],[button('↩️ Кросспостинг','xc_0')]])});
 }
 async function crossItems(id,userId,page=0){
   const r=await crossRoute(id,userId);if(!r)return;page=pageNumber(page);
   const rows=(await pool.query(`SELECT i.*,p.status post_status,q.status queue_status FROM ep_cross_items i
     LEFT JOIN ep_posts p ON p.id=i.post_id LEFT JOIN ep_schedules q ON q.post_id=p.id WHERE route_id=$1 ORDER BY i.id DESC LIMIT 7 OFFSET $2`,[id,page*6])).rows;
-  const labels={published:'✅ Опубликовано',scheduled:'🕒 В очереди',paused:'⚠️ Приостановлено',needs_check:'⚠️ Проверьте канал',draft:'✏️ Черновик',failed:'⚠️ Ошибка',pending:'⏳ Обрабатывается'};
+  const labels={published:'✅ Опубликовано',scheduled:'🕒 В очереди',paused:'⚠️ Приостановлено',needs_check:'⚠️ Проверьте канал',draft:'✏️ Черновик',failed:'⚠️ Ошибка',pending:'⏳ Обрабатывается',skipped:'Пропущен по правилам'};
   await sendToUser(userId,{text:'Материалы источника\n'+rows.slice(0,6).map(i=>`#${i.remote}: ${labels[i.queue_status||i.post_status||i.state]||'В обработке'}\n${i.url}\n${(i.last_error||'').slice(0,200)}`).join('\n\n'),attachments:keyboard([
-    ...rows.slice(0,6).flatMap(i=>i.state==='failed'?[[button(`Повторить #${i.remote}`,`xy_${i.id}`)]]:i.post_status==='draft'?[[button(`Править #${i.remote}`,`dopen_${i.post_id}`)]]:[]),
+    ...rows.slice(0,6).flatMap(i=>i.state==='failed'?[[button(`Повторить #${i.remote}`,`xy_${i.id}`),button('Править текст',`wi_${i.id}`)],...(i.related_publication?[[button('Посмотреть похожий пост',`pubopen_${i.related_publication}`),button('Добавить «Ранее сообщали»',`wl_${i.id}`)]]:[])]:i.post_status==='draft'?[[button(`Править #${i.remote}`,`dopen_${i.post_id}`)]]:[]),
     ...(page>0?[[button('◀️ Назад',`xi_${id}_${page-1}`)]]:[]),...(rows.length>6?[[button('Далее ▶️',`xi_${id}_${page+1}`)]]:[]),
     [button('↩️ Связка',`xr_${id}`)],[button('🕒 Отложенные','menu_scheduled_all_0')]])});
 }
@@ -5780,15 +5798,15 @@ async function handleCrossMessage(message){
   if(message.link||message.body.attachments?.length){await notify(userId,'Пришлите ссылку текстом или /cancel.');return true;}
   try{
     if(!(await crossAccess(f,userId)))throw new Error('Права на канал изменились.');
-    const isTrustat=f.source_kind==='trustat';
-    const input=isTrustat?String(message.body.text||'').trim():'@'+crossUsername(message.body.text);
-    const info=await crossBridge({action:isTrustat?'trustat_resolve':'resolve',source:input});
-    const source=isTrustat?info.source:input.slice(1);
-    if((isTrustat?(!/^trustat_[1-9][0-9]{0,11}$/.test(source)||info.peer!==String(-1000000000000-Number(source.slice(8)))):info.source!==source)||!/^-[0-9]+$/.test(info.peer)||!Number.isSafeInteger(info.cursor)||info.cursor<0)throw new Error('Источник не удалось проверить.');
+    const isTrustat=f.source_kind==='trustat',isVk=f.source_kind==='vk';
+    const input=(isTrustat||isVk)?String(message.body.text||'').trim():'@'+crossUsername(message.body.text);
+    const info=await crossBridge({action:isVk?'vk_resolve':isTrustat?'trustat_resolve':'resolve',source:input});
+    const source=(isTrustat||isVk)?info.source:input.slice(1);
+    if((isVk?(!/^vk_[1-9][0-9]{0,11}$/.test(source)||info.peer!==String(-Number(source.slice(3)))):isTrustat?(!/^trustat_[1-9][0-9]{0,11}$/.test(source)||info.peer!==String(-1000000000000-Number(source.slice(8)))):info.source!==source)||!/^-[0-9]+$/.test(info.peer)||!Number.isSafeInteger(info.cursor)||info.cursor<0)throw new Error('Источник не удалось проверить.');
     const client=await pool.connect();let route;
     try{await client.query('BEGIN');const claimed=await client.query('DELETE FROM ep_cross_inputs WHERE actor_user_id=$1 AND nonce=$2 RETURNING *',[userId,f.nonce]);
       if(claimed.rowCount){
-        const kind=isTrustat?'trustat':'public';
+        const kind=isVk?'vk':isTrustat?'trustat':'public';
         const old=(await client.query('SELECT * FROM ep_cross_routes WHERE channel_id=$1 AND peer=$2 FOR UPDATE',[f.channel_id,info.peer])).rows[0];
         if(old&&old.source_kind!==kind&&old.enabled)throw new Error('Сначала поставьте существующую связку на паузу, затем подключите источник заново.');
         route=(await client.query(`INSERT INTO ep_cross_routes(channel_id,actor_user_id,source,peer,title,cursor,source_kind)
@@ -5802,23 +5820,23 @@ async function handleCrossMessage(message){
 }
 async function handleCrossCallback(update){
   const p=update.callback?.payload||'',u=update.callback?.user?.user_id;
-  const m=p.match(/^(xc|xn|xd|xr|xy)_(\d+)$/),change=p.match(/^(xe|xm)_(\d+)_(\d+)_(0|1|original|ai)$/),items=p.match(/^xi_(\d+)_(\d+)$/);
+  const m=p.match(/^(xc|xn|xd|xr|xy|vn|vd)_(\d+)$/),change=p.match(/^(xe|xm)_(\d+)_(\d+)_(0|1|original|ai)$/),items=p.match(/^xi_(\d+)_(\d+)$/);
   if(u==null||!(m||change||items))return false;
   await answerCallback(update.callback.callback_id);
   if(await getComposer(u)||await getEditorSession(u)||await getScheduleSession(u)||await getDeletionSession(u)||await getStyleInput(u)||
     (await pool.query('SELECT 1 FROM ep_folder_inputs WHERE actor_user_id=$1 AND expires_at>NOW()',[u])).rowCount){await notify(u,'Сначала завершите текущую правку или /cancel.');return true;}
-  if(m){const id=m[2];if(m[1]==='xc')await crossMenu(u,Number(id));else if(m[1]==='xn')await crossDestinations(u,Number(id));
+  if(m){const id=m[2];if(m[1]==='xc')await crossMenu(u,Number(id));else if(m[1]==='xn'||m[1]==='vn')await crossDestinations(u,Number(id),m[1]==='vn'?'vk':'trustat');
     else if(m[1]==='xr')await crossCard(id,u);
-    else if(m[1]==='xd'){
+    else if(m[1]==='xd'||m[1]==='vd'){
       if(!(await crossAccess({channel_id:id},u))){await notify(u,'Канал недоступен.');return true;}
-      await pool.query(`INSERT INTO ep_cross_inputs(actor_user_id,channel_id,nonce,source_kind) VALUES($1,$2,$3,'trustat') ON CONFLICT(actor_user_id)
-        DO UPDATE SET channel_id=EXCLUDED.channel_id,nonce=EXCLUDED.nonce,source_kind='trustat',expires_at=NOW()+INTERVAL '30 minutes'`,[u,id,newEditNonce()]);
+      await pool.query(`INSERT INTO ep_cross_inputs(actor_user_id,channel_id,nonce,source_kind) VALUES($1,$2,$3,$4) ON CONFLICT(actor_user_id)
+        DO UPDATE SET channel_id=EXCLUDED.channel_id,nonce=EXCLUDED.nonce,source_kind=EXCLUDED.source_kind,expires_at=NOW()+INTERVAL '30 minutes'`,[u,id,newEditNonce(),m[1]==='vd'?'vk':'trustat']);
       await pool.query('DELETE FROM proposal_sessions WHERE max_user_id=$1',[u]);
-      await notify(u,'Пришлите ссылку на Telegram-канал или @имя. Источник должен быть доступен в базе Trustat; добавлять нашего бота в чужой канал не нужно. Для закрытого канала можно прислать ссылку-приглашение, если Trustat знает этот канал. Затем выберите режим и нажмите «Включить». Отмена: /cancel.');
+      await notify(u,m[1]==='vd'?'Пришлите ссылку на открытое сообщество ВК. Для чтения нужен ключ ВК в настройках сервиса. /cancel — отмена.':'Пришлите ссылку на Telegram-канал или @имя. Источник должен быть доступен в базе Trustat; добавлять нашего бота в чужой канал не нужно. Для закрытого канала можно прислать ссылку-приглашение, если Trustat знает этот канал. Затем выберите режим и нажмите «Включить». Отмена: /cancel.');
     }else{const i=(await pool.query('SELECT * FROM ep_cross_items WHERE id=$1',[id])).rows[0];const r=i&&await crossRoute(i.route_id,u);if(r){await pool.query("UPDATE ep_cross_items SET state='pending',next_at=NOW(),last_error=NULL WHERE id=$1 AND state='failed' AND post_id IS NULL",[id]);await crossItems(r.id,u);}}
   }else if(items)await crossItems(items[1],u,Number(items[2]));
   else{const r=await crossRoute(change[2],u);if(!r)return true;
-    if(change[1]==='xe'&&change[4]==='1'&&await crossLegacyDuplicate(r)){await notify(u,'Эта связка уже настроена в Telegram-боте. Сначала отключите её там, чтобы не получать два одинаковых поста.');return true;}
+    if(change[1]==='xe'&&change[4]==='1'&&await crossLegacyDuplicate(r)){await notify(u,'В Telegram-боте уже есть такая связка или обратное направление из этого MAX-канала. Сначала отключите его там, чтобы избежать дублей и кругового копирования.');return true;}
     if(change[1]==='xe'&&['0','1'].includes(change[4]))await pool.query('UPDATE ep_cross_routes SET enabled=$3,revision=revision+1,next_at=NOW() WHERE id=$1 AND revision=$2',[r.id,change[3],change[4]==='1']);
     if(change[1]==='xm'&&['original','ai'].includes(change[4]))await pool.query('UPDATE ep_cross_routes SET mode=$3,revision=revision+1 WHERE id=$1 AND revision=$2',[r.id,change[3],change[4]]);
     await crossCard(r.id,u);
@@ -5845,25 +5863,173 @@ async function crossTick(){
       WHERE i.state='pending' AND i.next_at<=NOW() AND r.enabled ORDER BY i.id LIMIT 1`)).rows[0];
     if(item){const route=(await pool.query('SELECT * FROM ep_cross_routes WHERE id=$1',[item.route_id])).rows[0];
       try{if(!(await crossAccess(route,route.actor_user_id)))throw Object.assign(new Error('Права на канал отозваны.'),{permanent:true});
-        const prepared=await crossBridge({action:'prepare',text:item.original,media:item.media,mode:item.mode});await queueCrossItem(item,route,prepared.body);
+        const prepared=await crossBridge({action:'prepare',text:item.edited_text??item.original,media:item.media,mode:item.mode});await queueCrossItem(item,route,prepared.body);
       }catch(e){await pool.query("UPDATE ep_cross_items SET state=$2,last_error=$3,next_at=NOW()+INTERVAL '5 minutes' WHERE id=$1 AND state='pending' AND post_id IS NULL",[item.id,e.permanent?'failed':'pending',e.message.slice(0,500)]);}
     }
     const route=(await pool.query('SELECT * FROM ep_cross_routes WHERE enabled AND next_at<=NOW() ORDER BY next_at,id LIMIT 1')).rows[0];
     if(route){try{if(!(await crossAccess(route,route.actor_user_id)))throw new Error('Права на канал отозваны.');
-      const isTrustat=route.source_kind==='trustat';
-      const fetched=await crossBridge({action:isTrustat?'trustat_fetch':'fetch',source:isTrustat?route.source:'@'+route.source,peer:route.peer,cursor:Number(route.cursor)});
+      const isTrustat=route.source_kind==='trustat',isVk=route.source_kind==='vk';
+      const fetched=await crossBridge({action:isVk?'vk_fetch':isTrustat?'trustat_fetch':'fetch',source:(isTrustat||isVk)?route.source:'@'+route.source,peer:route.peer,cursor:Number(route.cursor)});
       if(!Array.isArray(fetched.posts)||fetched.posts.length>100||!Number.isSafeInteger(fetched.cursor)||fetched.cursor<Number(route.cursor))throw new Error('Некорректный ответ источника.');
+      const decisions=new Map();for(const p of fetched.posts){if(Array.isArray(p)&&typeof p[1]==='string'){const d=applyEditorialRules(p[1],route.rules);if(!d.skip&&route.rules?.duplicates)d.related=await relatedPublication(route.channel_id,d.text);decisions.set(p[0],d);}}
       await client.query('BEGIN');const current=(await client.query('SELECT * FROM ep_cross_routes WHERE id=$1 FOR UPDATE',[route.id])).rows[0];
       if(current.enabled&&String(current.revision)===String(route.revision)){
         for(const p of fetched.posts){if(!Array.isArray(p)||!Number.isSafeInteger(p[0])||p[0]<=Number(route.cursor)||p[0]>fetched.cursor||typeof p[1]!=='string')throw new Error('Некорректный материал источника.');
-          await client.query(`INSERT INTO ep_cross_items(route_id,remote,original,url,media,mode) VALUES($1,$2,$3,$4,$5::jsonb,$6) ON CONFLICT(route_id,remote) DO NOTHING`,[route.id,p[0],p[1],isTrustat?`https://t.me/c/${route.source.slice(8)}/${p[0]}`:`https://t.me/${route.source}/${p[0]}`,JSON.stringify(p[3]),route.mode]);}
-        await client.query(`UPDATE ep_cross_routes SET cursor=$2,next_at=NOW()+($3 * INTERVAL '1 second'),last_error=$4,
+          await client.query(`INSERT INTO ep_cross_items(route_id,remote,original,url,media,mode,edited_text,state,last_error,related_publication) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10) ON CONFLICT(route_id,remote) DO NOTHING`,[route.id,p[0],p[1],isVk?`https://vk.com/wall${route.peer}_${p[0]}`:isTrustat?`https://t.me/c/${route.source.slice(8)}/${p[0]}`:`https://t.me/${route.source}/${p[0]}`,JSON.stringify(p[3]),route.mode,decisions.get(p[0]).text,decisions.get(p[0]).skip?'skipped':decisions.get(p[0]).related?'failed':'pending',decisions.get(p[0]).skip||(decisions.get(p[0]).related?'Похожая новость уже опубликована. Проверьте её перед повтором.':null),decisions.get(p[0]).related?.id||null]);}
+        await client.query(`UPDATE ep_cross_routes SET cursor=$2,checked_at=NOW(),next_at=NOW()+($3 * INTERVAL '1 second'),last_error=$4,
           enabled=CASE WHEN $5 THEN FALSE ELSE enabled END,revision=revision+CASE WHEN $5 THEN 1 ELSE 0 END WHERE id=$1`,
           [route.id,fetched.cursor,isTrustat?300:60,fetched.message?String(fetched.message).slice(0,500):null,fetched.pause===true]);}
       await client.query('COMMIT');
     }catch(e){await client.query('ROLLBACK').catch(()=>{});await pool.query(`UPDATE ep_cross_routes SET last_error=$2,next_at=NOW()+INTERVAL '5 minutes',
       enabled=CASE WHEN $3 THEN FALSE ELSE enabled END,revision=revision+CASE WHEN $3 THEN 1 ELSE 0 END WHERE id=$1 AND revision=$4`,[route.id,e.message.slice(0,500),e.pause===true,route.revision]);}}
   }catch(e){console.error('CROSSPOST WORKER ERROR:',e.message);}finally{if(locked)await client.query('SELECT pg_advisory_unlock(19471,2)').catch(()=>{});client?.release();crossBusy=false;}
+}
+
+// Editorial controls: source rules, related publications and editing published text.
+async function initEditorialDatabase(){
+ await pool.query(`
+ CREATE TABLE IF NOT EXISTS ep_editorial_inputs(actor_user_id BIGINT PRIMARY KEY,kind TEXT NOT NULL,target_id BIGINT NOT NULL,
+  nonce TEXT NOT NULL,expected_revision BIGINT NOT NULL DEFAULT 0,body JSONB,expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW()+INTERVAL '30 minutes');
+ ALTER TABLE ep_cross_routes ADD COLUMN IF NOT EXISTS rules JSONB NOT NULL DEFAULT '{}';
+ ALTER TABLE ep_cross_routes ADD COLUMN IF NOT EXISTS checked_at TIMESTAMPTZ;
+ ALTER TABLE ep_cross_items ADD COLUMN IF NOT EXISTS related_publication BIGINT;
+ ALTER TABLE ep_cross_items ADD COLUMN IF NOT EXISTS edited_text TEXT;
+ ALTER TABLE ep_publications ADD COLUMN IF NOT EXISTS edit_revision BIGINT NOT NULL DEFAULT 0;
+ CREATE TABLE IF NOT EXISTS ep_publication_edits(nonce TEXT PRIMARY KEY,publication_id BIGINT NOT NULL,actor_user_id BIGINT NOT NULL,
+  before_body JSONB NOT NULL,after_body JSONB NOT NULL,state TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),last_error TEXT);
+ CREATE UNIQUE INDEX IF NOT EXISTS ep_publication_edit_inflight ON ep_publication_edits(publication_id) WHERE state='sending';
+ `);
+}
+function parseEditorialRules(text){
+ if(String(text).length>6000)throw Error('Настройки слишком длинные. Максимум 6000 символов.');
+ const rules={include:[],exclude:[],replace:[],duplicates:false};
+ for(const line of String(text).split('\n').map(x=>x.trim()).filter(Boolean)){
+  if(line.toLowerCase()==='сброс')return {};
+  const colon=line.indexOf(':');if(colon<0)throw Error('Каждая строка должна начинаться с «Искать:», «Исключить:», «Заменить:» или «Дубли:».');
+  const key=line.slice(0,colon).trim().toLowerCase(),value=line.slice(colon+1).trim();
+  if(key==='искать'||key==='исключить'){
+   const values=value.split(';').map(x=>x.trim()).filter(Boolean);if(values.some(x=>x.length>200)||values.length>30)throw Error('До 30 фраз длиной до 200 символов. Разделитель — точка с запятой.');
+   rules[key==='искать'?'include':'exclude'].push(...values);
+  }else if(key==='заменить'){
+   const n=value.indexOf('=>');if(n<=0)throw Error('Замена записывается так: Заменить: старый текст => новый текст');
+   const from=value.slice(0,n).trim(),to=value.slice(n+2).trim();if(from.length>300||to.length>500)throw Error('Слишком длинная замена.');
+   rules.replace.push({from,to});
+  }else if(key==='дубли'&&['да','нет'].includes(value.toLowerCase()))rules.duplicates=value.toLowerCase()==='да';
+  else throw Error('Неизвестная настройка: '+key);
+ }
+ if(rules.include.length>30||rules.exclude.length>30||rules.replace.length>20)throw Error('Слишком много правил.');
+ return rules;
+}
+function applyEditorialRules(text,rules={}){
+ const folded=text.toLocaleLowerCase('ru');
+ if(rules.exclude?.some(x=>folded.includes(x.toLocaleLowerCase('ru'))))return {text,skip:'Исключён по стоп-фразе.'};
+ if(rules.include?.length&&!rules.include.some(x=>folded.includes(x.toLocaleLowerCase('ru'))))return {text,skip:'Нет обязательной фразы.'};
+ for(const r of rules.replace||[])text=text.split(r.from).join(r.to);
+ if(text.length>30000)throw Error('После замен текст превышает 30000 символов.');
+ return {text};
+}
+function editorialSimilarity(a,b){
+ const normalize=x=>String(x||'').normalize('NFKC').toLocaleLowerCase('ru').replace(/https?:\/\/\S+/g,' ').replace(/[^\p{L}\p{N}]+/gu,' ').trim();
+ a=normalize(a);b=normalize(b);if(a.length<40||b.length<40)return 0;if(a===b)return 1;
+ const aa=new Set(a.split(' ')),bb=new Set(b.split(' '));if(Math.min(aa.size,bb.size)<10)return 0;
+ let common=0;for(const word of aa)if(bb.has(word))common++;
+ return common/(aa.size+bb.size-common);
+}
+function verifiedMaxPostLink(value){
+ try{const u=new URL(value);return u.protocol==='https:'&&['max.ru','web.max.ru'].includes(u.hostname)&&!u.username&&!u.password&&!u.port?u.href:null;}catch{return null;}
+}
+async function relatedPublication(channelId,text){
+ const rows=(await pool.query("SELECT id,body_snapshot FROM ep_publications WHERE channel_id=$1 AND status='published' ORDER BY published_at DESC LIMIT 200",[channelId])).rows;
+ return rows.find(p=>editorialSimilarity(text,p.body_snapshot?.text)>=0.86)||null;
+}
+async function editorialInput(userId){return (await pool.query('SELECT * FROM ep_editorial_inputs WHERE actor_user_id=$1 AND expires_at>NOW()',[userId])).rows[0];}
+async function editorialBegin(userId,kind,id,revision=0,body=null){
+ if(await getComposer(userId)||await getEditorSession(userId)||await getScheduleSession(userId)||await getDeletionSession(userId)||await crossForm(userId)||await getStyleInput(userId)||(await pool.query('SELECT 1 FROM ep_folder_inputs WHERE actor_user_id=$1 AND expires_at>NOW()',[userId])).rowCount)throw Error('Сначала завершите текущую правку или /cancel.');
+ await pool.query(`INSERT INTO ep_editorial_inputs(actor_user_id,kind,target_id,nonce,expected_revision,body) VALUES($1,$2,$3,$4,$5,$6::jsonb)
+ ON CONFLICT(actor_user_id) DO UPDATE SET kind=EXCLUDED.kind,target_id=EXCLUDED.target_id,nonce=EXCLUDED.nonce,expected_revision=EXCLUDED.expected_revision,body=EXCLUDED.body,expires_at=NOW()+INTERVAL '30 minutes'`,[userId,kind,id,newEditNonce(),revision,JSON.stringify(body)]);
+}
+async function editorialPublishedAccess(id,userId){
+ const data=await publishedTarget(id,userId,false);if(!data||data.target.publication.status!=='published')return null;
+ const a=await channelAccess(data.target.channel_id,userId,data.target.capability);if(!a||!memberCanPublish(a.member))return null;
+ if(!a.owner&&data.target.capability==='create'&&String(data.target.row.author_user_id)!==String(userId))return null;
+ return {...data,writeAccess:a};
+}
+async function handleEditorialCallback(update){
+ const m=(update.callback?.payload||'').match(/^(wr|wi|we|wc|wl)_([0-9]+)$/);if(!m)return false;
+ const user=update.callback.user.user_id,id=m[2];await answerCallback(update.callback.callback_id);
+ try{
+  if(m[1]==='wr'){
+   const r=await crossRoute(id,user);if(!r)throw Error('Связка недоступна.');
+   await editorialBegin(user,'rules',id,Number(r.revision));
+   const q=r.rules||{};
+   await sendToUser(user,{text:'Правила для «'+r.title+'». Пришлите настройки одним сообщением. Можно оставить только нужные строки.\n\nИскать: первая фраза; вторая фраза\nИсключить: реклама; розыгрыш\nЗаменить: старая ссылка => новая ссылка\nДубли: да\n\n«Искать» — достаточно одной фразы. «Исключить» — любая фраза останавливает перенос. Замены точные, с учётом регистра; их может быть несколько. «Дубли» удерживает похожие новости для проверки.\n\nТекущие настройки:\n'+(q.include?.length?'Искать: '+q.include.join('; ')+'\n':'')+(q.exclude?.length?'Исключить: '+q.exclude.join('; ')+'\n':'')+(q.replace||[]).map(x=>'Заменить: '+x.from+' => '+x.to).join('\n')+'\nДубли: '+(q.duplicates?'да':'нет')+'\n\nНовые настройки заменят прежние и применятся к новым материалам. «сброс» отключит все правила. /cancel — отмена.'});
+  }else if(m[1]==='wi'){
+   const item=(await pool.query("SELECT * FROM ep_cross_items WHERE id=$1 AND state='failed' AND post_id IS NULL",[id])).rows[0];
+   if(!item||!await crossRoute(item.route_id,user))throw Error('Материал недоступен.');
+   await editorialBegin(user,'item',id);await notify(user,'Пришлите исправленный текст (до 4000 символов). Вложения сохраняются. При неподдерживаемом вложении отправка всё равно будет удержана. /cancel — отмена.\n\n'+(item.edited_text??item.original).slice(0,3000));
+  }else if(m[1]==='wl'){
+   const item=(await pool.query("SELECT * FROM ep_cross_items WHERE id=$1 AND state='failed' AND post_id IS NULL",[id])).rows[0];
+   const route=item&&await crossRoute(item.route_id,user);if(!route||!item.related_publication)throw Error('Материал недоступен.');
+   const pub=(await pool.query("SELECT * FROM ep_publications WHERE id=$1 AND channel_id=$2 AND status='published'",[item.related_publication,route.channel_id])).rows[0];
+   if(!pub)throw Error('Предыдущая публикация уже недоступна.');
+   const channel=await getChannel(route.channel_id);
+   const reply=await maxRequest('/messages?message_ids='+encodeURIComponent(pub.message_id),'GET');
+   const original=reply.messages?.find(x=>x.body?.mid===pub.message_id&&String(x.recipient?.chat_id)===String(channel.max_chat_id));
+   const link=verifiedMaxPostLink(original?.url);if(!link)throw Error('MAX не вернул ссылку на этот пост. Откройте предыдущую публикацию и скопируйте ссылку вручную в правку текста.');
+   const current=item.edited_text??item.original;
+   const text=current.includes(link)?current:current+'\n\nРанее сообщали → '+link;
+   if(text.length>4000)throw Error('Со ссылкой текст длиннее 4000 символов. Сначала сократите его через «Править текст».');
+   await pool.query("UPDATE ep_cross_items SET edited_text=$2 WHERE id=$1 AND state='failed' AND post_id IS NULL",[id,text]);
+   await notify(user,'Ссылка добавлена. Материал остаётся на проверке; «Повторить» передаст его в обработку.');await crossItems(route.id,user);
+  }else if(m[1]==='we'){
+   const data=await editorialPublishedAccess(id,user);if(!data)throw Error('Нет прав на редактирование публикации.');
+   if(data.target.policy?.status==='deleting')throw Error('Пост уже удаляется.');
+   const pub=data.target.publication;await editorialBegin(user,'published',id,Number(pub.edit_revision),pub.body_snapshot);
+   await notify(user,'Пришлите полный новый текст опубликованного поста, включая нужную подпись (до 4000 символов). Фото, видео и кнопки сохранятся. Затем покажу предпросмотр. /cancel — отмена.');
+  }else{
+   const session=await editorialInput(user);if(!session||session.kind!=='published_ready'||String(session.target_id)!==String(id))throw Error('Предпросмотр устарел. Откройте редактирование заново.');
+   const data=await editorialPublishedAccess(id,user);if(!data||Number(data.target.publication.edit_revision)!==Number(session.expected_revision)||data.target.policy?.status==='deleting')throw Error('Права или публикация изменились.');
+   const pub=data.target.publication;
+   const claimed=await pool.query(`INSERT INTO ep_publication_edits(nonce,publication_id,actor_user_id,before_body,after_body,state)
+    VALUES($1,$2,$3,$4::jsonb,$5::jsonb,'sending') ON CONFLICT DO NOTHING RETURNING nonce`,[session.nonce,id,user,JSON.stringify(pub.body_snapshot),JSON.stringify(session.body)]);
+   if(!claimed.rowCount)throw Error('Эта или другая правка уже отправляется. Проверьте опубликованный пост.');
+   try{
+    const result=await queueMaxWrite('/messages?message_id='+encodeURIComponent(pub.message_id),'PUT',{text:session.body.text});
+    if(result.success!==true)throw Error('MAX не подтвердил сохранение.');
+    const c=await pool.connect();try{await c.query('BEGIN');
+     await c.query('UPDATE ep_publications SET body_snapshot=$2::jsonb,edit_revision=edit_revision+1 WHERE id=$1',[id,JSON.stringify(session.body)]);
+     const table=data.target.kind==='p'?'ep_posts':'submissions';await c.query(`UPDATE ${table} SET published_body=$2::jsonb WHERE id=$1`,[data.target.id,JSON.stringify(session.body)]);
+     await c.query("UPDATE ep_publication_edits SET state='saved' WHERE nonce=$1",[session.nonce]);
+     await c.query('DELETE FROM ep_editorial_inputs WHERE actor_user_id=$1 AND nonce=$2',[user,session.nonce]);await c.query('COMMIT');
+    }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
+    await notify(user,'Текст опубликованного поста обновлён. Вложения и дата автоудаления сохранены.');await showPublishedPost(id,user,false);
+   }catch(e){await pool.query("UPDATE ep_publication_edits SET state='needs_check',last_error=$2 WHERE nonce=$1",[session.nonce,String(e.message).slice(0,400)]);await notify(user,'Результат правки не подтверждён. Проверьте пост в канале. Автоматически повторять правку бот не будет.');}
+  }
+ }catch(e){await notify(user,e.message.slice(0,500));}return true;
+}
+async function handleEditorialMessage(message){
+ const user=message.sender.user_id,s=await editorialInput(user);if(!s)return false;
+ if(['cancel','отмена'].includes(plainCommand(message))){await pool.query('DELETE FROM ep_editorial_inputs WHERE actor_user_id=$1',[user]);await notify(user,'Правка отменена.');return true;}
+ try{
+  if(message.body.attachments?.length||message.link)throw Error('Для этой правки нужен текст одним сообщением.');
+  const text=message.body.text;if(typeof text!=='string')throw Error('Пришлите текст.');
+  if(s.kind==='rules'){
+   const r=await crossRoute(s.target_id,user);if(!r||Number(r.revision)!==Number(s.expected_revision))throw Error('Связка изменилась. Отмените ввод и откройте правила заново.');
+   const rules=parseEditorialRules(text);await pool.query('UPDATE ep_cross_routes SET rules=$2::jsonb,revision=revision+1 WHERE id=$1 AND revision=$3',[r.id,JSON.stringify(rules),s.expected_revision]);
+   await pool.query('DELETE FROM ep_editorial_inputs WHERE actor_user_id=$1 AND nonce=$2',[user,s.nonce]);await crossCard(r.id,user);
+  }else if(s.kind==='item'){
+   if(text.length>4000||!text.trim())throw Error('Текст должен содержать от 1 до 4000 символов.');
+   const i=(await pool.query('SELECT * FROM ep_cross_items WHERE id=$1',[s.target_id])).rows[0];if(!i||!await crossRoute(i.route_id,user))throw Error('Материал недоступен.');
+   await pool.query("UPDATE ep_cross_items SET edited_text=$2 WHERE id=$1 AND state='failed' AND post_id IS NULL",[i.id,text]);
+   await pool.query('DELETE FROM ep_editorial_inputs WHERE actor_user_id=$1 AND nonce=$2',[user,s.nonce]);await notify(user,'Текст сохранён для проверки. Нажмите «Повторить», когда материал готов к обработке.');await crossItems(i.route_id,user);
+  }else if(s.kind==='published'||s.kind==='published_ready'){
+   if(!text.trim()||text.length>4000)throw Error('Текст должен содержать от 1 до 4000 символов.');
+   if(!await editorialPublishedAccess(s.target_id,user))throw Error('Права изменились.');
+   const body={...s.body,text};delete body.format;
+   await pool.query("UPDATE ep_editorial_inputs SET kind='published_ready',body=$2::jsonb WHERE actor_user_id=$1 AND nonce=$3",[user,JSON.stringify(body),s.nonce]);
+   await sendToUser(user,body);await sendToUser(user,{text:'Это предпросмотр правки. Сохранить текст в уже опубликованном посте?',attachments:keyboard([[button('✅ Сохранить правку',`wc_${s.target_id}`)]])});
+  }
+ }catch(e){await notify(user,e.message.slice(0,500)+'\n/cancel — отмена.');}return true;
 }
 
 async function start() {
