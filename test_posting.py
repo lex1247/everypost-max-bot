@@ -109,6 +109,63 @@ class EditorFlowTests(unittest.IsolatedAsyncioTestCase):
         if method=='deleteMessage':return True
         self.remote+=1;return {'message_id':self.remote}
     def post(self):return self.app.editor.p.new(self.d,123,'Тест',{})
+    def command_update(self,text,actor=123,**extra):
+        return {'message':{'message_id':150,'chat':{'type':'private','id':actor},
+                           'from':{'id':actor,'first_name':'Редактор'},'text':text,**extra}}
+    async def test_max_shortcuts_open_sections_without_creating_posts(self):
+        for command,action in [('newpost','new'),('inbox','proposed'),('drafts','draft'),
+                               ('scheduled','scheduled'),('published','sent'),('channels','settings')]:
+            self.assertTrue(await self.app.editor.handle(self.command_update('/'+command)))
+            rows=self.app.editor.say.call_args.args[2]
+            self.assertEqual(rows[0][0]['callback_data'],f'ed:channel:{action}:{self.d}')
+        await self.app.editor.handle(self.command_update('/menu'))
+        self.assertIn('Создать пост',str(self.app.editor.say.call_args))
+        await self.app.editor.handle(self.command_update('/help'))
+        self.assertIn('/published — Опубликованные и автоудаление',self.app.editor.say.call_args.args[1])
+        self.assertFalse(self.s.rows('SELECT * FROM ed_posts'))
+        self.assertFalse(self.s.rows('SELECT * FROM deliveries'))
+    async def test_shortcuts_keep_an_unfinished_edit_until_cancel(self):
+        post=self.post();session={'action':'text','post':post['id'],'revision':post['revision']}
+        self.app.editor.p.session(123,session)
+        for command in ('/drafts','/menu','/help'):
+            await self.app.editor.handle(self.command_update(command))
+            self.assertEqual(self.app.editor.p.session(123),session)
+            self.assertEqual(self.app.editor.p.post(post['id'])['text'],'Тест')
+        await self.app.editor.handle(self.command_update('/cancel'))
+        self.assertFalse(self.app.editor.p.session(123))
+        self.assertEqual(self.app.editor.p.post(post['id'])['state'],'draft')
+        await self.app.editor.handle(self.command_update('/drafts@EveryPost_bot'))
+        self.assertEqual(self.app.editor.say.call_args.args[2][0][0]['callback_data'],f'ed:channel:draft:{self.d}')
+    async def test_shortcut_does_not_expose_channels_to_subscribers(self):
+        proposal={'action':'proposal','destination':self.d};self.app.editor.p.session(456,proposal)
+        for command in ('/channels','/drafts','/inbox','/help'):
+            await self.app.editor.handle(self.command_update(command,actor=456))
+            self.assertEqual(self.app.editor.p.session(456),proposal)
+            self.assertNotIn(f'ed:channel:',str(self.app.editor.say.call_args))
+        self.assertFalse(self.s.rows('SELECT * FROM ed_posts'))
+    async def test_command_for_another_bot_is_ignored(self):
+        session={'action':'new','destination':self.d};self.app.editor.p.session(123,session)
+        await self.app.editor.handle(self.command_update('/cancel@another_bot'))
+        self.assertEqual(self.app.editor.p.session(123),session)
+        self.app.editor.say.assert_not_called()
+    async def test_forwarded_command_and_caption_remain_post_content(self):
+        self.app.editor.p.session(123,{'action':'new','destination':self.d})
+        await self.app.editor.handle(self.command_update('/drafts',forward_origin={'type':'user'}))
+        self.assertEqual(self.s.rows('SELECT text FROM ed_posts')[0]['text'],'/drafts')
+        self.app.editor.p.session(123,{'action':'new','destination':self.d})
+        update=self.command_update('');update['message'].pop('text')
+        update['message'].update(caption='/channels',photo=[{'file_id':'photo','width':80,'height':80}])
+        await self.app.editor.handle(update)
+        self.assertEqual(self.s.rows('SELECT text FROM ed_posts ORDER BY id DESC')[0]['text'],'/channels')
+        self.assertFalse(self.s.rows('SELECT * FROM deliveries'))
+    async def test_cancel_shortcut_invalidates_open_calendar_without_changing_schedule(self):
+        post=self.post();post=self.app.editor.p.change(post,123,state='scheduled',publish_at=time.time()+3600)
+        await self.app.editor.calendar(123,post,'schedule')
+        row=self.s.rows('SELECT * FROM ed_calendar')[0]
+        await self.app.editor.handle(self.command_update('/cancel'))
+        result=await calendar_action(self.app.editor,'save',{'initData':signed(),'nonce':row['nonce'],'mode':'schedule'})
+        self.assertEqual(result['state'],'cancelled')
+        self.assertEqual(self.app.editor.p.post(post['id'])['publish_at'],post['publish_at'])
     async def test_unknown_user_and_stale_callbacks_cannot_publish(self):
         p=self.post()
         with self.assertRaises(ValueError): await self.app.editor.callback(456,f"ed:publish:{p['id']}:1")

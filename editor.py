@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -12,6 +13,15 @@ from posting import (Posting, EDITABLE, packed, own_media, message_text, styled,
 LABELS = {'draft': 'Черновик', 'proposed': 'Предложено', 'held': 'Нужна проверка', 'scheduled': 'Отложен',
           'queued': 'В очереди', 'sent': 'Опубликован', 'deleted': 'Удалён', 'cancelled': 'Отменён',
           'failed': 'Ошибка', 'unknown': 'Проверь канал'}
+
+# Names, descriptions and order match the live MAX bot's /me command list.
+QUICK_COMMANDS = (
+    ('menu', 'Главное меню'), ('newpost', 'Создать пост'), ('inbox', 'Предложки'),
+    ('drafts', 'Черновики'), ('scheduled', 'Отложенные'),
+    ('published', 'Опубликованные и автоудаление'), ('channels', 'Мои каналы'),
+    ('cancel', 'Отменить текущий ввод'), ('help', 'Помощь и команды'))
+QUICK_DESTINATIONS = {'newpost': 'new', 'inbox': 'proposed', 'drafts': 'draft',
+                      'scheduled': 'scheduled', 'published': 'sent', 'channels': 'settings'}
 
 
 def button(text, data):
@@ -71,10 +81,40 @@ class Editor:
         if not self.available(actor):
             return await self.say(actor, 'Для предложки открой ссылку из канала. Для управления каналом владелец должен добавить тебя администратором бота.')
         return await self.say(actor, 'Постинг\nВыбери действие.', [
-            [button('✍️ Создать пост', 'choose:new')],
-            [button('📝 Черновики', 'choose:draft'), button('📨 Предложка', 'choose:proposed')],
-            [button('🗓 Отложенные', 'choose:scheduled'), button('✅ Опубликованные', 'choose:sent')],
-            [button('⚙️ Каналы и оформление', 'choose:settings')]])
+            [button('➕ Создать пост', 'choose:new')],
+            [button('📝 Черновики', 'choose:draft'), button('🕒 Отложенные', 'choose:scheduled')],
+            [button('📥 Предложки', 'choose:proposed'), button('📁 Мои каналы', 'choose:settings')],
+            [button('📤 Опубликованные', 'choose:sent')]])
+
+    async def quick_command(self, actor, action):
+        session = self.p.session(actor)
+        if action == 'help':
+            return await self.say(actor, 'EveryPost · Быстрые команды\n\n' +
+                '\n'.join('/'+name+' — '+description for name,description in QUICK_COMMANDS) +
+                '\n\nВ каждом разделе выбери канал Telegram или MAX. '
+                'Кнопки источников и режима ИИ остаются под полем сообщения. '
+                'Для предложки открой персональную ссылку из канала.')
+        if action == 'cancel':
+            # Cancelling an input does not change a saved draft or its schedule.
+            if session and session.get('action') == 'time':
+                self.s.run('UPDATE ed_calendar SET receipt=? WHERE actor=? AND post=? AND revision=? AND receipt=?',
+                    (packed({'ok':True,'state':'cancelled','message':'Выбор времени отменён.'}),
+                     actor,session['post'],session['revision'],''))
+            return await self.home(actor)
+        if session and session.get('action') != 'proposal':
+            return await self.say(actor, 'Сначала заверши текущий ввод или отправь /cancel. '
+                'Текущая правка не потеряна.', [[button('Отменить ввод', 'home')]])
+        if not self.available(actor):
+            if actor == self.app.owner:
+                return await self.say(actor, 'Сначала подключи канал кнопкой «Добавить назначение» или командой /destination.')
+            return await self.say(actor, 'Нет доступных каналов. Для управления владелец должен '
+                'добавить тебя администратором бота. Для предложки используй ссылку из канала.')
+        self.p.session(actor, {})
+        if actor == self.app.owner:
+            self.s.set('wizard', '')
+        if action == 'menu':
+            return await self.home(actor)
+        return await self.choose(actor, QUICK_DESTINATIONS[action])
 
     async def choose(self, actor, action):
         rows = [[button(f"{c['title'][:40]} · {c['platform'].upper()}", f"channel:{action}:{c['id']}")] for c in self.available(actor)]
@@ -376,22 +416,34 @@ class Editor:
             except Exception: pass
             await self.callback(actor,callback['data']);return True
         text=message.get('text','').strip()
-        if text=='/id': await self.say(actor,f'Твой ID: {actor}');return True
-        if text.startswith('/start propose_'):
+        forwarded = bool(message.get('forward_origin') or message.get('forward_date'))
+        # Only a plain, unforwarded command navigates. Captions and forwarded posts remain material.
+        plain = not forwarded and not any(message.get(k) for k in ('photo','video','document','audio','animation','media_group_id'))
+        match = re.fullmatch(r'/([a-z_]+|отмена)(?:@([a-z0-9_]+))?', text, re.I) if plain else None
+        if match:
+            target=match[2]
+            expected=(os.getenv('EXPECTED_TG_BOT_USERNAME') or 'EveryPost_bot').lstrip('@').lower()
+            if target and target.lower()!=expected:
+                return True
+            action={'start':'menu','posting':'menu','new':'newpost','отмена':'cancel'}.get(match[1].lower(),match[1].lower())
+            if action in dict(QUICK_COMMANDS):
+                await self.quick_command(actor,action);return True
+        if plain and text=='/id': await self.say(actor,f'Твой ID: {actor}');return True
+        if not forwarded and text.startswith('/start propose_'):
             code=text.split('propose_',1)[1]
             found=self.s.rows('SELECT destination FROM ed_channels WHERE code=?',(code,))
             if not found: raise ValueError('Ссылка предложки устарела.')
             destination=found[0]['destination'];self.p.session(actor,{'action':'proposal','destination':destination})
             await self.say(actor,'Предложка канала «'+self.p.channel(destination)['title']+'».\nПришли текст, фото, видео или один альбом. Редактор проверит материал перед публикацией.');return True
-        if text in ('Постинг','/menu','/posting') or (text.startswith('/start') and actor!=self.app.owner):
+        if not forwarded and (text=='Постинг' or (text.startswith('/start') and actor!=self.app.owner)):
             await self.home(actor);return True
-        if text in ('/cancel','Отмена') and self.p.session(actor):
+        if not forwarded and text=='Отмена' and self.p.session(actor):
             await self.home(actor);return True
-        if actor==self.app.owner and (text.startswith('/') or text in {'Добавить источник','Добавить назначение','Связать','Мои настройки','Режим публикации','Пауза','Продолжить','Помощь','Проверить канал'}):
+        if not forwarded and actor==self.app.owner and (text.startswith('/') or text in {'Добавить источник','Добавить назначение','Связать','Мои настройки','Режим публикации','Пауза','Продолжить','Помощь','Проверить канал'}):
             self.p.session(actor,{})
             return False
         session=self.p.session(actor)
-        if session and not text.startswith('/'):
+        if session and (forwarded or not text.startswith('/')):
             if message.get('media_group_id') and session.get('action') in ('new','proposal','replace'):
                 self.s.run('INSERT INTO ed_albums VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING',
                     (actor,str(message['media_group_id']),message['message_id'],packed(message),packed(session),time.time()))
