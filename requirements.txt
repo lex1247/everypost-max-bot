@@ -5,3 +5,4 @@ python-dotenv>=1,<2
 beautifulsoup4>=4.12,<5
 aiohttp>=3.10,<4
 psycopg[binary]>=3.2,<4
+Pillow>=11.3,<13

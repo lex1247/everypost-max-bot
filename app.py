@@ -749,6 +749,9 @@ class App:
             data = await self.telegram_file(photo)
         else:
             data = await self.reader_photo(photo)
+        if data[:4]==b'RIFF' and data[8:12]==b'WEBP':
+            from normalize_photo import normalize_webp
+            return await asyncio.to_thread(normalize_webp,data)
         if data.startswith(b'\xff\xd8\xff'):
             return ('photo.jpg', data, 'image/jpeg')
         if data.startswith(b'\x89PNG\r\n\x1a\n'):
