@@ -8,7 +8,7 @@ def photo_url(value):
         raise ValueError('Не удалось прочитать ссылку фотографии.')
     url = urlparse(value)
     host = (url.hostname or '').lower()
-    allowed = ('telesco.pe', 'telegram-cdn.org', 'userapi.com', 'vkuser.net', 'vk-cdn.net', 'vkuserphoto.ru')
+    allowed = ('telesco.pe', 'telegram-cdn.org', 'userapi.com', 'vkuser.net', 'vk-cdn.net', 'vkuserphoto.ru', 'static1.trustat.ru')
     if (url.scheme != 'https' or url.username or url.password or url.port not in (None, 443)
             or not any(host == domain or host.endswith('.' + domain) for domain in allowed)):
         raise ValueError('Фотография получена с неподдерживаемого адреса. Пост сохранён для проверки.')
@@ -151,3 +151,4 @@ def publication_parts(platform, text, media):
     else:
         raise ValueError('Неподдерживаемая площадка публикации.')
     return result
+
