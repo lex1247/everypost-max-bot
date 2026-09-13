@@ -84,6 +84,8 @@ async def calendar_action(editor, action, body):
 
 def create_web(app):
     server=web.Application(client_max_size=2*1024*1024)
+    from max_bridge import install
+    install(server, app)
     async def health(request):
         # A standby revision is healthy; the old revision can release the worker lock during cutover.
         app.s.rows('SELECT 1')
@@ -188,3 +190,4 @@ async def cloud_worker(app):
     finally:
         for job in jobs: job.cancel()
         await asyncio.gather(*jobs,return_exceptions=True)
+
