@@ -7,6 +7,7 @@ import re
 import time
 from aiohttp import web
 from core import source_link
+from trustat_source import Trustat, TrustatError
 from media import normal_media
 from local_model import publishing_enabled, RewriteUnavailable
 
@@ -27,6 +28,10 @@ def authenticate(raw, stamp, signature):
 
 async def action(app, data):
     operation = data.get('action')
+    if operation in ('trustat_resolve','trustat_fetch'):
+        provider=Trustat(app)
+        if operation=='trustat_resolve':return await provider.resolve(data.get('source'))
+        return await provider.fetch(data.get('source'),data.get('peer'),data.get('cursor'))
     if operation in ('resolve', 'fetch'):
         platform, username = source_link(data.get('source', ''))
         if platform != 'tg':
@@ -75,6 +80,8 @@ def install(server, app):
                 raise ValueError('Некорректный запрос.')
             result = await action(app, data)
             return web.json_response({'ok': True, **result})
+        except TrustatError as exc:
+            return web.json_response({'ok':False,'message':str(exc),'pause':exc.pause,'retry_after':exc.retry_after},status=422 if exc.pause else 503)
         except ValueError as exc:
             return web.json_response({'ok': False, 'message': str(exc)[:500]}, status=422)
         except Exception:
