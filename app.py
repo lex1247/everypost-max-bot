@@ -14,7 +14,8 @@ from local_model import (LocalModel, RewriteUnavailable, uses_local_model, publi
                          mode_description, managed_local_server, local_base_url)
 from free_cloud import FreeCloud, uses_free_cloud
 from max_transport import max_ssl_context
-from media import normal_media, photo_url, publication_parts, vk_media
+from max_source import MaxSource, choose as choose_max_source
+from media import normal_media, photo_url, publication_parts, vk_media, trustat_video_url
 
 WELCOME = 'Выбери действие кнопкой ниже. Сначала добавь свой канал, затем источник постов.'
 SOURCE_PROMPT = 'Пришли ссылку на открытый Telegram-канал, откуда брать новые посты.'
@@ -146,12 +147,16 @@ class App:
                     rows.append([{'text': 'Проверить канал'}])
                 rows.append([{'text': 'Отмена'}])
                 keyboard = {'keyboard': rows, 'resize_keyboard': True}
+            elif self.s.get('wizard') == '/max_source_choice':
+                rows=[[{'text':'MAX: '+str(c['id'])+' · '+c['title'][:35]}] for c in json.loads(self.s.get('max_source_choices','[]'))]
+                keyboard={'keyboard':[*rows,[{'text':'Отмена'}]],'resize_keyboard':True}
             elif self.s.get('wizard') in ('/choose_source', '/choose_destination'):
                 choosing_source = self.s.get('wizard') == '/choose_source'
                 table = 'sources' if choosing_source else 'destinations'
                 label = 'Источник' if choosing_source else 'Канал'
+                only_tg=not choosing_source and self.s.rows("SELECT 1 FROM sources WHERE id=? AND platform='max'",(int(self.s.get('route_source','0')),))
                 rows = [[{'text': f"{label} {r['id']}: {r['title'][:50]}"}]
-                        for r in self.s.rows('SELECT id,title FROM ' + table + ' ORDER BY id')]
+                        for r in self.s.rows('SELECT id,title FROM ' + table + (" WHERE platform='tg'" if only_tg else '') + ' ORDER BY id')]
                 keyboard = {'keyboard': [*rows, [{'text': 'Отмена'}]], 'resize_keyboard': True}
             elif self.s.get('wizard') == '/mode_route':
                 rows = [[{'text': f"Связка {r['source']} → {r['destination']}: {r['source_title'][:22]} → {r['title'][:22]}"}]
@@ -331,6 +336,16 @@ class App:
             return f"Источник «{title}» подключён к каналу «{destination['title']}».\n{mode}"
         return f'Источник «{title}» добавлен. Нажми «Связать» и выбери, куда направлять новые посты.'
 
+    def validate_reverse_route(self,sid,did):
+        source=self.s.rows('SELECT * FROM sources WHERE id=?',(sid,))[0]
+        dest=self.s.rows('SELECT * FROM destinations WHERE id=?',(did,))[0]
+        if source['platform']=='max':
+            if dest['platform']!='tg':raise ValueError('Для MAX-источника выберите Telegram-канал.')
+            if self.s.rows("SELECT 1 FROM sources WHERE platform='tg' AND remote=?",(dest['remote'],)):
+                raise ValueError('Этот Telegram-канал уже источник. Обратное копирование создаст цикл.')
+        if dest['platform']=='max' and self.s.rows("SELECT 1 FROM sources WHERE platform='max' AND remote=?",(dest['remote'],)):
+            raise ValueError('MAX-канал уже подключён как источник. Обратное копирование запрещено.')
+
     def choose_route(self):
         sources = self.s.rows('SELECT id,title FROM sources ORDER BY id')
         if not sources:
@@ -403,6 +418,13 @@ class App:
 
     async def command(self, text):
         text = text.strip()
+        if text in ('/maxsources','/start maxsources'):return await choose_max_source(self)
+        if self.s.get('wizard')=='/max_source_choice' and text.startswith('MAX: '):
+            selected=text.split()[1]
+            if selected not in [str(c['id']) for c in json.loads(self.s.get('max_source_choices','[]'))]:raise ValueError('Выбор устарел.')
+            sid,title=await MaxSource(self).add(selected)
+            self.s.set('route_source',sid);self.s.set('wizard','/choose_destination')
+            return 'Источник «'+title+'» подключён. Выберите Telegram-канал назначения. В MAX бот-администратор обязателен для доступа к постам.'
         buttons = {'Добавить источник': ('/source', SOURCE_PROMPT),
                    'Добавить назначение': ('/destination', DESTINATION_PROMPT)}
         if text in buttons:
@@ -470,7 +492,9 @@ class App:
             destination = self.s.rows('SELECT title FROM destinations WHERE id=?', (did,))
             if not source or not destination:
                 return 'Канал или источник не найден. Нажми «Связать» и выбери заново.'
+            self.validate_reverse_route(sid,did)
             self.s.run('INSERT OR IGNORE INTO routes VALUES(?,?)', (sid, did))
+            if self.s.rows("SELECT 1 FROM sources WHERE id=? AND platform='max'",(sid,)):self.s.set_route_mode(sid,did,'original')
             self.s.set('wizard', '')
             return f"Связь создана: «{source[0]['title']}» → «{destination[0]['title']}»."
         if cmd == '/source' and len(args) == 1:
@@ -493,7 +517,9 @@ class App:
                 raise ValueError('Нет такого источника или назначения. Смотри /list.')
             with self.s.db:
                 if cmd == '/route':
+                    self.validate_reverse_route(sid,did)
                     self.s.db.execute('INSERT OR IGNORE INTO routes VALUES(?,?)', (sid, did))
+                    if self.s.rows("SELECT 1 FROM sources WHERE id=? AND platform='max'",(sid,)):self.s.set_route_mode(sid,did,'original')
                 else:
                     self.s.db.execute('DELETE FROM routes WHERE source=? AND destination=?', (sid, did))
                     self.s.db.execute("UPDATE deliveries SET status='cancelled' WHERE destination=? AND post IN (SELECT id FROM posts WHERE source=?) AND status IN ('pending','failed')", (did, sid))
@@ -623,6 +649,8 @@ class App:
 
     async def fetch(self, source):
         posts, cursor = [], source['cursor']
+        if source['platform'] == 'max':
+            await MaxSource(self).fetch(source);return
         if source['platform'] == 'tg':
             public_name = self.s.get('tg_public:' + source['remote'])
             if public_name:
@@ -727,6 +755,16 @@ class App:
             return ('photo.png', data, 'image/png')
         raise ValueError('Формат фотографии пока не поддерживается; нужен JPEG или PNG. Пост сохранён для проверки.')
 
+    async def trustat_video_file(self,item):
+        data=bytearray()
+        async with self.http.stream('GET',trustat_video_url(item['url']),follow_redirects=False,timeout=60) as response:
+            if response.status_code!=200:raise ValueError('Trustat не отдал файл видео. Материал сохранён.')
+            async for chunk in response.aiter_bytes():
+                data.extend(chunk)
+                if len(data)>20_000_000:raise ValueError('Видео больше 20 МБ. Нужна ручная публикация.')
+        if data[4:8]!=b'ftyp':raise ValueError('Trustat вернул не MP4. Материал сохранён.')
+        return bytes(data)
+
     async def telegram_file(self, item):
         metadata = await self.tg('getFile', file_id=item['tg_file_id'])
         if metadata.get('file_size', 0) > 20_000_000:
@@ -783,7 +821,7 @@ class App:
         for item in [*part.get('photos', []), *part.get('items', [])]:
             kind = 'video' if item.get('type') == 'video' else 'image'
             if kind == 'video':
-                data = await self.telegram_file(item)
+                data = await self.trustat_video_file(item) if 'url' in item else await self.telegram_file(item)
                 if data[4:8] != b'ftyp':
                     raise ValueError('Для переноса видео в MAX нужен формат MP4.')
                 file_data = ('video.mp4', data, 'video/mp4')
@@ -1050,3 +1088,4 @@ if __name__ == '__main__':
         pass
     except Exception as exc:
         raise SystemExit('Бот остановлен: ' + safe_error(exc)) from None
+

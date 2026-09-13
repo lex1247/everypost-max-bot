@@ -8,6 +8,7 @@ import time
 from aiohttp import web
 from core import source_link
 from trustat_source import Trustat, TrustatError
+from vk_source import VKSource
 from media import normal_media
 from local_model import publishing_enabled, RewriteUnavailable
 
@@ -28,6 +29,10 @@ def authenticate(raw, stamp, signature):
 
 async def action(app, data):
     operation = data.get('action')
+    if operation in ('vk_resolve','vk_fetch'):
+        provider=VKSource(app)
+        if operation=='vk_resolve':return await provider.resolve(data.get('source'))
+        return await provider.fetch(data.get('source'),data.get('peer'),data.get('cursor'))
     if operation in ('trustat_resolve','trustat_fetch'):
         provider=Trustat(app)
         if operation=='trustat_resolve':return await provider.resolve(data.get('source'))
@@ -52,9 +57,9 @@ async def action(app, data):
         if not isinstance(text, str) or len(text) > 30000 or mode not in ('original', 'ai'):
             raise ValueError('Некорректный текст или режим обработки.')
         media = normal_media(data.get('media'))
-        if media['unsupported'] or media.get('gallery'):
+        if media['unsupported']:
             raise ValueError('В источнике есть неподдерживаемое вложение. Материал сохранён для проверки.')
-        if len(media['photos']) > 12:
+        if len(media['photos'])+len(media.get('gallery',[])) > 12:
             raise ValueError('В материале больше 12 фотографий. Нужна ручная правка.')
         if mode == 'ai' and text.strip():
             if not publishing_enabled():
@@ -63,7 +68,7 @@ async def action(app, data):
         if len(text.encode('utf-16-le'))//2 > 4000:
             raise ValueError('Текст длиннее 4000 символов. Материал сохранён целиком.')
         _, body, _ = await app.prepare_part('max', None,
-            {'kind': 'max', 'text': text, 'photos': media['photos']})
+            {'kind': 'max', 'text': text, 'photos': media['photos'], 'items':media.get('gallery',[])})
         return {'body': body}
     raise ValueError('Неизвестное действие кросспостинга.')
 

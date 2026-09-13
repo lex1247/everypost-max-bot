@@ -127,11 +127,19 @@ def post_media(post):
     if not media:
         if not str(post.get('text') or '').strip():result['unsupported'].append('пустая карточка Trustat; нужна проверка')
         return result
-    if isinstance(media,dict) and media.get('media_type')=='mediaPhoto' and isinstance(media.get('file_url'),str):
-        from media import photo_url
-        try:result['photos'].append({'url':photo_url(media['file_url'])})
-        except ValueError:result['unsupported'].append('фотография Trustat с неподдерживаемого адреса')
-    else:
-        # Video thumbnails must never be substituted for the video itself.
-        result['unsupported'].append('Trustat не предоставил поддерживаемый файл вложения; нужна проверка')
+    from media import photo_url,trustat_video_url
+    entries=media if isinstance(media,list) else [media]
+    gallery=[]
+    for item in entries:
+        try:
+            if not isinstance(item,dict):raise ValueError()
+            url=item.get('file_url')
+            if item.get('media_type')=='mediaPhoto' and isinstance(url,str):
+                gallery.append({'type':'photo','url':photo_url(url)})
+            elif item.get('media_type')=='mediaDocument' and item.get('mime_type')=='video/mp4' and isinstance(url,str):
+                gallery.append({'type':'video','url':trustat_video_url(url)})
+            else:raise ValueError()
+        except ValueError:result['unsupported'].append('Trustat не предоставил поддерживаемый файл вложения; нужна проверка')
+    if len(gallery)==1 and gallery[0]['type']=='photo':result['photos']=[{'url':gallery[0]['url']}]
+    elif gallery:result['gallery']=gallery
     return result

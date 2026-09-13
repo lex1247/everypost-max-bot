@@ -8,10 +8,18 @@ def photo_url(value):
         raise ValueError('Не удалось прочитать ссылку фотографии.')
     url = urlparse(value)
     host = (url.hostname or '').lower()
-    allowed = ('telesco.pe', 'telegram-cdn.org', 'userapi.com', 'vkuser.net', 'vk-cdn.net', 'vkuserphoto.ru', 'static1.trustat.ru')
+    allowed = ('telesco.pe', 'telegram-cdn.org', 'userapi.com', 'vkuser.net', 'vk-cdn.net', 'vkuserphoto.ru', 'static1.trustat.ru', 'i.oneme.ru')
     if (url.scheme != 'https' or url.username or url.password or url.port not in (None, 443)
             or not any(host == domain or host.endswith('.' + domain) for domain in allowed)):
         raise ValueError('Фотография получена с неподдерживаемого адреса. Пост сохранён для проверки.')
+    return value
+
+
+def trustat_video_url(value):
+    if not isinstance(value,str):raise ValueError('Некорректная ссылка видео.')
+    u=urlparse(value)
+    if u.scheme!='https' or u.hostname!='static1.trustat.ru' or u.username or u.password or u.port not in (None,443):
+        raise ValueError('Неподдерживаемый адрес видео Trustat.')
     return value
 
 
@@ -52,6 +60,10 @@ def normal_media(value):
             raise ValueError('Некорректный альбом.')
         result['gallery'] = []
         for item in gallery:
+            if isinstance(item,dict) and item.get('type') in ('photo','video') and 'url' in item:
+                validator=trustat_video_url if item['type']=='video' else photo_url
+                result['gallery'].append({'type':item['type'],'url':validator(item['url']),'spoiler':bool(item.get('spoiler'))})
+                continue
             if (not isinstance(item, dict) or item.get('type') not in ('photo', 'video')
                     or not isinstance(item.get('tg_file_id'), str) or not 1 <= len(item['tg_file_id']) <= 1024):
                 raise ValueError('Некорректное вложение Telegram.')
@@ -113,6 +125,7 @@ def publication_parts(platform, text, media):
             raise ValueError('Смешанные способы хранения вложений не поддерживаются.')
         gallery = media['gallery']
         if platform == 'tg':
+            if any('url' in x for x in gallery):raise ValueError('Этот источник медиа подготовлен для MAX.')
             caption = text if utf16_len(text) <= 1024 else ''
             parts = [{'kind': 'gallery', 'items': gallery[i:i+10], 'caption': caption if i == 0 else ''}
                      for i in range(0, len(gallery), 10)]

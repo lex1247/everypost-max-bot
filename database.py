@@ -2,7 +2,7 @@
 import re
 import sqlite3
 
-IDENTITIES = {'sources', 'destinations', 'posts', 'deliveries', 'ed_posts', 'ed_deletions'}
+IDENTITIES = {'sources', 'destinations', 'posts', 'deliveries', 'ed_posts', 'ed_deletions', 'max_source_messages'}
 SCHEMA = 'repost_bot'
 
 
@@ -149,3 +149,4 @@ def columns(db, table):
     if isinstance(db, Postgres):
         return db.columns(table)
     return {row[1] for row in db.execute('PRAGMA table_info(' + table + ')')}
+
