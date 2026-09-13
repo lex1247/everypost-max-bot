@@ -2533,7 +2533,7 @@ function adminMenuBody(canCreate = true) {
       [button("📝 Черновики", "menu_drafts_0"), button("🕒 Отложенные", "menu_scheduled_all_0")],
       [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")],
       [button("📤 Опубликованные", "publist_0")],
-      [button("📂 Папки каналов", "folders_0"),button("📣 Рассылки", "multilist_0")],
+      [button("📂 Мои каналы", "folders_0"),button("📣 Рассылки", "multilist_0")],
       [button("🔁 Кросспостинг", "xc_0")]
     ])
   };
