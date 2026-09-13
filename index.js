@@ -26,7 +26,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "multipost-folders-1";
+const VERSION = "max-crosspost-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -62,7 +62,7 @@ let lastApiCall = 0;
 
 // ---------- HTTPS и API ----------
 
-function httpsRequest(url, { method = "GET", headers = {}, body, agent } = {}) {
+function httpsRequest(url, { method = "GET", headers = {}, body, agent, timeout = 12000 } = {}) {
   return new Promise((resolve, reject) => {
     const req = https.request(url, {
       method, headers, agent, rejectUnauthorized: true
@@ -81,7 +81,7 @@ function httpsRequest(url, { method = "GET", headers = {}, body, agent } = {}) {
         resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString("utf8") });
       });
     });
-    const timer = setTimeout(() => req.destroy(new Error("HTTPS request timeout")), 12000);
+    const timer = setTimeout(() => req.destroy(new Error("HTTPS request timeout")), timeout);
     req.on("error", error => { clearTimeout(timer); reject(error); });
     req.end(body);
   });
@@ -1039,6 +1039,7 @@ async function initDatabase() {
       ON CONFLICT DO NOTHING;
   `);
   await initMultiDatabase();
+  await initCrossDatabase();
   console.log("DATABASE READY");
 }
 
@@ -1166,6 +1167,7 @@ async function handleMessage(update) {
   if (chatType && chatType !== "dialog") return;
   await rememberUser(sender);
   if ((await pool.query("SELECT 1 FROM ep_command_inputs WHERE max_message_id=$1 AND handled=TRUE",[mid])).rowCount) return;
+  if (await handleCrossMessage(message)) return;
   if (await handleFolderMessage(message)) return;
   if (await handleQuickCommand(message)) return;
   const deletionForm=await getDeletionSession(sender.user_id);
@@ -1795,6 +1797,8 @@ async function handleCallback(update) {
   // Настройки доступа не меняются из групп или пересланных чужих карточек.
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
+  if (await handleCrossCallback(update)) return;
+  if(await crossForm(update.callback?.user?.user_id)){await notify(update.callback.user.user_id,"Пришлите ссылку источника или /cancel.");return;}
   if (await handleMultiCallback(update)) return;
   if (await handleDeletionCallback(update)) return;
   if (await handleStyleCallback(update)) return;
@@ -2525,12 +2529,14 @@ function adminMenuBody(canCreate = true) {
       [button("📝 Черновики", "menu_drafts_0"), button("🕒 Отложенные", "menu_scheduled_all_0")],
       [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")],
       [button("📤 Опубликованные", "publist_0")],
-      [button("📂 Папки каналов", "folders_0"),button("📣 Рассылки", "multilist_0")]
+      [button("📂 Папки каналов", "folders_0"),button("📣 Рассылки", "multilist_0")],
+      [button("🔁 Кросспостинг", "xc_0")]
     ])
   };
 }
 
 async function showAdminMenu(userId, switchMode = false) {
+  if(await crossForm(userId)){await notify(userId,"Пришлите ссылку источника или /cancel.");return;}
   const deleteForm=await getDeletionSession(userId);
   if(deleteForm){await renderDeletionLaunch(deleteForm);return;}
   const styleInput=await getStyleInput(userId);
@@ -5676,6 +5682,174 @@ async function listMultiReports(userId,page=0) {
   ])});
 }
 
+// ---------- Кросспостинг из Telegram, управление в MAX ----------
+let crossBusy=false;
+async function initCrossDatabase(){
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ep_cross_routes(
+      id BIGSERIAL PRIMARY KEY,channel_id BIGINT NOT NULL REFERENCES channels(id),actor_user_id BIGINT NOT NULL,
+      source TEXT NOT NULL,peer TEXT NOT NULL,title TEXT NOT NULL,cursor BIGINT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'original',enabled BOOLEAN NOT NULL DEFAULT FALSE,revision BIGINT NOT NULL DEFAULT 0,
+      next_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),last_error TEXT,UNIQUE(channel_id,peer));
+    CREATE TABLE IF NOT EXISTS ep_cross_inputs(actor_user_id BIGINT PRIMARY KEY,channel_id BIGINT NOT NULL,
+      nonce TEXT NOT NULL,expires_at TIMESTAMPTZ NOT NULL DEFAULT(NOW()+INTERVAL '30 minutes'));
+    CREATE TABLE IF NOT EXISTS ep_cross_items(id BIGSERIAL PRIMARY KEY,route_id BIGINT NOT NULL REFERENCES ep_cross_routes(id),
+      remote BIGINT NOT NULL,original TEXT NOT NULL,url TEXT NOT NULL,media JSONB NOT NULL,mode TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending',post_id BIGINT REFERENCES ep_posts(id),last_error TEXT,
+      next_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(route_id,remote));
+  `);
+}
+function crossUsername(value){
+  const raw=String(value||'').trim();
+  const m=raw.match(/^(?:@|https:\/\/(?:t\.me|telegram\.me)\/(?:s\/)?)([A-Za-z][A-Za-z0-9_]{3,31})\/?$/);
+  if(!m)throw new Error('Пришлите @имя или ссылку https://t.me/имя на открытый Telegram-канал, не на отдельный пост.');
+  return m[1].toLowerCase();
+}
+async function crossBridge(payload){
+  const body=JSON.stringify(payload),stamp=String(Math.floor(Date.now()/1000));
+  const key=crypto.createHmac('sha256',TOKEN).update('EveryPost MAX crosspost bridge v1').digest();
+  const signature=crypto.createHmac('sha256',key).update(stamp+'.'+body).digest('hex');
+  const response=await httpsRequest('https://everypost-telegram-bot.onrender.com/max-crosspost',{
+    method:'POST',headers:{'Content-Type':'application/json','X-EveryPost-Time':stamp,'X-EveryPost-Signature':signature},body,timeout:180000});
+  let data;try{data=JSON.parse(response.text);}catch{throw new Error('Сервис обработки запускается. Повторите через минуту.');}
+  if(response.status!==200||!data.ok){const e=new Error(data.message||'Сервис обработки недоступен. Повторите позже.');e.permanent=response.status===422;throw e;}
+  return data;
+}
+async function crossAccess(route,userId){
+  if(!route)return null;
+  const a=await channelAccess(route.channel_id,userId,'create');
+  return a?.owner?a:null;
+}
+async function crossRoute(id,userId){
+  const r=(await pool.query('SELECT * FROM ep_cross_routes WHERE id=$1',[id])).rows[0];
+  return await crossAccess(r,userId)?r:null;
+}
+async function crossMenu(userId,page=0){
+  page=pageNumber(page);
+  const channels=(await accessibleChannels(userId,'create')).filter(c=>c.access_owner);
+  const ids=channels.map(c=>String(c.id));
+  const rows=(await pool.query('SELECT * FROM ep_cross_routes WHERE channel_id=ANY($1::bigint[]) ORDER BY id LIMIT 7 OFFSET $2',[ids,page*6])).rows;
+  await sendToUser(userId,{text:'🔁 Кросспостинг из Telegram\nИсточник → ваш канал MAX. Только новые посты; архив до подключения пропускается.\nУ каждой связки свой режим. Пауза останавливает обработку источника. Уже переданные в очередь MAX посты отменяются отдельно в «Отложенных».\nФото переносятся; видео и неподдерживаемые вложения сохраняются для проверки.',attachments:keyboard([
+    ...rows.slice(0,6).map(r=>[button(`${r.enabled?'▶️':'⏸'} ${shortTitle(r.title)}`,`xr_${r.id}`)]),
+    ...(page>0?[[button('◀️ Назад',`xc_${page-1}`)]]:[]),...(rows.length>6?[[button('Далее ▶️',`xc_${page+1}`)]]:[]),
+    [button('➕ Подключить источник','xn_0')],[button('↩️ Меню','menu_main')]])});
+}
+async function crossDestinations(userId,page=0){
+  page=pageNumber(page);const cs=(await accessibleChannels(userId,'create')).filter(c=>c.access_owner);
+  await sendToUser(userId,{text:'Выберите свой MAX-канал для новых постов из Telegram. Управление автоматической публикацией доступно владельцу.',attachments:keyboard([
+    ...cs.slice(page*6,page*6+6).map(c=>[button(shortTitle(c.title),`xd_${c.id}`)]),
+    ...(page>0?[[button('◀️ Назад',`xn_${page-1}`)]]:[]),...(cs.length>page*6+6?[[button('Далее ▶️',`xn_${page+1}`)]]:[]),[button('↩️ Назад','xc_0')]])});
+}
+async function crossLegacyDuplicate(route){
+  const exists=(await pool.query("SELECT to_regclass('repost_bot.routes') AS t")).rows[0]?.t;
+  if(!exists)return false;
+  const c=await getChannel(route.channel_id);
+  return (await pool.query(`SELECT 1 FROM repost_bot.routes r JOIN repost_bot.sources s ON s.id=r.source
+    JOIN repost_bot.destinations d ON d.id=r.destination WHERE s.platform='tg' AND s.remote=$1
+    AND d.platform='max' AND d.remote=$2 LIMIT 1`,[route.peer,String(c.max_chat_id)])).rowCount>0;
+}
+async function crossCard(id,userId){
+  const r=await crossRoute(id,userId);if(!r){await notify(userId,'Связка недоступна.');return;}
+  const c=await getChannel(r.channel_id);
+  const counts=(await pool.query(`SELECT i.state,COUNT(*) n FROM ep_cross_items i WHERE route_id=$1 GROUP BY i.state`,[r.id])).rows;
+  await sendToUser(userId,{text:`🔁 ${shortTitle(r.title)} → ${shortTitle(c.title)}\nИсточник: https://t.me/${r.source}\n${r.enabled?'▶️ Включено':'⏸ На паузе'}\nРежим: ${r.mode==='ai'?'Переписать с ИИ':'Как есть'}\n`+
+    'Режим применяется к новым найденным материалам. Оформление берётся из настроек MAX-канала. Переписывание передаёт текст подключённому сервису ИИ.\n'+
+    counts.map(x=>`${({pending:'Ожидают обработки',failed:'Требуют проверки',queued:'Переданы в очередь MAX'})[x.state]||x.state}: ${x.n}`).join('\n')+
+    (r.last_error?`\n⚠️ ${r.last_error.slice(0,350)}`:''),attachments:keyboard([
+      [button(r.enabled?'⏸ Пауза':'▶️ Включить',`xe_${r.id}_${r.revision}_${r.enabled?0:1}`)],
+      [button('Как есть',`xm_${r.id}_${r.revision}_original`),button('Переписать с ИИ',`xm_${r.id}_${r.revision}_ai`)],
+      [button('⚠️ Материалы и ошибки',`xi_${r.id}_0`)],[button('🔄 Обновить',`xr_${r.id}`)],[button('↩️ Кросспостинг','xc_0')]])});
+}
+async function crossItems(id,userId,page=0){
+  const r=await crossRoute(id,userId);if(!r)return;page=pageNumber(page);
+  const rows=(await pool.query(`SELECT i.*,p.status post_status,q.status queue_status FROM ep_cross_items i
+    LEFT JOIN ep_posts p ON p.id=i.post_id LEFT JOIN ep_schedules q ON q.post_id=p.id WHERE route_id=$1 ORDER BY i.id DESC LIMIT 7 OFFSET $2`,[id,page*6])).rows;
+  const labels={published:'✅ Опубликовано',scheduled:'🕒 В очереди',paused:'⚠️ Приостановлено',needs_check:'⚠️ Проверьте канал',draft:'✏️ Черновик',failed:'⚠️ Ошибка',pending:'⏳ Обрабатывается'};
+  await sendToUser(userId,{text:'Материалы источника\n'+rows.slice(0,6).map(i=>`#${i.remote}: ${labels[i.queue_status||i.post_status||i.state]||'В обработке'}\n${i.url}\n${(i.last_error||'').slice(0,200)}`).join('\n\n'),attachments:keyboard([
+    ...rows.slice(0,6).flatMap(i=>i.state==='failed'?[[button(`Повторить #${i.remote}`,`xy_${i.id}`)]]:i.post_status==='draft'?[[button(`Править #${i.remote}`,`dopen_${i.post_id}`)]]:[]),
+    ...(page>0?[[button('◀️ Назад',`xi_${id}_${page-1}`)]]:[]),...(rows.length>6?[[button('Далее ▶️',`xi_${id}_${page+1}`)]]:[]),
+    [button('↩️ Связка',`xr_${id}`)],[button('🕒 Отложенные','menu_scheduled_all_0')]])});
+}
+async function crossForm(userId){return (await pool.query('SELECT * FROM ep_cross_inputs WHERE actor_user_id=$1 AND expires_at>NOW()',[userId])).rows[0];}
+async function handleCrossMessage(message){
+  const userId=message.sender.user_id,f=await crossForm(userId);if(!f)return false;
+  if(['cancel','отмена','menu','start'].includes(plainCommand(message))){await pool.query('DELETE FROM ep_cross_inputs WHERE actor_user_id=$1',[userId]);await crossMenu(userId);return true;}
+  if(message.link||message.body.attachments?.length){await notify(userId,'Пришлите ссылку текстом или /cancel.');return true;}
+  try{
+    if(!(await crossAccess(f,userId)))throw new Error('Права на канал изменились.');
+    const source=crossUsername(message.body.text);const info=await crossBridge({action:'resolve',source:'@'+source});
+    if(info.source!==source||!/^-[0-9]+$/.test(info.peer)||!Number.isSafeInteger(info.cursor)||info.cursor<0)throw new Error('Источник не удалось проверить.');
+    const client=await pool.connect();let route;
+    try{await client.query('BEGIN');const claimed=await client.query('DELETE FROM ep_cross_inputs WHERE actor_user_id=$1 AND nonce=$2 RETURNING *',[userId,f.nonce]);
+      if(claimed.rowCount){route=(await client.query(`INSERT INTO ep_cross_routes(channel_id,actor_user_id,source,peer,title,cursor)
+        VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(channel_id,peer) DO UPDATE SET source=EXCLUDED.source,title=EXCLUDED.title RETURNING *`,[f.channel_id,userId,source,info.peer,String(info.title).slice(0,200),info.cursor])).rows[0];}
+      await client.query('INSERT INTO ep_command_inputs(max_message_id,actor_user_id,handled) VALUES($1,$2,TRUE) ON CONFLICT(max_message_id) DO UPDATE SET handled=TRUE',[message.body.mid,userId]);await client.query('COMMIT');
+    }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+    if(route)await crossCard(route.id,userId);
+  }catch(e){await notify(userId,e.message.slice(0,500)+'\nМожно повторить ссылку или /cancel.');}return true;
+}
+async function handleCrossCallback(update){
+  const p=update.callback?.payload||'',u=update.callback?.user?.user_id;
+  const m=p.match(/^(xc|xn|xd|xr|xy)_(\d+)$/),change=p.match(/^(xe|xm)_(\d+)_(\d+)_(0|1|original|ai)$/),items=p.match(/^xi_(\d+)_(\d+)$/);
+  if(u==null||!(m||change||items))return false;
+  await answerCallback(update.callback.callback_id);
+  if(await getComposer(u)||await getEditorSession(u)||await getScheduleSession(u)||await getDeletionSession(u)||await getStyleInput(u)||
+    (await pool.query('SELECT 1 FROM ep_folder_inputs WHERE actor_user_id=$1 AND expires_at>NOW()',[u])).rowCount){await notify(u,'Сначала завершите текущую правку или /cancel.');return true;}
+  if(m){const id=m[2];if(m[1]==='xc')await crossMenu(u,Number(id));else if(m[1]==='xn')await crossDestinations(u,Number(id));
+    else if(m[1]==='xr')await crossCard(id,u);
+    else if(m[1]==='xd'){
+      if(!(await crossAccess({channel_id:id},u))){await notify(u,'Канал недоступен.');return true;}
+      await pool.query(`INSERT INTO ep_cross_inputs(actor_user_id,channel_id,nonce) VALUES($1,$2,$3) ON CONFLICT(actor_user_id)
+        DO UPDATE SET channel_id=EXCLUDED.channel_id,nonce=EXCLUDED.nonce,expires_at=NOW()+INTERVAL '30 minutes'`,[u,id,newEditNonce()]);
+      await pool.query('DELETE FROM proposal_sessions WHERE max_user_id=$1',[u]);
+      await notify(u,'Пришлите ссылку на открытый Telegram-канал или @имя. Затем выберите режим и нажмите «Включить». Отмена: /cancel.');
+    }else{const i=(await pool.query('SELECT * FROM ep_cross_items WHERE id=$1',[id])).rows[0];const r=i&&await crossRoute(i.route_id,u);if(r){await pool.query("UPDATE ep_cross_items SET state='pending',next_at=NOW(),last_error=NULL WHERE id=$1 AND state='failed' AND post_id IS NULL",[id]);await crossItems(r.id,u);}}
+  }else if(items)await crossItems(items[1],u,Number(items[2]));
+  else{const r=await crossRoute(change[2],u);if(!r)return true;
+    if(change[1]==='xe'&&change[4]==='1'&&await crossLegacyDuplicate(r)){await notify(u,'Эта связка уже настроена в Telegram-боте. Сначала отключите её там, чтобы не получать два одинаковых поста.');return true;}
+    if(change[1]==='xe'&&['0','1'].includes(change[4]))await pool.query('UPDATE ep_cross_routes SET enabled=$3,revision=revision+1,next_at=NOW() WHERE id=$1 AND revision=$2',[r.id,change[3],change[4]==='1']);
+    if(change[1]==='xm'&&['original','ai'].includes(change[4]))await pool.query('UPDATE ep_cross_routes SET mode=$3,revision=revision+1 WHERE id=$1 AND revision=$2',[r.id,change[3],change[4]]);
+    await crossCard(r.id,u);
+  }return true;
+}
+async function queueCrossItem(item,route,base){
+  const a=await crossAccess(route,route.actor_user_id);if(!a)throw new Error('Права на MAX-канал отозваны.');
+  const style=styleForChannel(a.channel);let body,error;
+  try{body=composeStyledPost(base,style);}catch(e){body=base;error=e.message;}
+  const client=await pool.connect();try{await client.query('BEGIN');
+    const r=(await client.query('SELECT * FROM ep_cross_routes WHERE id=$1 FOR UPDATE',[route.id])).rows[0];
+    const fresh=(await client.query('SELECT * FROM ep_cross_items WHERE id=$1 FOR UPDATE',[item.id])).rows[0];
+    if(!r?.enabled||String(r.revision)!==String(route.revision)||fresh?.state!=='pending'||fresh.post_id){await client.query('COMMIT');return;}
+    const p=(await client.query(`INSERT INTO ep_posts(channel_id,author_user_id,status,body,base_body,source_message,post_style,is_saved,saved_at,last_error)
+      VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,TRUE,NOW(),$8) RETURNING id`,[route.channel_id,route.actor_user_id,error?'draft':'scheduled',JSON.stringify(body),JSON.stringify(base),JSON.stringify({crosspost_source:item.url,original:item.original,media:item.media}),JSON.stringify(style),error||null])).rows[0];
+    if(!error)await client.query(`INSERT INTO ep_schedules(post_id,due_at,timezone,scheduled_by,access_version,body_snapshot) VALUES($1,NOW(),$2,$3,$4,$5::jsonb)`,[p.id,a.channel.timezone||'Europe/Moscow',route.actor_user_id,a.version,JSON.stringify(body)]);
+    await client.query("UPDATE ep_cross_items SET state='queued',post_id=$2,last_error=$3 WHERE id=$1",[item.id,p.id,error||null]);await client.query('COMMIT');
+  }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+}
+async function crossTick(){
+  if(!ready||crossBusy)return;crossBusy=true;let client,locked=false;
+  try{client=await pool.connect();locked=(await client.query('SELECT pg_try_advisory_lock(19471,2) acquired')).rows[0].acquired;if(!locked)return;
+    const item=(await pool.query(`SELECT i.* FROM ep_cross_items i JOIN ep_cross_routes r ON r.id=i.route_id
+      WHERE i.state='pending' AND i.next_at<=NOW() AND r.enabled ORDER BY i.id LIMIT 1`)).rows[0];
+    if(item){const route=(await pool.query('SELECT * FROM ep_cross_routes WHERE id=$1',[item.route_id])).rows[0];
+      try{if(!(await crossAccess(route,route.actor_user_id)))throw Object.assign(new Error('Права на канал отозваны.'),{permanent:true});
+        const prepared=await crossBridge({action:'prepare',text:item.original,media:item.media,mode:item.mode});await queueCrossItem(item,route,prepared.body);
+      }catch(e){await pool.query("UPDATE ep_cross_items SET state=$2,last_error=$3,next_at=NOW()+INTERVAL '5 minutes' WHERE id=$1 AND state='pending' AND post_id IS NULL",[item.id,e.permanent?'failed':'pending',e.message.slice(0,500)]);}
+    }
+    const route=(await pool.query('SELECT * FROM ep_cross_routes WHERE enabled AND next_at<=NOW() ORDER BY next_at,id LIMIT 1')).rows[0];
+    if(route){try{if(!(await crossAccess(route,route.actor_user_id)))throw new Error('Права на канал отозваны.');
+      const fetched=await crossBridge({action:'fetch',source:'@'+route.source,peer:route.peer,cursor:Number(route.cursor)});
+      if(!Array.isArray(fetched.posts)||fetched.posts.length>100||!Number.isSafeInteger(fetched.cursor)||fetched.cursor<Number(route.cursor))throw new Error('Некорректный ответ источника.');
+      await client.query('BEGIN');const current=(await client.query('SELECT * FROM ep_cross_routes WHERE id=$1 FOR UPDATE',[route.id])).rows[0];
+      if(current.enabled&&String(current.revision)===String(route.revision)){
+        for(const p of fetched.posts){if(!Array.isArray(p)||!Number.isSafeInteger(p[0])||p[0]<=Number(route.cursor)||p[0]>fetched.cursor||typeof p[1]!=='string')throw new Error('Некорректный материал источника.');
+          await client.query(`INSERT INTO ep_cross_items(route_id,remote,original,url,media,mode) VALUES($1,$2,$3,$4,$5::jsonb,$6) ON CONFLICT(route_id,remote) DO NOTHING`,[route.id,p[0],p[1],`https://t.me/${route.source}/${p[0]}`,JSON.stringify(p[3]),route.mode]);}
+        await client.query("UPDATE ep_cross_routes SET cursor=$2,next_at=NOW()+INTERVAL '60 seconds',last_error=NULL WHERE id=$1",[route.id,fetched.cursor]);}
+      await client.query('COMMIT');
+    }catch(e){await client.query('ROLLBACK').catch(()=>{});await pool.query("UPDATE ep_cross_routes SET last_error=$2,next_at=NOW()+INTERVAL '5 minutes' WHERE id=$1",[route.id,e.message.slice(0,500)]);}}
+  }catch(e){console.error('CROSSPOST WORKER ERROR:',e.message);}finally{if(locked)await client.query('SELECT pg_advisory_unlock(19471,2)').catch(()=>{});client?.release();crossBusy=false;}
+}
+
 async function start() {
   await initDatabase();
   ready = true;
@@ -5686,6 +5860,7 @@ async function start() {
     console.log("CALENDAR UI READY: /calendar");
   });
   setInterval(() => void runWorker(), 700).unref();
+  setInterval(() => void crossTick(), 10000).unref();
 }
 start().catch(error => {
   console.error("STARTUP ERROR:", error.message);
