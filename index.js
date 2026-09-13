@@ -26,7 +26,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "auto-delete-calendar-1";
+const VERSION = "multipost-folders-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -1038,6 +1038,7 @@ async function initDatabase() {
         AND NOT EXISTS (SELECT 1 FROM ep_publications r WHERE r.channel_id=s.channel_id AND r.message_id=s.published_mid)
       ON CONFLICT DO NOTHING;
   `);
+  await initMultiDatabase();
   console.log("DATABASE READY");
 }
 
@@ -1091,6 +1092,8 @@ async function handleStart(update) {
   const userId = update.user?.user_id;
   if (userId == null) return;
   await rememberUser(update.user);
+  const folderForm=(await pool.query('SELECT * FROM ep_folder_inputs WHERE actor_user_id=$1 AND expires_at>NOW()',[userId])).rows[0];
+  if(folderForm){await notify(userId,'Введите название папки или отправьте /cancel.');return;}
   const deleteForm=await getDeletionSession(userId);
   if(deleteForm){await renderDeletionLaunch(deleteForm);return;}
   const styleInput=await getStyleInput(userId);
@@ -1162,6 +1165,8 @@ async function handleMessage(update) {
   if (chatType === "chat") { await registerExistingGroupMessage(message); return; }
   if (chatType && chatType !== "dialog") return;
   await rememberUser(sender);
+  if ((await pool.query("SELECT 1 FROM ep_command_inputs WHERE max_message_id=$1 AND handled=TRUE",[mid])).rowCount) return;
+  if (await handleFolderMessage(message)) return;
   if (await handleQuickCommand(message)) return;
   const deletionForm=await getDeletionSession(sender.user_id);
   if(deletionForm){await notify(sender.user_id,"Открыт календарь удаления. Выберите дату в нём или отправьте /cancel. Этот текст не опубликован.");return;}
@@ -1790,6 +1795,7 @@ async function handleCallback(update) {
   // Настройки доступа не меняются из групп или пересланных чужих карточек.
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
+  if (await handleMultiCallback(update)) return;
   if (await handleDeletionCallback(update)) return;
   if (await handleStyleCallback(update)) return;
   if (await handleDiscussionCallback(update)) return;
@@ -2518,7 +2524,8 @@ function adminMenuBody(canCreate = true) {
       ...(canCreate ? [[button("➕ Создать пост", "menu_create")]] : []),
       [button("📝 Черновики", "menu_drafts_0"), button("🕒 Отложенные", "menu_scheduled_all_0")],
       [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")],
-      [button("📤 Опубликованные", "publist_0")]
+      [button("📤 Опубликованные", "publist_0")],
+      [button("📂 Папки каналов", "folders_0"),button("📣 Рассылки", "multilist_0")]
     ])
   };
 }
@@ -2603,10 +2610,12 @@ async function showChannelPicker(session, page = 0) {
   const nav = pageButtons(`cpage_${session.nonce}`, page, channels.length);
   await sendToUser(session.actor_user_id, {
     text: "➕ Создать пост\n\n" + (rows.length
-      ? "Выберите канал для публикации."
+      ? `Отметьте один или несколько каналов и нажмите «Продолжить». Выбрано: ${multiIds(current.selected_channels).length}.`
       : "Нет доступных каналов для собственных постов. Попросите владельца выдать это право."),
     attachments: keyboard([
-      ...rows.map(c => [button(shortTitle(c.title), `cpick_${session.nonce}_${c.id}`)]),
+      ...rows.map(c => [button(`${multiIds(current.selected_channels).includes(String(c.id))?'✅':'⬜'} ${shortTitle(c.title)}`, `mtoggle_${session.nonce}_${c.id}`)]),
+      [button('📂 Выбрать папку',`mf_${session.nonce}_0`)],
+      ...(multiIds(current.selected_channels).length?[[button(`Продолжить · ${multiIds(current.selected_channels).length}`,`mgo_${session.nonce}`)]]:[]),
       ...(nav.length ? [nav] : []),
       [button("↩️ Отменить создание", `ccancel_${session.nonce}`)]
     ])
@@ -2637,6 +2646,7 @@ async function beginComposer(userId) {
 }
 
 async function choosePostChannel(session, channelId) {
+  // Старые карточки одноканального выбора продолжают работать.
   const access = await channelAccess(channelId, session.actor_user_id, "create");
   const channel = access?.channel;
   if (!channel) {
@@ -2675,7 +2685,7 @@ async function sendComposerPrompt(session) {
   if (!(await canUseOwnPost(row, session.actor_user_id)) || row.status !== "draft") return;
   const editing = session.stage === "waiting_text";
   await sendToUser(session.actor_user_id, {
-    text: `➕ Пост #${row.id}\nКанал: «${shortTitle(row.title)}»\n\n` +
+    text: `➕ Пост #${row.id}\nНазначение: ${multiTitle(row)}\n\n` +
       (editing
         ? "Пришлите весь новый текст одним обычным сообщением. Он заменит текст или подпись. " +
           "Фото и видео останутся прежними."
@@ -2692,16 +2702,18 @@ async function sendComposerPrompt(session) {
 
 function ownPostControls(session, row) {
   return {
-    text: `👁 ${row.is_saved ? "Черновик" : "Новый пост"} #${row.id}\nКанал: «${shortTitle(row.title)}»\n\n` +
-      "Выше показан вариант для публикации. Он ещё не отправлен в канал.\n" + deletionTimeText(row.deletion_policy),
+    text: `👁 ${row.is_saved ? "Черновик" : "Новый пост"} #${row.id}\nНазначение: ${multiTitle(row)}\n\n` +
+      (pendingMulti(row)
+        ? "Для каждого канала показано его оформление. Неподходящие варианты сохранятся отдельно для исправления. Публикация ещё не началась.\nНастройка времени публикации и удаления применяется ко всем выбранным каналам; часовой пояс календаря показан в нём.\n"
+        : "Выше показан вариант для публикации. Он ещё не отправлен в канал.\n") + deletionTimeText(row.deletion_policy),
     attachments: keyboard([
-      [button("🚀 Опубликовать", `cpublish_${session.nonce}`),
+      [button(pendingMulti(row)?`🚀 Опубликовать в ${row.multi_targets.length} каналов`:"🚀 Опубликовать", `cpublish_${session.nonce}`),
        button("💾 Сохранить черновик", `csave_${session.nonce}`)],
       [button("✏️ Изменить текст", `ctext_${session.nonce}`),
        button("📎 Заменить материал", `creplace_${session.nonce}`)],
       [button("🕒 Отложить", `cschedule_${session.nonce}`)],
       [button(row.deletion_policy?.enabled ? "🗑 Изменить автоудаление" : "🗑 Автоудаление: выкл", `adp_${session.nonce}`)],
-      ...styleControls("p",session.nonce,row.post_style),
+      ...(!pendingMulti(row)?styleControls("p",session.nonce,row.post_style):[]),
       ...(row.is_saved ? [[button("🗑 Удалить черновик", `ddelete_${session.nonce}`)]] : []),
       [button(row.is_saved ? "↩️ Закрыть без сохранения" : "↩️ Отменить пост",
         `ccancel_${session.nonce}`)]
@@ -2721,7 +2733,9 @@ async function showOwnPostPreview(session) {
       await pool.query(`UPDATE ep_posts SET body=$2::jsonb WHERE id=$1 AND status='draft'
         AND EXISTS(SELECT 1 FROM ep_composer_sessions e WHERE e.post_id=ep_posts.id AND e.nonce=$3 AND e.stage='preview')`,
         [row.id,JSON.stringify(row.body),current.nonce]);
+      if(pendingMulti(row)) await notify(current.actor_user_id,`👁 Вариант для «${shortTitle(row.title)}»`);
       const preview = await sendToUser(current.actor_user_id, row.body);
+      await showMultiPreviews(row,current.actor_user_id);
       await pool.query(`
         UPDATE ep_posts SET preview_mid = $2, updated_at = NOW()
         WHERE id = $1 AND status = 'draft'
@@ -2964,6 +2978,7 @@ async function handleComposerMessage(message) {
 }
 
 async function publishOwnPost(session, row, callbackId) {
+  if(pendingMulti(row)){await queueMultiNow(session,row,callbackId);return;}
   try { await assertPublicationWindow(deletionKey("p",row.id)); }
   catch(e) { await notify(session.actor_user_id,e.message); return; }
   if (!(await canUseOwnPost(row, session.actor_user_id))) {
@@ -3687,7 +3702,7 @@ async function beginSchedulePicker(postId, userId, schedule = null) {
   const defaultAt = schedule ? new Date(schedule.due_at).getTime() : Math.ceil((Date.now()+10*60000)/60000)*60000;
   const initial = localParts(Math.max(defaultAt, Date.now()+60000), timezone);
   // Реальный предпросмотр: если медиа не отправляются, расписание не подтверждается вслепую.
-  try { await sendToUser(userId, post.body); }
+  try { await sendToUser(userId, post.body); await showMultiPreviews(post,userId); }
   catch (error) { await notify(userId, `Предпросмотр недоступен. Материал сохранён. ${error.message.slice(0,200)}`); return; }
   const made = await pool.query(`INSERT INTO ep_schedule_sessions(actor_user_id, post_id, nonce,
     schedule_id, expected_revision, draft_revision, access_version, timezone, stage, day_key, month_key, hour, minute)
@@ -3738,6 +3753,7 @@ async function confirmSchedule(session, callbackId) {
           revision = ep_schedules.revision + 1, attempts = 0, next_at = NOW(),
           locked_at = NULL, dispatch_started_at = NULL, last_error = NULL, updated_at = NOW()
         RETURNING *`,[post.id,due,session.timezone,session.actor_user_id,access.version,JSON.stringify(fresh.body)])).rows[0];
+      await expandMultiTargets(client,fresh,session.actor_user_id,due,session.timezone);
       await client.query("UPDATE ep_posts SET status = 'scheduled', is_saved = TRUE, saved_at = NOW(), updated_at = NOW() WHERE id = $1",[post.id]);
       await client.query("DELETE FROM ep_schedule_sessions WHERE actor_user_id = $1 AND nonce = $2",[session.actor_user_id,session.nonce]);
       await audit(post.channel_id,session.actor_user_id,session.schedule_id ? "schedule_moved" : "post_scheduled",post.id,
@@ -3750,6 +3766,7 @@ async function confirmSchedule(session, callbackId) {
   await answerCallback(callbackId,`✅ Пост #${post.id} отложен.\nКанал: «${shortTitle(post.title)}»\n${timeLabel(due,session.timezone)} · ${zoneLabel(session.timezone,due)}`,true);
   console.log("POST SCHEDULED:",post.id,due.toISOString());
   await showScheduledPost(saved.id,session.actor_user_id,false);
+  if(pendingMulti(post)) await showMultiReport(post.id,session.actor_user_id);
 }
 async function handleScheduleMessage(message) {
   const userId = message.sender.user_id, mid = message.body.mid;
@@ -5195,7 +5212,7 @@ function calendarStateBody(session, post, now = Date.now()) {
   const today = dateKey(localParts(now, session.timezone));
   return {
     ok: true, state: 'editing', version: VERSION, nonce: session.nonce,
-    postId: String(post.id), title: shortTitle(post.title),
+    postId: String(post.id), title: multiTitle(post),
     timezone: session.timezone, zoneLabel: zoneLabel(session.timezone, now),
     serverNow: now, today, maxDay: shiftDay(today, SCHEDULE_HORIZON_DAYS),
     day: session.day_key, hour: Number(session.hour), minute: Number(session.minute),
@@ -5247,11 +5264,12 @@ async function saveCalendarChoice(client, userId, nonce, input) {
         revision=ep_schedules.revision+1,attempts=0,next_at=NOW(),
         locked_at=NULL,dispatch_started_at=NULL,last_error=NULL,updated_at=NOW()
       RETURNING *`, [post.id, choice.due, session.timezone, userId, access.version, JSON.stringify(fresh.body)])).rows[0];
+    const multiCount=await expandMultiTargets(client,fresh,userId,choice.due,session.timezone);
     await client.query("UPDATE ep_posts SET status='scheduled',is_saved=TRUE,saved_at=NOW(),updated_at=NOW() WHERE id=$1", [post.id]);
     await client.query('DELETE FROM ep_schedule_sessions WHERE actor_user_id=$1 AND nonce=$2', [userId, nonce]);
     result = {
       ok: true, state: 'saved', postId: String(post.id), scheduleId: String(saved.id),
-      title: shortTitle(post.title), dueAt: choice.due.toISOString(),
+      title: multiTitle(post), multiCount, dueAt: choice.due.toISOString(),
       timezone: session.timezone, label: timeLabel(choice.due, session.timezone),
       zoneLabel: zoneLabel(session.timezone, choice.due)
     };
@@ -5264,7 +5282,7 @@ async function saveCalendarChoice(client, userId, nonce, input) {
       ON CONFLICT(event_key) DO NOTHING`, [
         'calendar_saved:' + nonce,
         JSON.stringify({update_type: 'everypost_calendar_saved', actor_user_id: userId,
-          schedule_id: String(saved.id), card_mid: session.card_mid || null})
+          schedule_id: String(saved.id), card_mid: session.card_mid || null, multi_root: pendingMulti(fresh)?String(post.id):null})
       ]);
     await client.query('COMMIT');
   } catch (error) {
@@ -5317,6 +5335,7 @@ async function handleCalendarSavedNotice(update) {
     } catch (error) { console.error('CALENDAR CARD UPDATE ERROR:', error.message); }
   }
   await showScheduledPost(q.id, update.actor_user_id, false);
+  if(update.multi_root) await showMultiReport(update.multi_root,update.actor_user_id);
 }
 function calendarHeaders(res) {
   res.set('Cache-Control', 'no-store');
@@ -5381,6 +5400,282 @@ app.post('/calendar/api/disable', calendarEndpoint('disable'));
 const CALENDAR_HTML = "<!doctype html>\n<html lang=\"ru\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n<meta name=\"color-scheme\" content=\"dark light\">\n<title>EveryPost · Календарь</title>\n<style nonce=\"__CSP_NONCE__\">\n:root{color-scheme:dark;--bg:#18151b;--panel:#242126;--text:#fbf9fc;--muted:#96919c;--disabled:#4a454f;--accent:#c53780;--control:#37333c;--line:#45404a}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;-webkit-font-smoothing:antialiased}button,input,select{font:inherit}button{cursor:pointer;color:inherit;border:0;background:none;-webkit-tap-highlight-color:transparent}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button:disabled{cursor:default;color:var(--disabled)}[hidden]{display:none!important}\n.viewport{min-height:100svh;display:flex;align-items:flex-end;justify-content:center;padding-top:max(10px,env(safe-area-inset-top))}.sheet{width:100%;max-width:600px;min-height:min(680px,100svh);background:var(--panel);border-radius:26px 26px 0 0;padding:10px 16px max(22px,env(safe-area-inset-bottom));box-shadow:0 -1px 0 #ffffff08}.handle{width:34px;height:4px;border-radius:8px;background:#7a738044;margin:0 auto 15px}.heading{display:grid;grid-template-columns:40px 1fr 40px;align-items:center;margin-bottom:8px}.heading h1{font-size:20px;font-weight:650;text-align:center;letter-spacing:-.5px;margin:0}.cross{width:38px;height:38px;padding:9px;color:var(--text)}svg{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}.context{text-align:center;color:var(--muted);font-size:12px;line-height:1.4;margin:2px 12px 22px;overflow-wrap:anywhere}.context strong{font-weight:500;color:var(--text)}.month-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding:0 9px}.month-label{display:flex;align-items:center;gap:7px;text-align:left;padding:5px 0;font-size:19px;font-weight:650}.month-label svg{width:15px;height:19px;color:var(--accent)}.arrows{display:flex;gap:12px}.arrow{width:36px;height:36px;padding:8px;color:var(--accent)}.week,.days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));text-align:center}.week{font-size:12px;letter-spacing:.6px;font-weight:600;color:var(--muted);margin:0 0 10px}.days{row-gap:6px}.day{width:44px;max-width:100%;height:44px;justify-self:center;border-radius:50%;font-size:22px;padding:0;line-height:44px}.day.selected{background:var(--accent);color:white;font-weight:650}.day.today:not(.selected){color:var(--accent)}.day:not(:disabled):not(.selected):hover{background:#ffffff09}.empty{height:44px}.time-row{display:flex;justify-content:space-between;align-items:center;padding:20px 12px 16px;margin-top:10px}.time-row label{font-size:19px;font-weight:600}.time-control{position:relative;border-radius:9px;background:var(--control);min-width:78px;padding:10px 12px;text-align:center;font-size:21px;font-variant-numeric:tabular-nums}.time-control input{position:absolute;inset:0;width:100%;height:100%;border:0;opacity:0;cursor:pointer;color-scheme:dark}.time-control input::-webkit-calendar-picker-indicator{position:absolute;inset:0;width:auto;height:auto}.note{color:var(--muted);font-size:12px;line-height:1.45;text-align:center;margin:0 10px 8px}.error{font-size:13px;line-height:1.4;color:#ff9ebf;margin:12px 10px;min-height:18px;text-align:center}.primary{display:block;width:100%;background:var(--accent);color:#fff;border:0;border-radius:16px;min-height:54px;padding:13px 12px;font-size:18px;font-weight:600;margin-top:10px;line-height:1.3}.primary:disabled{background:#64344d;color:#c0a0b1}.minor{display:block;margin:14px auto 0;color:var(--muted);font-size:13px}.status{padding:36px 16px;text-align:center;min-height:370px;display:flex;flex-direction:column;align-items:center;justify-content:center}.status .symbol{font-size:48px;margin-bottom:16px}.status h2{font-size:23px;letter-spacing:-.6px;margin:0 0 15px}.status p{color:var(--muted);font-size:15px;line-height:1.5;white-space:pre-line;overflow-wrap:anywhere}.status .primary{max-width:350px}.jump{background:var(--control);border-radius:14px;padding:15px;margin:0 6px 18px;display:flex;gap:8px}.jump select{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;flex:1}.secondary{display:block;width:100%;padding:13px;margin-top:8px;border-radius:12px;background:var(--control);color:var(--text);font-size:15px}.brand{text-align:center;color:var(--muted);opacity:.65;font-size:11px;margin:16px 0 0;letter-spacing:1px}\n@media(min-width:700px){.viewport{padding:24px;align-items:center}.sheet{border-radius:28px;min-height:0;max-width:510px;padding:12px 24px 24px}.day{height:49px;width:49px;line-height:49px}.context{margin-bottom:26px}}\n@media(max-width:360px){.heading h1{font-size:18px}.sheet{padding-left:10px;padding-right:10px}.month-label{font-size:17px}.day{width:38px;height:42px;line-height:42px;font-size:20px}.primary{font-size:16px}}\n@media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#eceaf0;--panel:#fff;--text:#211d24;--muted:#7d7582;--disabled:#ccc7d0;--control:#f0edf2;--line:#ddd7e0}.error{color:#a31850}.time-control input{color-scheme:light}}\n</style>\n<script nonce=\"__CSP_NONCE__\" src=\"https://st.max.ru/js/max-web-app.js\"></script>\n</head>\n<body>\n<main class=\"viewport\"><section class=\"sheet\" aria-label=\"Календарь отложенной публикации\">\n<div class=\"handle\" aria-hidden=\"true\"></div>\n<header class=\"heading\"><button class=\"cross\" id=\"close\" aria-label=\"Закрыть выбор времени\"><svg viewBox=\"0 0 24 24\"><path d=\"m5 5 14 14M19 5 5 19\"/></svg></button><h1 id=\"heading\">Запланировать пост</h1><span></span></header>\n<div class=\"status\" id=\"status\" role=\"status\"><div class=\"symbol\" id=\"symbol\">◌</div><h2 id=\"statusTitle\">Открываем календарь</h2><p id=\"statusText\">Проверяем доступ к материалу…</p><button id=\"retry\" class=\"primary\" hidden>Повторить</button><button id=\"returnBot\" class=\"minor\">Вернуться в EveryPost</button></div>\n<div id=\"editor\" hidden>\n<p class=\"context\"><strong id=\"channel\"></strong><br><span id=\"zone\"></span></p>\n<div class=\"month-row\"><button id=\"monthLabel\" class=\"month-label\" aria-label=\"Выбрать месяц и год\"><span id=\"monthText\"></span><svg viewBox=\"0 0 16 24\"><path d=\"m5 5 7 7-7 7\"/></svg></button><div class=\"arrows\"><button class=\"arrow\" id=\"prev\" aria-label=\"Предыдущий месяц\"><svg viewBox=\"0 0 24 24\"><path d=\"m15 5-7 7 7 7\"/></svg></button><button class=\"arrow\" id=\"next\" aria-label=\"Следующий месяц\"><svg viewBox=\"0 0 24 24\"><path d=\"m9 5 7 7-7 7\"/></svg></button></div></div>\n<div class=\"jump\" id=\"jump\" hidden><select id=\"jumpMonth\" aria-label=\"Месяц\"></select><select id=\"jumpYear\" aria-label=\"Год\"></select></div>\n<div class=\"week\" aria-hidden=\"true\"><span>ПН</span><span>ВТ</span><span>СР</span><span>ЧТ</span><span>ПТ</span><span>СБ</span><span>ВС</span></div>\n<div class=\"days\" id=\"days\" role=\"group\" aria-label=\"Выбор дня\"></div>\n<div class=\"time-row\"><label for=\"time\">Время</label><div class=\"time-control\"><span id=\"timeText\">--:--</span><input type=\"time\" id=\"time\" step=\"60\" aria-label=\"Время публикации в часовом поясе канала\" required></div></div>\n<p class=\"note\" id=\"oldSchedule\" hidden>До сохранения нового времени действует прежнее расписание.</p>\n<p class=\"note\" id=\"deleteNote\" hidden></p>\n<p class=\"error\" id=\"error\" role=\"alert\"></p>\n<button type=\"button\" class=\"primary\" id=\"save\">Отправить</button>\n<button type=\"button\" class=\"secondary\" id=\"disableDeletion\" hidden>Отключить автоудаление</button>\n<p class=\"brand\">EVERYPOST</p>\n</div>\n</section></main>\n<script nonce=\"__CSP_NONCE__\">\n(function(){\n'use strict';\nconst $=id=>document.getElementById(id),months=['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];\nconst monthCases=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];\nconst pad=n=>String(n).padStart(2,'0');\nlet data=null,selected='',view='',busy=false,initData='',nonce=null,mode='schedule',delta=0,retryAction=null,uncertain=null;\nconst bridge=()=>window.WebApp;\nfunction parts(at,zone){return Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(at)).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));}\nfunction key(p){return String(p.year)+pad(p.month)+pad(p.day);}\nfunction shifted(day,by){const d=new Date(Date.UTC(Number(day.slice(0,4)),Number(day.slice(4,6))-1,Number(day.slice(6,8))+by));return String(d.getUTCFullYear())+pad(d.getUTCMonth()+1)+pad(d.getUTCDate());}\nfunction instant(day,h,m,zone){const target=Date.UTC(+day.slice(0,4),+day.slice(4,6)-1,+day.slice(6,8),h,m);let at=target;for(let i=0;i<4;i++){const p=parts(at,zone);at+=target-Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute,p.second);}return at;}\nfunction atNow(){return Date.now()+delta;}\nfunction modal(title,text,symbol='!',retry=null){$('editor').hidden=true;$('status').hidden=false;$('statusTitle').textContent=title;$('statusText').textContent=text;$('symbol').textContent=symbol;retryAction=retry;$('retry').hidden=!retry;}\nfunction returnToBot(){const b=bridge();if(typeof b?.close==='function'){b.close();return;}if(typeof b?.openMaxLink==='function'){b.openMaxLink('https://max.ru/id190206555510_3_bot');return;}window.location.href='https://max.ru/id190206555510_3_bot';}\nfunction readLaunch(){\n  const b=bridge(); const hash=new URLSearchParams(location.hash.slice(1));\n  initData=typeof b?.initData==='string'&&b.initData?b.initData:hash.get('WebAppData')||'';\n  const p=new URLSearchParams(initData);\n  const hint=p.get('start_param')||b?.initDataUnsafe?.start_param||hash.get('WebAppStartParam')||new URLSearchParams(location.search).get('WebAppStartParam')||'';\n  const match=typeof hint==='string'?hint.match(/^(sc|ad)_([a-f0-9]{24})$/):null;\n  nonce=match?match[2]:null;mode=match?.[1]==='ad'?'delete':'schedule';\n}\nasync function request(action,body={}){\n  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),25000);\n  try{\n    const res=await fetch('/calendar/api/'+action,{method:'POST',credentials:'omit',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData,nonce,mode,...body}),signal:controller.signal});\n    let result;try{result=await res.json();}catch{throw new Error('Сервер запускается или временно недоступен. Подождите и повторите.');}\n    if(!res.ok||!result.ok){const e=new Error(result.message||'Не удалось выполнить действие.');e.status=res.status;throw e;}\n    return result;\n  }catch(e){if(e.name==='AbortError')throw new Error('Ответ сервера задерживается. Проверьте результат кнопкой «Повторить».');throw e;}finally{clearTimeout(timer);}\n}\nfunction receipt(result){\n  busy=false;uncertain=null;data=null;\n  if(result.state==='saved'&&result.mode==='delete')modal(result.disabled?'Автоудаление выключено':'Автоудаление настроено',result.title+'\\n'+result.label+'\\n'+result.zoneLabel+'\\n\\nУдалится только пост в канале.','✓');\n  else if(result.state==='saved')modal('Пост отложен',result.title+'\\n'+result.label+'\\n'+result.zoneLabel+'\\n\\nРасписание также доступно в боте.','✓');\n  else modal('Выбор времени закрыт',result.message||'Расписание не изменено.','✓');\n}\nfunction render(){\n  if(!data)return;\n  const y=Number(view.slice(0,4)),m=Number(view.slice(4,6));\n  const today=key(parts(atNow(),data.timezone));data.today=today;\n  $('monthText').textContent=months[m-1]+' '+y+' г.';\n  $('prev').disabled=busy||view<=today.slice(0,6);$('next').disabled=busy||view>=data.maxDay.slice(0,6);\n  const first=new Date(Date.UTC(y,m-1,1)),offset=(first.getUTCDay()+6)%7,count=new Date(Date.UTC(y,m,0)).getUTCDate();\n  const frag=document.createDocumentFragment();\n  for(let i=0;i<offset;i++){const blank=document.createElement('span');blank.className='empty';blank.setAttribute('aria-hidden','true');frag.append(blank);}\n  for(let d=1;d<=count;d++){\n    const k=view+pad(d),btn=document.createElement('button');btn.type='button';btn.className='day'+(k===selected?' selected':'')+(k===today?' today':'');btn.textContent=String(d);\n    btn.disabled=busy||k<today||k>data.maxDay;btn.setAttribute('aria-label',d+' '+monthCases[m-1]+' '+y);btn.setAttribute('aria-pressed',String(k===selected));\n    btn.addEventListener('click',()=>{if(busy)return;selected=k;$('error').textContent='';render();});frag.append(btn);\n  }\n  $('days').replaceChildren(frag);\n  $('time').disabled=busy;$('monthLabel').disabled=busy;$('jumpMonth').disabled=busy;$('jumpYear').disabled=busy;\n  const time=$('time').value; $('timeText').textContent=time||'--:--';\n  let valid=selected>=today&&selected<=data.maxDay&&/^\\d{2}:\\d{2}$/.test(time);\n  if(valid){const [h,mi]=time.split(':').map(Number);const at=instant(selected,h,mi,data.timezone);valid=at>atNow()+5000;\n    if(data.mode==='delete'&&data.minAt)valid=valid&&at>new Date(data.minAt).getTime();\n    if(data.mode!=='delete'&&data.maxPublishAt)valid=valid&&at<new Date(data.maxPublishAt).getTime();}\n  const label=selected===today?'сегодня':selected===shifted(today,1)?'завтра':(+selected.slice(6,8))+' '+monthCases[+selected.slice(4,6)-1]+(selected.slice(0,4)!==today.slice(0,4)?' '+selected.slice(0,4):'');\n  $('save').textContent=busy?'Сохраняем…':(data.mode==='delete'?'Удалить ':data.rescheduling?'Перенести на ':'Отправить ')+label+' в '+(time||'--:--');$('save').disabled=busy||!valid;$('disableDeletion').disabled=busy;\n  if(!valid&&!$('error').textContent)$('error').textContent=data.mode==='delete'?'Выберите время позже текущего и позже публикации.':data.maxPublishAt?'Публикация должна быть раньше удаления и позже текущего времени.':'Выберите время позже текущего в часовом поясе канала.';\n  $('jumpMonth').value=String(m);$('jumpYear').value=String(y);\n}\nfunction jumpSetup(){\n  $('jumpMonth').replaceChildren();months.forEach((name,i)=>{const o=document.createElement('option');o.value=String(i+1);o.textContent=name;$('jumpMonth').append(o);});\n  $('jumpYear').replaceChildren();for(let y=+data.today.slice(0,4);y<=+data.maxDay.slice(0,4);y++){const o=document.createElement('option');o.value=String(y);o.textContent=String(y);$('jumpYear').append(o);}\n}\nasync function load(){\n  readLaunch();\n  if(!initData){modal('Откройте через EveryPost','В EveryPost нажмите «Отложить» или «Автоудаление», затем «Открыть календарь». Без авторизации MAX время сохранить нельзя.','↗',load);return;}\n  modal('Открываем календарь','Проверяем доступ к материалу…','◌');\n  try{\n    const result=await request('state');if(result.state!=='editing'){receipt(result);return;}\n    data=result;nonce=result.nonce;mode=result.mode||'schedule';delta=Number(result.serverNow)-Date.now();selected=data.day;view=selected.slice(0,6);\n    $('heading').textContent=mode==='delete'?'Когда удалить пост?':'Запланировать пост';\n    document.title='EveryPost · '+(mode==='delete'?'Автоудаление':'Отложка');\n    document.querySelector('.sheet').setAttribute('aria-label',mode==='delete'?'Календарь удаления поста':'Календарь отложенной публикации');\n    $('time').setAttribute('aria-label',mode==='delete'?'Время удаления в часовом поясе канала':'Время публикации в часовом поясе канала');\n    $('disableDeletion').hidden=mode!=='delete'||!data.canDisable;\n    $('deleteNote').hidden=false;$('deleteNote').textContent=mode==='delete'?\n      (data.publicationLabel?'Публикация: '+data.publicationLabel+'. ':'')+'Удалится только пост в канале. Копия в чате останется.':(data.currentDeletionLabel||'');\n    $('channel').textContent=data.title+' · пост #'+data.postId;$('zone').textContent=data.zoneLabel;$('time').value=pad(data.hour)+':'+pad(data.minute);$('oldSchedule').hidden=!data.rescheduling;\n    $('error').textContent='';$('jump').hidden=true;$('status').hidden=true;$('editor').hidden=false;busy=false;jumpSetup();render();\n  }catch(e){modal('Календарь не открыт',e.message,'!',load);}\n}\nasync function checkUncertain(){\n  if(!uncertain){await load();return;}\n  try{const r=await request(uncertain.action,uncertain.body);receipt(r);}\n  catch(e){modal('Не удалось подтвердить результат',e.message+'\\nПовтор проверяет ту же операцию и не создаёт второй пост.','!',checkUncertain);}\n}\nasync function save(){\n  if(!data||busy||$('save').disabled)return;\n  const [hour,minute]=$('time').value.split(':').map(Number),body={day:selected,hour,minute};\n  busy=true;$('error').textContent='';render();\n  try{receipt(await request('save',body));}\n  catch(e){\n    busy=false;\n    if(e.status&&e.status<500){$('error').textContent=e.message;render();}\n    else{uncertain={action:'save',body};modal('Проверяем сохранение',e.message+'\\nНе создавайте второй пост: повтор безопасно проверит этот же выбор времени.','!',checkUncertain);}\n  }\n}\nasync function close(){\n  if(busy)return;\n  if(!data){returnToBot();return;}\n  busy=true;render();\n  try{receipt(await request('cancel'));returnToBot();}\n  catch(e){busy=false;uncertain={action:'cancel',body:{}};modal('Не удалось закрыть выбор',e.message,'!',checkUncertain);}\n}\n$('disableDeletion').addEventListener('click',async()=>{\n  if(!data||busy||!data.canDisable)return;\n  busy=true;render();\n  try{receipt(await request('disable'));}\n  catch(e){busy=false;if(e.status&&e.status<500){$('error').textContent=e.message;render();}\n    else{uncertain={action:'disable',body:{}};modal('Проверяем сохранение',e.message,'!',checkUncertain);}}\n});\n$('save').addEventListener('click',save);$('close').addEventListener('click',close);$('returnBot').addEventListener('click',returnToBot);$('retry').addEventListener('click',()=>retryAction?.());\n$('time').addEventListener('input',()=>{$('error').textContent='';render();});\n$('monthLabel').addEventListener('click',()=>{$('jump').hidden=!$('jump').hidden;});\nfunction changeView(shift){if(!data||busy)return;const d=new Date(Date.UTC(+view.slice(0,4),+view.slice(4,6)-1+shift,1));view=String(d.getUTCFullYear())+pad(d.getUTCMonth()+1);render();}\n$('prev').addEventListener('click',()=>changeView(-1));$('next').addEventListener('click',()=>changeView(1));\nfunction applyJump(){if(!data||busy)return;let v=$('jumpYear').value+pad($('jumpMonth').value);v=v<data.today.slice(0,6)?data.today.slice(0,6):v>data.maxDay.slice(0,6)?data.maxDay.slice(0,6):v;view=v;render();}\n$('jumpMonth').addEventListener('change',applyJump);$('jumpYear').addEventListener('change',applyJump);\ntry{bridge()?.BackButton?.show();bridge()?.BackButton?.onClick(close);}catch{}\nsetInterval(()=>{if(data&&!busy)render();},15000);\nload();\n})();\n</script>\n</body></html>\n";
 function calendarHtml(nonce) { return CALENDAR_HTML.replaceAll("__CSP_NONCE__", nonce); }
 
+// ---------- Несколько каналов и личные папки ----------
+const MULTI_LIMIT = 30;
+function multiIds(values) {
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values.map(String).filter(x => /^[1-9]\d*$/.test(x)))];
+}
+function pendingMulti(post) { return !post.multi_expanded && (post.multi_targets || []).length > 1; }
+function multiTitle(post) {
+  return pendingMulti(post) ? `Несколько каналов (${post.multi_targets.length})` : shortTitle(post.title);
+}
+async function initMultiDatabase() {
+  await pool.query(`
+    ALTER TABLE ep_composer_sessions ADD COLUMN IF NOT EXISTS selected_channels JSONB NOT NULL DEFAULT '[]';
+    ALTER TABLE ep_posts ADD COLUMN IF NOT EXISTS multi_targets JSONB NOT NULL DEFAULT '[]';
+    ALTER TABLE ep_posts ADD COLUMN IF NOT EXISTS multi_expanded BOOLEAN NOT NULL DEFAULT FALSE;
+    CREATE TABLE IF NOT EXISTS ep_channel_folders (
+      id BIGSERIAL PRIMARY KEY, actor_user_id BIGINT NOT NULL, name TEXT NOT NULL,
+      channel_ids JSONB NOT NULL DEFAULT '[]', UNIQUE(actor_user_id,name)
+    );
+    CREATE TABLE IF NOT EXISTS ep_folder_inputs (
+      actor_user_id BIGINT PRIMARY KEY, nonce TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 minutes')
+    );
+    CREATE TABLE IF NOT EXISTS ep_multi_deliveries (
+      root_post_id BIGINT NOT NULL REFERENCES ep_posts(id), channel_id BIGINT NOT NULL REFERENCES channels(id),
+      post_id BIGINT REFERENCES ep_posts(id), last_error TEXT,
+      PRIMARY KEY(root_post_id,channel_id), UNIQUE(post_id)
+    );
+  `);
+}
+async function chooseMultipleChannels(session) {
+  const ids = multiIds(session.selected_channels);
+  if (!ids.length) { await notify(session.actor_user_id,'Отметьте хотя бы один канал.'); return; }
+  const targets = [];
+  for (const id of ids) {
+    const a = await channelAccess(id,session.actor_user_id,'create');
+    if (!a) { await notify(session.actor_user_id,'Права на один из выбранных каналов изменились. Обновите выбор.'); return; }
+    targets.push({channel_id:String(id), title:shortTitle(a.channel.title), style:styleForChannel(a.channel)});
+  }
+  const client = await pool.connect(); let next;
+  try {
+    await client.query('BEGIN');
+    const fresh = (await client.query(`SELECT * FROM ep_composer_sessions WHERE actor_user_id=$1 AND nonce=$2
+      AND stage='choose_channel' FOR UPDATE`,[session.actor_user_id,session.nonce])).rows[0];
+    if (fresh && JSON.stringify(multiIds(fresh.selected_channels)) === JSON.stringify(ids)) {
+      const post = (await client.query(`INSERT INTO ep_posts(channel_id,author_user_id,multi_targets,post_style)
+        VALUES($1,$2,$3::jsonb,$4::jsonb) RETURNING id`,[ids[0],session.actor_user_id,
+        JSON.stringify(targets.length>1?targets:[]),JSON.stringify(targets[0].style)])).rows[0];
+      next = (await client.query(`UPDATE ep_composer_sessions SET post_id=$3,nonce=$4,stage='waiting_content',updated_at=NOW()
+        WHERE actor_user_id=$1 AND nonce=$2 RETURNING *`,[session.actor_user_id,session.nonce,post.id,newEditNonce()])).rows[0];
+    }
+    await client.query('COMMIT');
+  } catch(e) { await client.query('ROLLBACK').catch(()=>{}); throw e; } finally {client.release();}
+  if(next) await sendComposerPrompt(next);
+}
+async function selectMultiChannels(session,ids,replace=false) {
+  const allowed = new Set((await accessibleChannels(session.actor_user_id,'create')).map(c=>String(c.id)));
+  const fresh = await getComposer(session.actor_user_id);
+  if(!fresh || fresh.nonce!==session.nonce || fresh.stage!=='choose_channel') return;
+  let selected = multiIds(fresh.selected_channels).filter(id=>allowed.has(id));
+  const incoming = multiIds(ids).filter(id=>allowed.has(id));
+  if(replace) selected=multiIds([...selected,...incoming]);
+  else for(const id of incoming) selected=selected.includes(id)?selected.filter(x=>x!==id):[...selected,id];
+  if(selected.length>MULTI_LIMIT) {await notify(session.actor_user_id,`За один раз можно выбрать до ${MULTI_LIMIT} каналов.`);return;}
+  // Меняем nonce после каждого выбора: повторная доставка старой кнопки не снимает отметку.
+  const changed=(await pool.query(`UPDATE ep_composer_sessions SET selected_channels=$3::jsonb,nonce=$4
+    WHERE actor_user_id=$1 AND nonce=$2 AND stage='choose_channel' RETURNING *`,
+    [session.actor_user_id,session.nonce,JSON.stringify(selected),newEditNonce()])).rows[0];
+  if(changed) await showChannelPicker(changed);
+}
+async function showFolderList(userId,page=0,session=null) {
+  page=pageNumber(page);
+  const rows=(await pool.query(`SELECT * FROM ep_channel_folders WHERE actor_user_id=$1 ORDER BY id
+    LIMIT $2 OFFSET $3`,[userId,ADMIN_PAGE_SIZE+1,page*ADMIN_PAGE_SIZE])).rows;
+  const prefix=session?`mf_${session.nonce}`:'folders';
+  await sendToUser(userId,{text:session?'📂 Выберите папку. Её доступные каналы будут отмечены; затем можно снять отдельные отметки.':'📂 Ваши папки каналов',
+    attachments:keyboard([
+      ...rows.slice(0,ADMIN_PAGE_SIZE).map(f=>[button(f.name,session?`mfolder_${session.nonce}_${f.id}`:`folder_${f.id}_0`)]),
+      ...(page>0?[[button('◀️ Назад',`${prefix}_${page-1}`)]]:[]),
+      ...(rows.length>ADMIN_PAGE_SIZE?[[button('Далее ▶️',`${prefix}_${page+1}`)]]:[]),
+      ...(!session?[[button('➕ Создать папку','foldernew')]]:[]),
+      [button('↩️ Назад',session?`cpage_${session.nonce}_0`:'menu_main')]
+    ])});
+}
+async function showFolder(userId,id,page=0) {
+  const f=(await pool.query('SELECT * FROM ep_channel_folders WHERE id=$1 AND actor_user_id=$2',[id,userId])).rows[0];
+  if(!f){await notify(userId,'Папка недоступна.');return;}
+  const all=await accessibleChannels(userId,'create');page=pageNumber(page);
+  const selected=new Set(multiIds(f.channel_ids));
+  await sendToUser(userId,{text:`📂 ${f.name}\nОтметьте каналы папки. Изменения сохраняются сразу.\nПапка доступна только вам.`,
+    attachments:keyboard([
+      ...all.slice(page*ADMIN_PAGE_SIZE,(page+1)*ADMIN_PAGE_SIZE).map(c=>[button(`${selected.has(String(c.id))?'✅':'⬜'} ${shortTitle(c.title)}`,
+        `fset_${f.id}_${c.id}_${selected.has(String(c.id))?0:1}_${page}`)]),
+      ...(page>0?[[button('◀️ Назад',`folder_${f.id}_${page-1}`)]]:[]),
+      ...((page+1)*ADMIN_PAGE_SIZE<all.length?[[button('Далее ▶️',`folder_${f.id}_${page+1}`)]]:[]),
+      [button('🗑 Удалить папку',`fremove_${f.id}`)], [button('↩️ Папки','folders_0')]
+    ])});
+}
+async function handleFolderMessage(message) {
+  const userId=message.sender.user_id;
+  const f=(await pool.query('SELECT * FROM ep_folder_inputs WHERE actor_user_id=$1',[userId])).rows[0];
+  if(!f)return false;
+  if(new Date(f.expires_at)<=new Date()) {await pool.query('DELETE FROM ep_folder_inputs WHERE actor_user_id=$1',[userId]);return false;}
+  const value=plainCommand(message);
+  if(['cancel','отмена','menu','start'].includes(value)) {
+    await pool.query('DELETE FROM ep_folder_inputs WHERE actor_user_id=$1',[userId]);
+    await showAdminMenu(userId,true);return true;
+  }
+  const name=(message.body.text||'').trim();
+  if(!name || name.length>60 || /[\r\n\u0000-\u001f]/.test(name) || message.link || message.body.attachments?.length) {
+    await notify(userId,'Пришлите название папки одним текстовым сообщением, от 1 до 60 символов. Отмена: /cancel.');return true;
+  }
+  const client=await pool.connect();let made;
+  try{
+    await client.query('BEGIN');
+    const claimed=await client.query('DELETE FROM ep_folder_inputs WHERE actor_user_id=$1 AND nonce=$2 RETURNING *',[userId,f.nonce]);
+    if(claimed.rowCount) made=(await client.query(`INSERT INTO ep_channel_folders(actor_user_id,name) VALUES($1,$2)
+      ON CONFLICT(actor_user_id,name) DO UPDATE SET name=EXCLUDED.name RETURNING *`,[userId,name])).rows[0];
+    await client.query(`INSERT INTO ep_command_inputs(max_message_id,actor_user_id,handled) VALUES($1,$2,TRUE)
+      ON CONFLICT(max_message_id) DO UPDATE SET handled=TRUE`,[message.body.mid,userId]);
+    await client.query('COMMIT');
+  }catch(e){await client.query('ROLLBACK').catch(()=>{});throw e;}finally{client.release();}
+  if(made)await showFolder(userId,made.id);return true;
+}
+async function handleMultiCallback(update) {
+  const cb=update.callback,userId=cb?.user?.user_id,p=cb?.payload||'';
+  const select=p.match(/^m(toggle|folder|f)_([a-f0-9]{24})_(\d+)$/);
+  const go=p.match(/^mgo_([a-f0-9]{24})$/);
+  const folders=p.match(/^folders_(\d+)$/),folder=p.match(/^folder_(\d+)_(\d+)$/);
+  const set=p.match(/^fset_(\d+)_(\d+)_(0|1)_(\d+)$/),remove=p.match(/^fremove_(\d+)$/);
+  const report=p.match(/^mreport_(\d+)(?:_(\d+))?$/),list=p.match(/^multilist_(\d+)$/);
+  if(userId==null || !(select||go||folders||folder||set||remove||report||list||p==='foldernew'))return false;
+  await answerCallback(cb.callback_id);
+  if(select||go) {
+    const s=await getComposer(userId),nonce=select?select[2]:go[1];
+    if(!s || s.nonce!==nonce || s.stage!=='choose_channel') {await notify(userId,'Используйте последнюю карточку выбора каналов.');return true;}
+    if(go)await chooseMultipleChannels(s);
+    else if(select[1]==='toggle')await selectMultiChannels(s,[select[3]]);
+    else if(select[1]==='f')await showFolderList(userId,Number(select[3]),s);
+    else {
+      const f=(await pool.query('SELECT * FROM ep_channel_folders WHERE id=$1 AND actor_user_id=$2',[select[3],userId])).rows[0];
+      if(f)await selectMultiChannels(s,f.channel_ids,true);
+    }
+    return true;
+  }
+  if(report){await showMultiReport(report[1],userId,Number(report[2]||0));return true;}
+  if(list){await listMultiReports(userId,Number(list[1]));return true;}
+  if(await getComposer(userId)||await getEditorSession(userId)||await getScheduleSession(userId)||await getDeletionSession(userId)||await getStyleInput(userId)) {
+    await notify(userId,'Сначала сохраните или закройте текущую правку.');return true;
+  }
+  if(folders)await showFolderList(userId,Number(folders[1]));
+  else if(folder)await showFolder(userId,folder[1],Number(folder[2]));
+  else if(p==='foldernew') {
+    if(!(await accessibleChannels(userId,'create')).length){await notify(userId,'Нет доступных каналов для создания папки.');return true;}
+    await pool.query(`INSERT INTO ep_folder_inputs(actor_user_id,nonce) VALUES($1,$2)
+      ON CONFLICT(actor_user_id) DO UPDATE SET nonce=EXCLUDED.nonce,expires_at=NOW()+INTERVAL '30 minutes'`,[userId,newEditNonce()]);
+    await pool.query('DELETE FROM proposal_sessions WHERE max_user_id=$1',[userId]);
+    await notify(userId,'Пришлите название новой папки. Например: Юг. Отмена: /cancel.');
+  } else if(remove) {
+    await pool.query('DELETE FROM ep_channel_folders WHERE id=$1 AND actor_user_id=$2',[remove[1],userId]);
+    await notify(userId,'Папка удалена. Каналы и ранее выбранные назначения постов сохранены.');await showFolderList(userId);
+  } else if(set) {
+    if(!(await channelAccess(set[2],userId,'create'))){await notify(userId,'Канал недоступен.');return true;}
+    // Явное 0/1 вместо переключателя делает повторы одного callback безопасными.
+    await pool.query(`UPDATE ep_channel_folders SET channel_ids=CASE WHEN $4::boolean
+      THEN CASE WHEN channel_ids @> to_jsonb(ARRAY[$3::text]) THEN channel_ids ELSE channel_ids || to_jsonb(ARRAY[$3::text]) END
+      ELSE channel_ids - $3::text END WHERE id=$1 AND actor_user_id=$2`,[set[1],userId,set[2],set[3]==='1']);
+    await showFolder(userId,set[1],Number(set[4]));
+  }
+  return true;
+}
+async function showMultiPreviews(post,userId) {
+  if(!pendingMulti(post))return;
+  for(const t of post.multi_targets) {
+    if(String(t.channel_id)===String(post.channel_id))continue;
+    const access=await channelAccess(t.channel_id,userId,'create');
+    if(!access){await notify(userId,`⚠️ «${t.title}»: доступ отозван, отправка будет пропущена.`);continue;}
+    await notify(userId,`👁 Вариант для «${shortTitle(access.channel.title)}»`);
+    try {await sendToUser(userId,composeStyledPost(post.base_body||post.body,t.style));}
+    catch(e) {await notify(userId,`⚠️ «${shortTitle(access.channel.title)}»: ${e.message.slice(0,400)}\nЭтот вариант требует исправления.`);}
+  }
+}
+// Вызывается в транзакции с блокировкой исходного ep_posts. Повторный клик,
+// изменение расписания одного назначения и перезапуск не создают копии заново.
+async function expandMultiTargets(client,post,userId,due,timezone) {
+  if(!pendingMulti(post))return 0;
+  const policy=await getDeletionPolicy(deletionKey('p',post.id),client);
+  await client.query(`INSERT INTO ep_multi_deliveries(root_post_id,channel_id,post_id) VALUES($1,$2,$1) ON CONFLICT DO NOTHING`,[post.id,post.channel_id]);
+  let queued=1;
+  for(const t of post.multi_targets) {
+    if(String(t.channel_id)===String(post.channel_id))continue;
+    let access,body,error=null;
+    try{
+      access=await channelAccess(t.channel_id,userId,'create');
+      if(!access)throw new Error('Права на канал отозваны. Отправка пропущена.');
+      if(policy?.enabled && !memberCanDelete(access.member))throw new Error('Нет права удаления для заданного автоудаления. Отправка пропущена.');
+      body=composeStyledPost(post.base_body||post.body,t.style);
+    }catch(e){error=e.message.slice(0,1000);}
+    let child=null;
+    if(access && (!policy?.enabled || memberCanDelete(access.member))) {
+      child=(await client.query(`INSERT INTO ep_posts(channel_id,author_user_id,status,source_message,body,base_body,
+        post_style,is_saved,saved_at,last_error) VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,TRUE,NOW(),$8) RETURNING *`,
+        [t.channel_id,userId,error?'draft':'scheduled',JSON.stringify(post.source_message),JSON.stringify(body||post.base_body||post.body),
+        JSON.stringify(post.base_body||post.body),JSON.stringify(t.style),error])).rows[0];
+      if(policy?.enabled)await client.query(`INSERT INTO ep_auto_deletions(target_key,channel_id,capability,due_at,timezone,
+        requested_by,access_version,enabled,status) VALUES($1,$2,'create',$3,$4,$5,$6,TRUE,'armed')`,
+        [deletionKey('p',child.id),t.channel_id,policy.due_at,policy.timezone,userId,access.version]);
+      if(!error){
+        await client.query(`INSERT INTO ep_schedules(post_id,due_at,timezone,scheduled_by,access_version,body_snapshot)
+          VALUES($1,$2,$3,$4,$5,$6::jsonb)`,[child.id,due,timezone,userId,access.version,JSON.stringify(body)]);
+        queued++;
+      }
+    }
+    await client.query(`INSERT INTO ep_multi_deliveries(root_post_id,channel_id,post_id,last_error) VALUES($1,$2,$3,$4)`,[post.id,t.channel_id,child?.id||null,error]);
+  }
+  await client.query('UPDATE ep_posts SET multi_expanded=TRUE WHERE id=$1',[post.id]);
+  return queued;
+}
+async function queueMultiNow(session,post,callbackId) {
+  const userId=session.actor_user_id;
+  const access=await channelAccess(post.channel_id,userId,'create');
+  if(!access || !(await canUseOwnPost(post,userId))){await notify(userId,'Права изменились. Пост сохранён.');return;}
+  const client=await pool.connect();let saved=false;
+  try{
+    await client.query('BEGIN');
+    const form=(await client.query(`SELECT * FROM ep_composer_sessions WHERE actor_user_id=$1 AND nonce=$2 AND stage='preview' FOR UPDATE`,[userId,session.nonce])).rows[0];
+    const fresh=(await client.query('SELECT * FROM ep_posts WHERE id=$1 FOR UPDATE',[post.id])).rows[0];
+    if(form && String(form.post_id)===String(post.id) && fresh?.status==='draft' && pendingMulti(fresh) && fresh.preview_mid && fresh.controls_mid) {
+      const due=new Date();await assertPublicationWindow(deletionKey('p',post.id),due,client);
+      const body=composeStyledPost(fresh.base_body||fresh.body,fresh.post_style);
+      await client.query(`INSERT INTO ep_schedules(post_id,due_at,timezone,scheduled_by,access_version,body_snapshot)
+        VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(post_id) DO UPDATE SET status='scheduled',due_at=EXCLUDED.due_at,
+        timezone=EXCLUDED.timezone,scheduled_by=EXCLUDED.scheduled_by,access_version=EXCLUDED.access_version,
+        body_snapshot=EXCLUDED.body_snapshot,revision=ep_schedules.revision+1,attempts=0,next_at=NOW(),
+        dispatch_started_at=NULL,locked_at=NULL,last_error=NULL`,[post.id,due,access.channel.timezone||'Europe/Moscow',userId,access.version,JSON.stringify(body)]);
+      await expandMultiTargets(client,fresh,userId,due,access.channel.timezone||'Europe/Moscow');
+      await client.query(`UPDATE ep_posts SET status='scheduled',body=$2::jsonb,is_saved=TRUE,saved_at=NOW() WHERE id=$1`,[post.id,JSON.stringify(body)]);
+      await client.query('DELETE FROM ep_composer_sessions WHERE actor_user_id=$1 AND nonce=$2',[userId,session.nonce]);
+      saved=true;
+    }
+    await client.query('COMMIT');
+  }catch(e){await client.query('ROLLBACK').catch(()=>{});throw e;}finally{client.release();}
+  if(!saved){await notify(userId,'Эта отправка уже обработана. Откройте «Рассылки».');return;}
+  await answerCallback(callbackId,'Отправка поставлена в очередь. Результат будет отдельным для каждого канала.',true);
+  await showMultiReport(post.id,userId);
+}
+async function showMultiReport(root,userId,page=0) {
+  page=pageNumber(page);
+  const original=(await pool.query('SELECT * FROM ep_posts WHERE id=$1 AND author_user_id=$2',[root,userId])).rows[0];
+  if(!original)return;
+  const rows=(await pool.query(`SELECT d.*,p.status,p.last_error AS post_error,c.title,q.id AS schedule_id,q.status AS queue_status
+    FROM ep_multi_deliveries d JOIN channels c ON c.id=d.channel_id LEFT JOIN ep_posts p ON p.id=d.post_id
+    LEFT JOIN ep_schedules q ON q.post_id=p.id WHERE d.root_post_id=$1 ORDER BY d.channel_id`,[root])).rows;
+  const labels={published:'✅ опубликовано',scheduled:'🕒 в очереди',sending:'⏳ отправляется',publishing:'⏳ отправляется',
+    paused:'⚠️ отправка приостановлена',needs_check:'⚠️ проверьте результат в канале',draft:'✏️ требует редактирования',cancelled:'отменено'};
+  const lines=[],buttons=[];
+  for(const r of rows.slice(page*6,page*6+6)){
+    if(!(await channelAccess(r.channel_id,userId,'view'))) {lines.push('⚠️ Одно назначение недоступно: права отозваны.');continue;}
+    lines.push(`${shortTitle(r.title)}: ${labels[r.queue_status==='cancelled'?r.status:(r.queue_status||r.status)]||'⚠️ не отправлено'}`+
+      ((r.post_error||(!r.post_id?r.last_error:null))?` — ${(r.post_error||r.last_error).slice(0,180)}`:''));
+    if(r.status==='draft' && r.post_id)buttons.push([button(`✏️ ${shortTitle(r.title)}`,`dopen_${r.post_id}`)]);
+  }
+  await sendToUser(userId,{text:`📣 Рассылка #${root}\n${lines.join('\n')}\n\nПосле постановки в очередь каждый канал управляется отдельно в «Отложенных» и «Опубликованных».`,
+    attachments:keyboard([...buttons,...(page>0?[[button('◀️ Назад',`mreport_${root}_${page-1}`)]]:[]),...(rows.length>(page+1)*6?[[button('Далее ▶️',`mreport_${root}_${page+1}`)]]:[]),[button('🔄 Обновить результат',`mreport_${root}_${page}`)],[button('🕒 Отложенные','menu_scheduled_all_0')],[button('↩️ Меню','menu_main')]])});
+}
+async function listMultiReports(userId,page=0) {
+  page=pageNumber(page);
+  const rows=(await pool.query(`SELECT id FROM ep_posts WHERE author_user_id=$1 AND multi_expanded=TRUE ORDER BY id DESC LIMIT $2 OFFSET $3`,
+    [userId,ADMIN_PAGE_SIZE+1,page*ADMIN_PAGE_SIZE])).rows;
+  await sendToUser(userId,{text:'📣 Рассылки по нескольким каналам',attachments:keyboard([
+    ...rows.slice(0,ADMIN_PAGE_SIZE).map(r=>[button(`Рассылка #${r.id}`,`mreport_${r.id}`)]),
+    ...(page>0?[[button('◀️ Назад',`multilist_${page-1}`)]]:[]),
+    ...(rows.length>ADMIN_PAGE_SIZE?[[button('Далее ▶️',`multilist_${page+1}`)]]:[]),[button('↩️ Меню','menu_main')]
+  ])});
+}
+
 async function start() {
   await initDatabase();
   ready = true;
@@ -5396,3 +5691,4 @@ start().catch(error => {
   console.error("STARTUP ERROR:", error.message);
   process.exit(1);
 });
+
