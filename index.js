@@ -26,7 +26,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "max-crosspost-1";
+const VERSION = "max-trustat-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -5697,6 +5697,8 @@ async function initCrossDatabase(){
       remote BIGINT NOT NULL,original TEXT NOT NULL,url TEXT NOT NULL,media JSONB NOT NULL,mode TEXT NOT NULL,
       state TEXT NOT NULL DEFAULT 'pending',post_id BIGINT REFERENCES ep_posts(id),last_error TEXT,
       next_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(route_id,remote));
+    ALTER TABLE ep_cross_routes ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'public';
+    ALTER TABLE ep_cross_inputs ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'public';
   `);
 }
 function crossUsername(value){
@@ -5712,7 +5714,7 @@ async function crossBridge(payload){
   const response=await httpsRequest('https://everypost-telegram-bot.onrender.com/max-crosspost',{
     method:'POST',headers:{'Content-Type':'application/json','X-EveryPost-Time':stamp,'X-EveryPost-Signature':signature},body,timeout:180000});
   let data;try{data=JSON.parse(response.text);}catch{throw new Error('Сервис обработки запускается. Повторите через минуту.');}
-  if(response.status!==200||!data.ok){const e=new Error(data.message||'Сервис обработки недоступен. Повторите позже.');e.permanent=response.status===422;throw e;}
+  if(response.status!==200||!data.ok){const e=new Error(data.message||'Сервис обработки недоступен. Повторите позже.');e.permanent=response.status===422;e.pause=data.pause===true;throw e;}
   return data;
 }
 async function crossAccess(route,userId){
@@ -5752,7 +5754,8 @@ async function crossCard(id,userId){
   const r=await crossRoute(id,userId);if(!r){await notify(userId,'Связка недоступна.');return;}
   const c=await getChannel(r.channel_id);
   const counts=(await pool.query(`SELECT i.state,COUNT(*) n FROM ep_cross_items i WHERE route_id=$1 GROUP BY i.state`,[r.id])).rows;
-  await sendToUser(userId,{text:`🔁 ${shortTitle(r.title)} → ${shortTitle(c.title)}\nИсточник: https://t.me/${r.source}\n${r.enabled?'▶️ Включено':'⏸ На паузе'}\nРежим: ${r.mode==='ai'?'Переписать с ИИ':'Как есть'}\n`+
+  await sendToUser(userId,{text:`🔁 ${shortTitle(r.title)} → ${shortTitle(c.title)}\nИсточник: ${r.source_kind==='trustat'?'Trustat · https://t.me/c/'+r.source.slice(8):'https://t.me/'+r.source}\n${r.enabled?'▶️ Включено':'⏸ На паузе'}\nРежим: ${r.mode==='ai'?'Переписать с ИИ':'Как есть'}\n`+
+    (r.source_kind==='trustat'?'Проверка раз в 5 минут в пределах лимита Trustat. При исчерпании лимита связка встанет на паузу.\n':'')+
     'Режим применяется к новым найденным материалам. Оформление берётся из настроек MAX-канала. Переписывание передаёт текст подключённому сервису ИИ.\n'+
     counts.map(x=>`${({pending:'Ожидают обработки',failed:'Требуют проверки',queued:'Переданы в очередь MAX'})[x.state]||x.state}: ${x.n}`).join('\n')+
     (r.last_error?`\n⚠️ ${r.last_error.slice(0,350)}`:''),attachments:keyboard([
@@ -5777,12 +5780,21 @@ async function handleCrossMessage(message){
   if(message.link||message.body.attachments?.length){await notify(userId,'Пришлите ссылку текстом или /cancel.');return true;}
   try{
     if(!(await crossAccess(f,userId)))throw new Error('Права на канал изменились.');
-    const source=crossUsername(message.body.text);const info=await crossBridge({action:'resolve',source:'@'+source});
-    if(info.source!==source||!/^-[0-9]+$/.test(info.peer)||!Number.isSafeInteger(info.cursor)||info.cursor<0)throw new Error('Источник не удалось проверить.');
+    const isTrustat=f.source_kind==='trustat';
+    const input=isTrustat?String(message.body.text||'').trim():'@'+crossUsername(message.body.text);
+    const info=await crossBridge({action:isTrustat?'trustat_resolve':'resolve',source:input});
+    const source=isTrustat?info.source:input.slice(1);
+    if((isTrustat?(!/^trustat_[1-9][0-9]{0,11}$/.test(source)||info.peer!==String(-1000000000000-Number(source.slice(8)))):info.source!==source)||!/^-[0-9]+$/.test(info.peer)||!Number.isSafeInteger(info.cursor)||info.cursor<0)throw new Error('Источник не удалось проверить.');
     const client=await pool.connect();let route;
     try{await client.query('BEGIN');const claimed=await client.query('DELETE FROM ep_cross_inputs WHERE actor_user_id=$1 AND nonce=$2 RETURNING *',[userId,f.nonce]);
-      if(claimed.rowCount){route=(await client.query(`INSERT INTO ep_cross_routes(channel_id,actor_user_id,source,peer,title,cursor)
-        VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(channel_id,peer) DO UPDATE SET source=EXCLUDED.source,title=EXCLUDED.title RETURNING *`,[f.channel_id,userId,source,info.peer,String(info.title).slice(0,200),info.cursor])).rows[0];}
+      if(claimed.rowCount){
+        const kind=isTrustat?'trustat':'public';
+        const old=(await client.query('SELECT * FROM ep_cross_routes WHERE channel_id=$1 AND peer=$2 FOR UPDATE',[f.channel_id,info.peer])).rows[0];
+        if(old&&old.source_kind!==kind&&old.enabled)throw new Error('Сначала поставьте существующую связку на паузу, затем подключите источник заново.');
+        route=(await client.query(`INSERT INTO ep_cross_routes(channel_id,actor_user_id,source,peer,title,cursor,source_kind)
+          VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(channel_id,peer) DO UPDATE SET
+          source=EXCLUDED.source,title=EXCLUDED.title,source_kind=EXCLUDED.source_kind,
+          revision=ep_cross_routes.revision+1 RETURNING *`,[f.channel_id,userId,source,info.peer,String(info.title).slice(0,200),info.cursor,kind])).rows[0];}
       await client.query('INSERT INTO ep_command_inputs(max_message_id,actor_user_id,handled) VALUES($1,$2,TRUE) ON CONFLICT(max_message_id) DO UPDATE SET handled=TRUE',[message.body.mid,userId]);await client.query('COMMIT');
     }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
     if(route)await crossCard(route.id,userId);
@@ -5799,10 +5811,10 @@ async function handleCrossCallback(update){
     else if(m[1]==='xr')await crossCard(id,u);
     else if(m[1]==='xd'){
       if(!(await crossAccess({channel_id:id},u))){await notify(u,'Канал недоступен.');return true;}
-      await pool.query(`INSERT INTO ep_cross_inputs(actor_user_id,channel_id,nonce) VALUES($1,$2,$3) ON CONFLICT(actor_user_id)
-        DO UPDATE SET channel_id=EXCLUDED.channel_id,nonce=EXCLUDED.nonce,expires_at=NOW()+INTERVAL '30 minutes'`,[u,id,newEditNonce()]);
+      await pool.query(`INSERT INTO ep_cross_inputs(actor_user_id,channel_id,nonce,source_kind) VALUES($1,$2,$3,'trustat') ON CONFLICT(actor_user_id)
+        DO UPDATE SET channel_id=EXCLUDED.channel_id,nonce=EXCLUDED.nonce,source_kind='trustat',expires_at=NOW()+INTERVAL '30 minutes'`,[u,id,newEditNonce()]);
       await pool.query('DELETE FROM proposal_sessions WHERE max_user_id=$1',[u]);
-      await notify(u,'Пришлите ссылку на открытый Telegram-канал или @имя. Затем выберите режим и нажмите «Включить». Отмена: /cancel.');
+      await notify(u,'Пришлите ссылку на Telegram-канал или @имя. Источник должен быть доступен в базе Trustat; добавлять нашего бота в чужой канал не нужно. Для закрытого канала можно прислать ссылку-приглашение, если Trustat знает этот канал. Затем выберите режим и нажмите «Включить». Отмена: /cancel.');
     }else{const i=(await pool.query('SELECT * FROM ep_cross_items WHERE id=$1',[id])).rows[0];const r=i&&await crossRoute(i.route_id,u);if(r){await pool.query("UPDATE ep_cross_items SET state='pending',next_at=NOW(),last_error=NULL WHERE id=$1 AND state='failed' AND post_id IS NULL",[id]);await crossItems(r.id,u);}}
   }else if(items)await crossItems(items[1],u,Number(items[2]));
   else{const r=await crossRoute(change[2],u);if(!r)return true;
@@ -5838,15 +5850,19 @@ async function crossTick(){
     }
     const route=(await pool.query('SELECT * FROM ep_cross_routes WHERE enabled AND next_at<=NOW() ORDER BY next_at,id LIMIT 1')).rows[0];
     if(route){try{if(!(await crossAccess(route,route.actor_user_id)))throw new Error('Права на канал отозваны.');
-      const fetched=await crossBridge({action:'fetch',source:'@'+route.source,peer:route.peer,cursor:Number(route.cursor)});
+      const isTrustat=route.source_kind==='trustat';
+      const fetched=await crossBridge({action:isTrustat?'trustat_fetch':'fetch',source:isTrustat?route.source:'@'+route.source,peer:route.peer,cursor:Number(route.cursor)});
       if(!Array.isArray(fetched.posts)||fetched.posts.length>100||!Number.isSafeInteger(fetched.cursor)||fetched.cursor<Number(route.cursor))throw new Error('Некорректный ответ источника.');
       await client.query('BEGIN');const current=(await client.query('SELECT * FROM ep_cross_routes WHERE id=$1 FOR UPDATE',[route.id])).rows[0];
       if(current.enabled&&String(current.revision)===String(route.revision)){
         for(const p of fetched.posts){if(!Array.isArray(p)||!Number.isSafeInteger(p[0])||p[0]<=Number(route.cursor)||p[0]>fetched.cursor||typeof p[1]!=='string')throw new Error('Некорректный материал источника.');
-          await client.query(`INSERT INTO ep_cross_items(route_id,remote,original,url,media,mode) VALUES($1,$2,$3,$4,$5::jsonb,$6) ON CONFLICT(route_id,remote) DO NOTHING`,[route.id,p[0],p[1],`https://t.me/${route.source}/${p[0]}`,JSON.stringify(p[3]),route.mode]);}
-        await client.query("UPDATE ep_cross_routes SET cursor=$2,next_at=NOW()+INTERVAL '60 seconds',last_error=NULL WHERE id=$1",[route.id,fetched.cursor]);}
+          await client.query(`INSERT INTO ep_cross_items(route_id,remote,original,url,media,mode) VALUES($1,$2,$3,$4,$5::jsonb,$6) ON CONFLICT(route_id,remote) DO NOTHING`,[route.id,p[0],p[1],isTrustat?`https://t.me/c/${route.source.slice(8)}/${p[0]}`:`https://t.me/${route.source}/${p[0]}`,JSON.stringify(p[3]),route.mode]);}
+        await client.query(`UPDATE ep_cross_routes SET cursor=$2,next_at=NOW()+($3 * INTERVAL '1 second'),last_error=$4,
+          enabled=CASE WHEN $5 THEN FALSE ELSE enabled END,revision=revision+CASE WHEN $5 THEN 1 ELSE 0 END WHERE id=$1`,
+          [route.id,fetched.cursor,isTrustat?300:60,fetched.message?String(fetched.message).slice(0,500):null,fetched.pause===true]);}
       await client.query('COMMIT');
-    }catch(e){await client.query('ROLLBACK').catch(()=>{});await pool.query("UPDATE ep_cross_routes SET last_error=$2,next_at=NOW()+INTERVAL '5 minutes' WHERE id=$1",[route.id,e.message.slice(0,500)]);}}
+    }catch(e){await client.query('ROLLBACK').catch(()=>{});await pool.query(`UPDATE ep_cross_routes SET last_error=$2,next_at=NOW()+INTERVAL '5 minutes',
+      enabled=CASE WHEN $3 THEN FALSE ELSE enabled END,revision=revision+CASE WHEN $3 THEN 1 ELSE 0 END WHERE id=$1 AND revision=$4`,[route.id,e.message.slice(0,500),e.pause===true,route.revision]);}}
   }catch(e){console.error('CROSSPOST WORKER ERROR:',e.message);}finally{if(locked)await client.query('SELECT pg_advisory_unlock(19471,2)').catch(()=>{});client?.release();crossBusy=false;}
 }
 
