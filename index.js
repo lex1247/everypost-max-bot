@@ -617,7 +617,7 @@ async function handleStyleCallback(update) {
     if(verb==="sig"){
       if(!next.signature?.text){
         const defaults=styleForChannel(t.access.channel);
-        if(!defaults.signature?.text)throw new Error("Сначала сохраните или закройте пост, затем добавьте подпись: «Мои каналы» → канал → «Автоподпись».");
+        if(!defaults.signature?.text)throw new Error("Сначала сохраните или закройте пост, затем добавьте подпись: «Настройки каналов» → канал → «Автоподпись».");
         next.signature=defaults.signature;next.signature_on=true;
       }else next.signature_on=!next.signature_on;
     }else if(verb==="prop"){
@@ -628,7 +628,7 @@ async function handleStyleCallback(update) {
       if(next.discussion_on) next.discussion_on=false;
       else {
         const defaults=styleForChannel(t.access.channel);
-        if(!defaults.discussion_on||!defaults.discussion_url)throw new Error("Сначала подключите чат: «Мои каналы» → канал → «Чат канала».");
+        if(!defaults.discussion_on||!defaults.discussion_url)throw new Error("Сначала подключите чат: «Настройки каналов» → канал → «Чат канала».");
         next.discussion_on=true;next.discussion_url=defaults.discussion_url;
         next.discussion_group_id=defaults.discussion_group_id;
       }
@@ -2060,7 +2060,7 @@ async function showChannelAccess(channelId, userId) {
         `Собственные посты: ${access.grant.can_create_posts ? "разрешены" : "не разрешены"}.\n\n` +
         "Доступ относится только к этому каналу. Платежи и назначение сотрудников доступны владельцу.",
       attachments: keyboard([[button("📥 Предложки", "menu_inbox_0")],
-        [button("↩️ Мои каналы", "menu_channels_0")]])
+        [button("↩️ Настройки каналов", "menu_channels_0")]])
     });
     return;
   }
@@ -2086,7 +2086,7 @@ async function showChannelAccess(channelId, userId) {
       [button("💬 Чат канала", `dc_open_${c.id}`)],
       [button(`Кнопка предложки: ${c.post_style?.proposal_on ? "вкл" : "выкл"}`,
         `fmt_chprop_${c.id}_${c.style_version}_${c.post_style?.proposal_on ? 0 : 1}`)],
-      [button("↩️ Мои каналы", "menu_channels_0")]
+      [button("↩️ Настройки каналов", "menu_channels_0")]
     ])
   });
 }
@@ -2531,7 +2531,7 @@ function adminMenuBody(canCreate = true) {
     attachments: keyboard([
       ...(canCreate ? [[button("➕ Создать пост", "menu_create")]] : []),
       [button("📝 Черновики", "menu_drafts_0"), button("🕒 Отложенные", "menu_scheduled_all_0")],
-      [button("📥 Предложки", "menu_inbox_0"), button("📁 Мои каналы", "menu_channels_0")],
+      [button("📥 Предложки", "menu_inbox_0"), button("⚙️ Настройки каналов", "menu_channels_0")],
       [button("📤 Опубликованные", "publist_0")],
       [button("📂 Мои каналы", "folders_0"),button("📣 Рассылки", "multilist_0")],
       [button("🔁 Кросспостинг", "xc_0")]
@@ -2579,7 +2579,7 @@ async function listMyChannels(userId, page = 0) {
   const rows = channels.slice(page * ADMIN_PAGE_SIZE, (page + 1) * ADMIN_PAGE_SIZE);
   const nav = pageButtons("menu_channels", page, channels.length);
   await sendToUser(userId, {
-    text: "📁 Мои каналы\n\n" + (rows.length
+    text: "⚙️ Настройки каналов\n\n" + (rows.length
       ? "Выберите канал. Назначать и разжаловать админов может только владелец в EveryPost."
       : "На этой странице нет доступных каналов."),
     attachments: keyboard([
@@ -4145,7 +4145,7 @@ const QUICK_COMMANDS = [
   { name: "drafts", description: "Черновики" },
   { name: "scheduled", description: "Отложенные" },
   { name: "published", description: "Опубликованные и автоудаление" },
-  { name: "channels", description: "Мои каналы" },
+  { name: "channels", description: "Настройки каналов" },
   { name: "cancel", description: "Отменить текущий ввод" },
   { name: "help", description: "Помощь и команды" }
 ];
@@ -6048,4 +6048,3 @@ start().catch(error => {
   console.error("STARTUP ERROR:", error.message);
   process.exit(1);
 });
-
