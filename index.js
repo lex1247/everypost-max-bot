@@ -1041,6 +1041,7 @@ async function initDatabase() {
   await initMultiDatabase();
   await initCrossDatabase();
   await initEditorialDatabase();
+  await initSubscriptionDatabase();
   console.log("DATABASE READY");
 }
 
@@ -1168,6 +1169,7 @@ async function handleMessage(update) {
   if (chatType && chatType !== "dialog") return;
   await rememberUser(sender);
   if ((await pool.query("SELECT 1 FROM ep_command_inputs WHERE max_message_id=$1 AND handled=TRUE",[mid])).rowCount) return;
+  if (await handleSubscriptionMessage(message)) return;
   if (await handleEditorialMessage(message)) return;
   if (await handleCrossMessage(message)) return;
   if (await handleFolderMessage(message)) return;
@@ -1799,6 +1801,7 @@ async function handleCallback(update) {
   // Настройки доступа не меняются из групп или пересланных чужих карточек.
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
+  if (await handleSubscriptionCallback(update)) return;
   if (await handleEditorialCallback(update)) return;
   if(await editorialInput(update.callback?.user?.user_id)){await notify(update.callback.user.user_id,"Завершите правку или /cancel.");return;}
   if (await handleCrossCallback(update)) return;
@@ -2534,7 +2537,8 @@ function adminMenuBody(canCreate = true) {
       [button("📥 Предложки", "menu_inbox_0"), button("⚙️ Настройки каналов", "menu_channels_0")],
       [button("📤 Опубликованные", "publist_0")],
       [button("📂 Мои каналы", "folders_0"),button("📣 Рассылки", "multilist_0")],
-      [button("🔁 Кросспостинг", "xc_0")]
+      [button("🔁 Кросспостинг", "xc_0")],
+      [button("💳 Моя подписка", "sub_list_0")]
     ])
   };
 }
@@ -4136,6 +4140,99 @@ async function handleUpdate(update) {
   }
 }
 
+// ---------- Подписки по каналам; приём оплаты пока отключён ----------
+const CHANNEL_PLANS = Object.freeze([
+  { months: 1, price: 299, label: '1 месяц' },
+  { months: 3, price: 849, label: '3 месяца' },
+  { months: 6, price: 1599, label: '6 месяцев' },
+  { months: 12, price: 2999, label: '12 месяцев' }
+]);
+async function initSubscriptionDatabase() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS ep_channel_subscriptions (
+    channel_id BIGINT PRIMARY KEY REFERENCES channels(id),
+    plan_months INTEGER NOT NULL CHECK(plan_months IN (1,3,6,12)),
+    expires_at TIMESTAMPTZ NOT NULL,
+    assigned_by BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS ep_subscription_grants (
+    message_id TEXT PRIMARY KEY, channel_id BIGINT NOT NULL REFERENCES channels(id),
+    actor_id BIGINT NOT NULL, months INTEGER NOT NULL CHECK(months IN (1,3,6,12)),
+    expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );`);
+}
+function subscriptionStatus(row, now = new Date()) {
+  if (!row) return 'Бесплатный доступ на этапе запуска. Срок не назначен.';
+  const active = new Date(row.expires_at).getTime() > now.getTime();
+  const plan = CHANNEL_PLANS.find(p => p.months === Number(row.plan_months));
+  const until = new Date(row.expires_at).toLocaleString('ru-RU', { timeZone:'Europe/Moscow', dateStyle:'short', timeStyle:'short' });
+  return `Статус: ${active ? 'действует' : 'срок завершён'}\nПериод: ${plan?.label || 'не указан'}\nДействует до: ${until} (МСК)\nСрок назначен вручную; это не подтверждение оплаты.`;
+}
+async function showMySubscriptions(userId, page = 0) {
+  const channels = await accessibleChannels(userId, 'view');
+  page = pageNumber(page);
+  const rows = channels.slice(page * ADMIN_PAGE_SIZE, (page + 1) * ADMIN_PAGE_SIZE);
+  await sendToUser(userId, {text:'💳 Моя подписка\n\nПодписка оформляется на каждый канал отдельно. Администраторы этого канала отдельно не оплачиваются.\n\n' +
+    (channels.length ? 'Выберите канал, чтобы посмотреть статус и срок.' : 'У вас пока нет подключённых каналов с доступом к управлению. Тарифы можно посмотреть ниже.'),
+    attachments:keyboard([
+      ...rows.map(c => [button(shortTitle(c.title), `sub_channel_${c.id}`)]),
+      ...(pageButtons('sub_list', page, channels.length).length ? [pageButtons('sub_list', page, channels.length)] : []),
+      [button('📋 Тарифы', 'sub_plans')], [button('↩️ Меню', 'menu_main')]
+    ])});
+}
+async function showSubscriptionChannel(channelId, userId) {
+  const access = await channelAccess(channelId,userId,'view');
+  if (!access) { await notify(userId,'Канал недоступен.'); return; }
+  const row = (await pool.query('SELECT * FROM ep_channel_subscriptions WHERE channel_id=$1',[channelId])).rows[0];
+  await sendToUser(userId,{text:`💳 Подписка · «${shortTitle(access.channel.title)}»\n\n${subscriptionStatus(row)}\n\nПриём оплаты ещё не открыт. На этапе запуска окончание указанного срока не блокирует функции бота.`,
+    attachments:keyboard([[button('📋 Тарифы и продление','sub_plans')],[button('↩️ Моя подписка','sub_list_0')]])});
+}
+async function showSubscriptionPlans(userId) {
+  await sendToUser(userId,{text:'📋 Тарифы EveryPost\n\nНа один канал:\n' + CHANNEL_PLANS.map(p => `${p.label} — ${p.price.toLocaleString('ru-RU')} ₽`).join('\n') +
+    '\n\nАдминистраторы канала отдельно не оплачиваются.\n\nОплата и автоматическое продление пока недоступны. Сейчас бот работает в бесплатном режиме запуска. Деньги не списываются.',
+    attachments:keyboard([[button('↩️ Моя подписка','sub_list_0')]])});
+}
+async function handleSubscriptionCallback(update) {
+  const cb=update.callback, userId=cb?.user?.user_id, value=cb?.payload || '';
+  const list=value.match(/^sub_list_(\d+)$/), channel=value.match(/^sub_channel_(\d+)$/);
+  if(userId==null || !(list || channel || value==='sub_plans'))return false;
+  await answerCallback(cb.callback_id);
+  if(list)await showMySubscriptions(userId,list[1]);
+  else if(channel)await showSubscriptionChannel(channel[1],userId);
+  else await showSubscriptionPlans(userId);
+  return true;
+}
+async function handleSubscriptionMessage(message) {
+  const text=(message.body?.text || '').trim(), userId=message.sender.user_id;
+  if(/^\/subscription(?:@\w+)?$/i.test(text)) {await showMySubscriptions(userId);return true;}
+  if(!/^\/subscriptiongrant(?:@\w+)?(?:\s|$)/i.test(text))return false;
+  // Explicit service administrator only; channel ownership never grants billing privileges.
+  const admin=(process.env.SUBSCRIPTION_ADMIN_MAX_ID || '').trim();
+  if(!/^\d+$/.test(admin) || String(userId)!==admin){await notify(userId,'Назначать срок подписки может только администратор сервиса.');return true;}
+  const m=text.match(/^\/subscriptiongrant(?:@\w+)?\s+(\d+)\s+(1|3|6|12)$/i);
+  if(!m){await notify(userId,'Формат: /subscriptiongrant ID_канала 1|3|6|12. Это ручное назначение срока без оплаты.');return true;}
+  const db=await pool.connect();let result;
+  try {
+    await db.query('BEGIN');
+    const c=(await db.query('SELECT id FROM channels WHERE id=$1 AND active=TRUE FOR UPDATE',[m[1]])).rows[0];
+    if(!c)throw new Error('Активный канал не найден.');
+    const old=(await db.query('SELECT * FROM ep_subscription_grants WHERE message_id=$1',[message.body.mid])).rows[0];
+    if(old)result=old;
+    else {
+      result=(await db.query(`INSERT INTO ep_channel_subscriptions(channel_id,plan_months,expires_at,assigned_by)
+        VALUES($1,$2,NOW()+make_interval(months=>$2::integer),$3)
+        ON CONFLICT(channel_id) DO UPDATE SET plan_months=$2,
+          expires_at=GREATEST(ep_channel_subscriptions.expires_at,NOW())+make_interval(months=>$2::integer),
+          assigned_by=$3,updated_at=NOW() RETURNING *`,[m[1],Number(m[2]),userId])).rows[0];
+      await db.query('INSERT INTO ep_subscription_grants(message_id,channel_id,actor_id,months,expires_at) VALUES($1,$2,$3,$4,$5)',
+        [message.body.mid,m[1],userId,Number(m[2]),result.expires_at]);
+    }
+    await db.query('COMMIT');
+  }catch(e){await db.query('ROLLBACK').catch(()=>{});throw e;}finally{db.release();}
+  await notify(userId,`Срок подписки канала #${m[1]} назначен до ${new Date(result.expires_at).toLocaleString('ru-RU',{timeZone:'Europe/Moscow'})} (МСК). Оплата не проводилась.`);
+  return true;
+}
+
 // ---------- Быстрые команды MAX ----------
 // PATCH /me/commands регистрирует подсказки. Расположением меню управляет клиент MAX.
 const QUICK_COMMANDS = [
@@ -4146,6 +4243,7 @@ const QUICK_COMMANDS = [
   { name: "scheduled", description: "Отложенные" },
   { name: "published", description: "Опубликованные и автоудаление" },
   { name: "channels", description: "Настройки каналов" },
+  { name: "subscription", description: "Моя подписка и тарифы" },
   { name: "cancel", description: "Отменить текущий ввод" },
   { name: "help", description: "Помощь и команды" }
 ];
