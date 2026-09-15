@@ -29,6 +29,9 @@ def authenticate(raw, stamp, signature):
 
 async def action(app, data):
     operation = data.get('action')
+    if operation in ('content_fetch', 'content_prepare'):
+        from content_source import action as content_action
+        return await content_action(app, data)
     if operation in ('vk_resolve','vk_fetch'):
         provider=VKSource(app)
         if operation=='vk_resolve':return await provider.resolve(data.get('source'))

@@ -6,3 +6,5 @@ beautifulsoup4>=4.12,<5
 aiohttp>=3.10,<4
 psycopg[binary]>=3.2,<4
 Pillow>=11.3,<13
+yt-dlp==2026.8.19
+curl-cffi==0.16.3
