@@ -26,7 +26,7 @@ import tls from "node:tls";
 // Полный файл для существующего everypost-max-bot. Новые секреты не нужны.
 // Контент предложки и редакторский черновик хранятся отдельно.
 // Документация API: https://dev.max.ru/docs-api/methods/POST/messages
-const VERSION = "max-editorial-1";
+const VERSION = "max-content-1";
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -1042,6 +1042,7 @@ async function initDatabase() {
   await initCrossDatabase();
   await initEditorialDatabase();
   await initSubscriptionDatabase();
+  await initContentDatabase();
   console.log("DATABASE READY");
 }
 
@@ -1801,6 +1802,7 @@ async function handleCallback(update) {
   // Настройки доступа не меняются из групп или пересланных чужих карточек.
   const recipientType = update.message?.recipient?.chat_type;
   if (recipientType && recipientType !== "dialog") return;
+  if (await handleContentCallback(update)) return;
   if (await handleSubscriptionCallback(update)) return;
   if (await handleEditorialCallback(update)) return;
   if(await editorialInput(update.callback?.user?.user_id)){await notify(update.callback.user.user_id,"Завершите правку или /cancel.");return;}
@@ -2537,7 +2539,7 @@ function adminMenuBody(canCreate = true) {
       [button("📥 Предложки", "menu_inbox_0"), button("⚙️ Настройки каналов", "menu_channels_0")],
       [button("📤 Опубликованные", "publist_0")],
       [button("📂 Мои каналы", "folders_0"),button("📣 Рассылки", "multilist_0")],
-      [button("🔁 Кросспостинг", "xc_0")],
+      [button("🎬 Контент", "content_open"), button("🔁 Кросспостинг", "xc_0")],
       [button("💳 Моя подписка", "sub_list_0")]
     ])
   };
@@ -5457,7 +5459,8 @@ app.get('/calendar', (req, res) => {
   calendarHeaders(res);
   const nonce = crypto.randomBytes(18).toString('base64');
   res.set('Content-Security-Policy', `default-src 'none'; script-src 'nonce-${nonce}' https://st.max.ru; style-src 'nonce-${nonce}'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors https://max.ru https://*.max.ru`);
-  res.type('html').send(calendarHtml(nonce));
+  const launchScript = `<script nonce="${nonce}">(()=>{const h=new URLSearchParams(location.hash.slice(1));const b=window.WebApp||window.Max?.WebApp||window.MAX?.WebApp;const raw=b?.initData||h.get('WebAppData')||'';const p=new URLSearchParams(raw);if((p.get('start_param')||b?.initDataUnsafe?.start_param||h.get('WebAppStartParam'))==='content')location.replace('/content#'+new URLSearchParams({WebAppData:raw}).toString());})();</script>`;
+  res.type('html').send(calendarHtml(nonce).replace('<script nonce=',launchScript+'<script nonce='));
 });
 function calendarEndpoint(action) {
   return async (req, res) => {
@@ -5821,7 +5824,7 @@ async function crossBridge(payload){
     const signature=crypto.createHmac('sha256',key).update(stamp+'.'+body).digest('hex');
     let response;
     try{response=await httpsRequest('https://everypost-telegram-bot.onrender.com/max-crosspost',{
-      method:'POST',headers:{'Content-Type':'application/json','X-EveryPost-Time':stamp,'X-EveryPost-Signature':signature},body,timeout:65000});}
+      method:'POST',headers:{'Content-Type':'application/json','X-EveryPost-Time':stamp,'X-EveryPost-Signature':signature},body,timeout:payload.action==='content_prepare'?160000:65000});}
     catch(e){if(retryRead&&attempt<2){await sleep(15000);continue;}throw Error('Сервис чтения не ответил. Повторим позже; материалы сохранены.');}
     let data;try{data=JSON.parse(response.text);}catch{
       if(retryRead&&attempt<2&&[200,502,503,504].includes(response.status)){await sleep(15000);continue;}
@@ -6130,6 +6133,241 @@ async function handleEditorialMessage(message){
  }catch(e){await notify(user,e.message.slice(0,500)+'\n/cancel — отмена.');}return true;
 }
 
+// Content discovery uses the existing authenticated bridge and ep_schedules.
+const CONTENT_SEEDS = [
+ ['ZSqV2aYs5','ailq309','7630155394786069782'],['ZSqV2fPGM','assel_nogai','7517331297430162706'],
+ ['ZSqV2YwYT','preobrazhenskaya_style','6918097245090974978'],['ZSqVY315r','senita_stylist','6945895321968839938'],
+ ['ZSqVYka9j','potapova.style.hair','7477844578209565954'],['ZSqVYUEqv','miaoloo','7221888273554181419'],
+ ['ZSqVFVxK2','maxprxgove7','7644846844866088200'],['ZSqVFES9R','albina_hair','7618120483661237525'],
+ ['ZSqVNsMHm','emerson3089','7630757847998958861']
+];
+const CONTENT_PROVIDERS = {tiktok: {fetch: 'content_fetch', prepare: 'content_prepare'}};
+let contentBusy = false;
+async function initContentDatabase() {
+ await pool.query(`
+ CREATE TABLE IF NOT EXISTS ep_content_sources (
+  id BIGSERIAL PRIMARY KEY, channel_id BIGINT NOT NULL REFERENCES channels(id), actor_user_id BIGINT NOT NULL,
+  provider TEXT NOT NULL, url TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  checked_at TIMESTAMPTZ, next_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), failures INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT, UNIQUE(channel_id,provider,url));
+ CREATE INDEX IF NOT EXISTS ep_content_sources_due ON ep_content_sources(next_at) WHERE enabled;
+ CREATE TABLE IF NOT EXISTS ep_content_candidates (
+  id BIGSERIAL PRIMARY KEY, channel_id BIGINT NOT NULL REFERENCES channels(id),
+  provider TEXT NOT NULL, remote_id TEXT NOT NULL, canonical_url TEXT NOT NULL, original_url TEXT NOT NULL,
+  author TEXT, title TEXT, published_at TIMESTAMPTZ, duration DOUBLE PRECISION, metrics JSONB NOT NULL DEFAULT '{}',
+  metadata_status TEXT NOT NULL DEFAULT 'unverified', state TEXT NOT NULL DEFAULT 'new'
+    CHECK(state IN ('new','selected','preparing','queued','skipped','failed')),
+  selected_by BIGINT, due_at TIMESTAMPTZ, prepared_body JSONB, content_hash TEXT,
+  post_id BIGINT UNIQUE REFERENCES ep_posts(id), last_error TEXT, lease_until TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(channel_id,provider,remote_id));
+ CREATE INDEX IF NOT EXISTS ep_content_review ON ep_content_candidates(channel_id,state,id);
+ CREATE UNIQUE INDEX IF NOT EXISTS ep_content_hash_once ON ep_content_candidates(channel_id,content_hash)
+   WHERE content_hash IS NOT NULL AND post_id IS NOT NULL;
+ CREATE TABLE IF NOT EXISTS ep_content_discoveries (
+  candidate_id BIGINT NOT NULL REFERENCES ep_content_candidates(id), source_id BIGINT NOT NULL REFERENCES ep_content_sources(id),
+  PRIMARY KEY(candidate_id,source_id));
+ CREATE TABLE IF NOT EXISTS ep_content_metric_samples (
+  id BIGSERIAL PRIMARY KEY, candidate_id BIGINT NOT NULL REFERENCES ep_content_candidates(id),
+  observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), metrics JSONB NOT NULL);
+ CREATE TABLE IF NOT EXISTS ep_content_publication_metrics (
+  id BIGSERIAL PRIMARY KEY, publication_id BIGINT NOT NULL REFERENCES ep_publications(id),
+  observed_at TIMESTAMPTZ NOT NULL, provider TEXT NOT NULL DEFAULT 'max', metrics JSONB NOT NULL,
+  UNIQUE(publication_id,observed_at));
+ `);
+}
+function contentSourceUrl(value) {
+ if(typeof value!=='string'||value.length>2048)throw Error('Нужна ссылка TikTok или @имя.');
+ let s=value.trim();if(/^@[a-zA-Z0-9_.]{1,32}$/.test(s))s='https://www.tiktok.com/'+s;
+ let u;try{u=new URL(s);}catch{throw Error('Некорректная ссылка TikTok.');}
+ if(u.protocol!=='https:'||u.username||u.password||(u.port&&u.port!=='443'))throw Error('Нужна HTTPS-ссылка TikTok.');
+ if(['vt.tiktok.com','vm.tiktok.com'].includes(u.hostname)&&/^\/[a-zA-Z0-9]+\/?$/.test(u.pathname))return u.origin+u.pathname;
+ if(!['tiktok.com','www.tiktok.com'].includes(u.hostname)||!/^\/@[a-zA-Z0-9_.]{1,32}(?:\/video\/\d{10,25})?\/?$/.test(u.pathname))throw Error('Нужна ссылка на аккаунт или видео TikTok.');
+ return 'https://www.tiktok.com'+u.pathname.replace(/\/$/,'');
+}
+async function contentAccess(channelId,userId,owner=false) {
+ if(!/^[1-9]\d{0,17}$/.test(String(channelId)))throw Error('Некорректный канал.');
+ const a=await channelAccess(channelId,userId,'create');
+ if(!a||(owner&&!a.owner))throw Error('Нет доступа к этому каналу.');return a;
+}
+function contentMetadata(item) {
+ if(!item||item.provider!=='tiktok'||!/^\d{10,25}$/.test(item.remote_id))throw Error('Некорректный ответ TikTok.');
+ const url=contentSourceUrl(item.canonical_url);
+ if(!url.endsWith('/video/'+item.remote_id))throw Error('ID и ссылка ролика не совпадают.');
+ const numeric=v=>typeof v==='number'&&Number.isFinite(v)&&v>=0?v:null;
+ const metrics={};for(const key of ['views','likes','comments','shares'])metrics[key]=numeric(item.metrics?.[key]);
+ const date=item.published_at==null?null:new Date(item.published_at);
+ if(date&&!Number.isFinite(date.getTime()))throw Error('Некорректная дата ролика.');
+ return {...item,canonical_url:url,original_url:contentSourceUrl(item.original_url),author:String(item.author||'').slice(0,100),
+   title:String(item.title||'').slice(0,4000),published_at:date,duration:numeric(item.duration),metrics};
+}
+async function contentUpsert(client,channelId,sourceId,raw,verified=true) {
+ const i=contentMetadata(raw);
+ const row=(await client.query(`INSERT INTO ep_content_candidates(channel_id,provider,remote_id,canonical_url,original_url,
+  author,title,published_at,duration,metrics,metadata_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
+  ON CONFLICT(channel_id,provider,remote_id) DO UPDATE SET
+   canonical_url=CASE WHEN $12 THEN EXCLUDED.canonical_url ELSE ep_content_candidates.canonical_url END,
+   author=CASE WHEN $12 THEN EXCLUDED.author ELSE ep_content_candidates.author END,
+   title=CASE WHEN $12 THEN EXCLUDED.title ELSE ep_content_candidates.title END,
+   published_at=COALESCE(EXCLUDED.published_at,ep_content_candidates.published_at),
+   duration=COALESCE(EXCLUDED.duration,ep_content_candidates.duration),
+   metrics=CASE WHEN $12 THEN EXCLUDED.metrics ELSE ep_content_candidates.metrics END,
+   metadata_status=CASE WHEN $12 THEN 'verified' ELSE ep_content_candidates.metadata_status END, updated_at=NOW()
+  RETURNING *`,[channelId,i.provider,i.remote_id,i.canonical_url,i.original_url,i.author,i.title,i.published_at,i.duration,
+   JSON.stringify(i.metrics),verified?'verified':'unverified',verified])).rows[0];
+ if(sourceId)await client.query('INSERT INTO ep_content_discoveries VALUES($1,$2) ON CONFLICT DO NOTHING',[row.id,sourceId]);
+ if(verified)await client.query('INSERT INTO ep_content_metric_samples(candidate_id,metrics) VALUES($1,$2::jsonb)',[row.id,JSON.stringify(i.metrics)]);
+ return row;
+}
+async function contentAddSources(channelId,userId,values) {
+ await contentAccess(channelId,userId,true);
+ if(!Array.isArray(values)||!values.length||values.length>50)throw Error('Добавьте от 1 до 50 источников за раз.');
+ const urls=[...new Set(values.map(contentSourceUrl))];
+ const client=await pool.connect();try{await client.query('BEGIN');
+  await client.query('SELECT id FROM channels WHERE id=$1 FOR UPDATE',[channelId]);
+  const existing=(await client.query('SELECT url FROM ep_content_sources WHERE channel_id=$1',[channelId])).rows;
+  if(new Set([...existing.map(s=>s.url),...urls]).size>200)throw Error('Лимит MVP: 200 источников на канал.');
+  for(const url of urls)await client.query(`INSERT INTO ep_content_sources(channel_id,actor_user_id,provider,url)
+   VALUES($1,$2,'tiktok',$3) ON CONFLICT(channel_id,provider,url) DO NOTHING`,[channelId,userId,url]);
+  await client.query('COMMIT');
+ }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+}
+async function contentSeed(channelId,userId) {
+ await contentAddSources(channelId,userId,CONTENT_SEEDS.flatMap(([short,author])=>['https://vt.tiktok.com/'+short+'/', '@'+author]));
+ // Mappings from the conversation are references, not freshly verified metadata.
+ for(const [short,author,id] of CONTENT_SEEDS)await contentUpsert(pool,channelId,null,{
+  provider:'tiktok',remote_id:id,original_url:'https://vt.tiktok.com/'+short+'/',
+  canonical_url:`https://www.tiktok.com/@${author}/video/${id}`,author,title:'Пример из вашей подборки',metrics:{}},false);
+}
+async function contentDecide(channelId,userId,id,decision,dueAt) {
+ await contentAccess(channelId,userId);
+ if(!/^[1-9]\d{0,17}$/.test(String(id))||!['queue','skip','restore'].includes(decision))throw Error('Некорректное действие.');
+ const client=await pool.connect();try{await client.query('BEGIN');
+  // Channel lock serializes slot allocation across concurrent selections.
+  await client.query('SELECT id FROM channels WHERE id=$1 FOR UPDATE',[channelId]);
+  const row=(await client.query('SELECT * FROM ep_content_candidates WHERE id=$1 AND channel_id=$2 FOR UPDATE',[id,channelId])).rows[0];
+  if(!row)throw Error('Кандидат не найден.');
+  if(decision==='queue'&&['selected','preparing','queued'].includes(row.state)){await client.query('COMMIT');return row;}
+  if(['selected','preparing','queued'].includes(row.state))throw Error('Ролик уже выбран. Управляйте публикацией в «Отложенных».');
+  if(decision==='queue') {
+   let due;
+   if(dueAt){due=new Date(dueAt);if(!Number.isFinite(due.getTime())||due.getTime()<Date.now()+5*60000||due.getTime()>Date.now()+365*86400000)throw Error('Выберите время от 5 минут до года вперёд.');}
+   else {
+    const latest=(await client.query(`SELECT MAX(due_at) AS due FROM (
+     SELECT due_at FROM ep_schedules q JOIN ep_posts p ON p.id=q.post_id WHERE p.channel_id=$1 AND q.status IN ('scheduled','sending')
+     UNION ALL SELECT due_at FROM ep_content_candidates WHERE channel_id=$1 AND state IN ('selected','preparing')) slots`,[channelId])).rows[0].due;
+    due=new Date(Math.max(Date.now()+10*60000,latest?new Date(latest).getTime()+90*60000:0));
+   }
+   await client.query(`UPDATE ep_content_candidates SET state='selected',selected_by=$3,due_at=$4,last_error=NULL,updated_at=NOW()
+    WHERE id=$1 AND channel_id=$2`,[id,channelId,userId,due]);
+  }else await client.query(`UPDATE ep_content_candidates SET state=$3,last_error=NULL,updated_at=NOW() WHERE id=$1 AND channel_id=$2`,[id,channelId,decision==='skip'?'skipped':'new']);
+  await audit(channelId,userId,'content_'+decision,id,{},client);
+  await client.query('COMMIT');
+  return (await pool.query('SELECT id,state,due_at,post_id FROM ep_content_candidates WHERE id=$1',[id])).rows[0];
+ }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+}
+async function contentQueue(row,prepared) {
+ const access=await contentAccess(row.channel_id,row.selected_by);
+ if(!prepared||!/^([a-f0-9]{64})$/.test(prepared.content_hash)||prepared.body?.attachments?.length!==1||
+    prepared.body.attachments[0].type!=='video'||typeof prepared.body.attachments[0].payload?.token!=='string'||!prepared.body.attachments[0].payload.token)throw Error('Видео не подготовлено.');
+ const base={text:'',attachments:[{type:'video',payload:{token:prepared.body.attachments[0].payload.token}}]};
+ const style=styleForChannel(access.channel),body=composeStyledPost(base,style);
+ const client=await pool.connect();try{await client.query('BEGIN');
+  await client.query('SELECT id FROM channels WHERE id=$1 FOR UPDATE',[row.channel_id]);
+  const fresh=(await client.query('SELECT * FROM ep_content_candidates WHERE id=$1 FOR UPDATE',[row.id])).rows[0];
+  if(!fresh||fresh.post_id||fresh.state!=='preparing'){await client.query('COMMIT');return;}
+  if((await client.query('SELECT id FROM ep_content_candidates WHERE channel_id=$1 AND content_hash=$2 AND post_id IS NOT NULL',[row.channel_id,prepared.content_hash])).rowCount)throw Error('Этот видеофайл уже передан в очередь канала.');
+  if(new Date(fresh.due_at).getTime()<Date.now()+60000)throw Error('Подготовка задержалась: выберите новое время публикации.');
+  const p=(await client.query(`INSERT INTO ep_posts(channel_id,author_user_id,status,body,base_body,source_message,post_style,is_saved,saved_at)
+   VALUES($1,$2,'scheduled',$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb,TRUE,NOW()) RETURNING id`,
+   [row.channel_id,row.selected_by,JSON.stringify(body),JSON.stringify(base),JSON.stringify({content_candidate_id:row.id,provider:row.provider,
+    source_url:row.original_url,canonical_url:row.canonical_url,author:row.author}),JSON.stringify(style)])).rows[0];
+  await client.query(`INSERT INTO ep_schedules(post_id,due_at,timezone,scheduled_by,access_version,body_snapshot)
+   VALUES($1,$2,$3,$4,$5,$6::jsonb)`,[p.id,fresh.due_at,access.channel.timezone||'Europe/Moscow',row.selected_by,access.version,JSON.stringify(body)]);
+  await client.query(`UPDATE ep_content_candidates SET state='queued',post_id=$2,prepared_body=$3::jsonb,content_hash=$4,
+   lease_until=NULL,last_error=NULL,updated_at=NOW() WHERE id=$1`,[row.id,p.id,JSON.stringify(base),prepared.content_hash]);
+  await client.query('COMMIT');
+ }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+}
+async function contentCollect(source) {
+ await contentAccess(source.channel_id,source.actor_user_id,true);
+ const adapter=CONTENT_PROVIDERS[source.provider];if(!adapter)throw Error('Источник пока не подключён.');
+ const data=await crossBridge({action:adapter.fetch,provider:source.provider,source:source.url});
+ if(!Array.isArray(data.items)||data.items.length>30)throw Error('Некорректный список кандидатов.');
+ const client=await pool.connect();try{await client.query('BEGIN');
+  const fresh=(await client.query('SELECT * FROM ep_content_sources WHERE id=$1 FOR UPDATE',[source.id])).rows[0];
+  if(fresh?.enabled){for(const item of data.items)await contentUpsert(client,source.channel_id,source.id,item);
+   await client.query("UPDATE ep_content_sources SET checked_at=NOW(),next_at=NOW()+INTERVAL '6 hours',failures=0,last_error=NULL WHERE id=$1",[source.id]);}
+  await client.query('COMMIT');
+ }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+}
+async function contentTick() {
+ if(!ready||contentBusy)return;contentBusy=true;let client,locked=false;
+ try{client=await pool.connect();locked=(await client.query('SELECT pg_try_advisory_lock(19471,3) acquired')).rows[0].acquired;if(!locked)return;
+  await pool.query("UPDATE ep_content_candidates SET state='selected',lease_until=NULL WHERE state='preparing' AND lease_until<NOW() AND post_id IS NULL");
+  const row=(await pool.query(`UPDATE ep_content_candidates SET state='preparing',lease_until=NOW()+INTERVAL '5 minutes'
+   WHERE id=(SELECT id FROM ep_content_candidates WHERE state='selected' ORDER BY due_at,id LIMIT 1) RETURNING *`)).rows[0];
+  if(row)try{
+   await contentAccess(row.channel_id,row.selected_by);
+   const data=await crossBridge({action:CONTENT_PROVIDERS[row.provider].prepare,provider:row.provider,url:row.canonical_url});
+   await contentQueue(row,data);
+  }catch(e){await pool.query("UPDATE ep_content_candidates SET state='failed',last_error=$2,lease_until=NULL WHERE id=$1 AND post_id IS NULL",[row.id,String(e.message).slice(0,500)]);}
+  const source=(await pool.query('SELECT * FROM ep_content_sources WHERE enabled AND next_at<=NOW() ORDER BY next_at,id LIMIT 1')).rows[0];
+  if(source)try{await contentCollect(source);}catch(e){
+   await pool.query(`UPDATE ep_content_sources SET checked_at=NOW(),failures=failures+1,last_error=$2,
+    next_at=NOW()+(LEAST(21600,300*POWER(2,LEAST(failures,6))) * INTERVAL '1 second') WHERE id=$1`,[source.id,String(e.message).slice(0,500)]);
+  }
+ }catch(e){console.error('CONTENT WORKER:',e.message);}finally{
+  if(locked)await client.query('SELECT pg_advisory_unlock(19471,3)').catch(()=>{});client?.release();contentBusy=false;
+ }
+}
+async function contentState(channelId,userId,input) {
+ const a=await contentAccess(channelId,userId);
+ const state=['new','selected','queued','skipped','failed'].includes(input.filter)?input.filter:'new';
+ const page=Math.min(10000,Math.max(0,Number.parseInt(input.page,10)||0));
+ const rows=(await pool.query(`SELECT c.id,c.provider,c.remote_id,c.canonical_url,c.original_url,c.author,c.title,c.published_at,c.duration,
+  c.metrics,c.metadata_status,c.state,c.due_at,c.post_id,c.last_error,q.status AS queue_status,q.due_at AS queue_due_at,p.published_mid
+  FROM ep_content_candidates c LEFT JOIN ep_posts p ON p.id=c.post_id LEFT JOIN ep_schedules q ON q.post_id=p.id
+  WHERE c.channel_id=$1 AND (c.state=$2 OR ($2='selected' AND c.state='preparing'))
+  ORDER BY c.published_at DESC NULLS LAST,c.id DESC LIMIT 13 OFFSET $3`,[channelId,state,page*12])).rows;
+ const sources=(await pool.query('SELECT id,url,enabled,checked_at,next_at,last_error FROM ep_content_sources WHERE channel_id=$1 ORDER BY id',[channelId])).rows;
+ return {ok:true,title:a.channel.title,timezone:a.channel.timezone||'Europe/Moscow',owner:a.owner,items:rows.slice(0,12),hasMore:rows.length>12,sources};
+}
+async function handleContentCallback(update) {
+ if(update.callback?.payload!=='content_open')return false;
+ const u=update.callback.user.user_id;await answerCallback(update.callback.callback_id);
+ await sendToUser(u,{text:'Контент · TikTok\nВыберите канал, добавьте источники и отберите ролики. Выбранные видео попадут в существующее расписание EveryPost.',
+  attachments:keyboard([[{type:'open_app',text:'🎬 Открыть контент',web_app:BOT_USERNAME,payload:'content'}]])});return true;
+}
+function contentEndpoint(action) {
+ return async(req,res)=>{calendarHeaders(res);try{
+  if(!ready)calendarReject(503,'Сервис запускается.');
+  if(req.get('Origin')&&req.get('Origin')!==CALENDAR_ORIGIN)calendarReject(403,'Запрос с другого сайта запрещён.');
+  if(!req.is('application/json'))calendarReject(415,'Ожидается JSON.');
+  const auth=verifyCalendarInitData(req.body?.initData);calendarLimit(auth.userId,action!=='state'&&action!=='channels');
+  const input=req.body||{},channelId=String(input.channelId||'');let result={ok:true};
+  if(action==='channels')result.channels=(await accessibleChannels(auth.userId,'create')).map(c=>({id:String(c.id),title:c.title}));
+  else if(action==='state')result=await contentState(channelId,auth.userId,input);
+  else if(action==='sources')await contentAddSources(channelId,auth.userId,input.urls);
+  else if(action==='seed')await contentSeed(channelId,auth.userId);
+  else if(action==='decide')result.item=await contentDecide(channelId,auth.userId,String(input.id||''),input.decision,input.dueAt);
+  else if(action==='toggle'){
+   await contentAccess(channelId,auth.userId,true);
+   if(typeof input.enabled!=='boolean'||!/^\d{1,18}$/.test(String(input.id)))throw Error('Некорректный источник.');
+   await pool.query('UPDATE ep_content_sources SET enabled=$3,next_at=NOW() WHERE channel_id=$1 AND id=$2',[channelId,input.id,input.enabled]);
+  }
+  res.json(result);
+ }catch(e){res.status(e instanceof CalendarError?e.status:400).json({ok:false,message:e instanceof CalendarError?e.publicMessage:String(e.message).slice(0,500)});}};
+}
+for(const action of ['channels','state','sources','seed','decide','toggle'])app.post('/content/api/'+action,contentEndpoint(action));
+app.get('/content',(req,res)=>{
+ calendarHeaders(res);const nonce=crypto.randomBytes(18).toString('base64');
+ res.set('Content-Security-Policy',`default-src 'none'; script-src 'nonce-${nonce}' https://st.max.ru; style-src 'nonce-${nonce}'; connect-src 'self'; frame-src https://www.tiktok.com; base-uri 'none'; form-action 'none'; frame-ancestors https://max.ru https://*.max.ru`);
+ res.type('html').send(CONTENT_HTML.replaceAll('__CSP_NONCE__',nonce));
+});
+
+const CONTENT_HTML = "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>EveryPost · Контент</title><script src=\"https://st.max.ru/js/max-web-app.js\"></script>\n<style nonce=\"__CSP_NONCE__\">\n:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#17151b;color:#f5f1f7}*{box-sizing:border-box}body{margin:0}main{max-width:1120px;margin:auto;padding:24px 16px}h1{font-size:26px;margin:8px 0}h2{font-size:18px}p{line-height:1.5;color:#bdb5c6}button,select,input,textarea{font:inherit;color:inherit;background:#322c39;border:1px solid #51465b;border-radius:10px;padding:11px}button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}button.primary{background:#b92e77;border-color:#b92e77}a{color:#eea7d6}header,.toolbar,.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.toolbar{margin:20px 0}select{max-width:100%}#cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(275px,1fr));gap:16px}.card,details{border:1px solid #443b4b;background:#231e29;border-radius:16px;padding:16px}.card{min-width:0}.card iframe{width:100%;height:420px;border:0;border-radius:10px;background:#100f13}.meta{font-size:13px;color:#bdb5c6;line-height:1.7;overflow-wrap:anywhere}.title{white-space:pre-wrap;overflow-wrap:anywhere;max-height:88px;overflow:auto}.actions{margin-top:14px}.error{color:#ffb2bd;white-space:pre-wrap}#status{min-height:26px;white-space:pre-wrap}textarea{width:100%;min-height:100px;margin:12px 0}.source{border-top:1px solid #443b4b;padding:14px 0;overflow-wrap:anywhere}.source button{margin:8px 0}.pager{display:flex;gap:12px;justify-content:center;margin:24px}label{font-size:13px;display:grid;gap:6px}.card input{width:100%}summary{cursor:pointer;font-weight:650}details{margin-bottom:18px}.empty{padding:35px 12px;text-align:center;border:1px dashed #51465b;border-radius:16px}[hidden]{display:none!important}\n</style></head><body><main><header><h1>🎬 Контент</h1><select id=\"channel\" aria-label=\"Канал MAX\"></select></header>\n<p>Посмотрите ролики и выберите подходящие. Они появятся в «Отложенных» вашего EveryPost после подготовки видео.</p>\n<div id=\"status\" role=\"status\" aria-live=\"polite\"></div>\n<details id=\"sourcesPanel\"><summary>Источники TikTok</summary><p>Добавьте несколько аккаунтов или ссылок на ролики — по одному на строку. Проверка доступных источников каждые 6 часов; ошибки видны ниже.</p>\n<div id=\"sourceControls\"><textarea id=\"urls\" aria-label=\"Ссылки TikTok\" placeholder=\"@имя_автора&#10;https://www.tiktok.com/@имя/video/...\"></textarea><div class=\"actions\"><button id=\"add\">Добавить источники</button><button id=\"seed\">Добавить 9 примеров и их авторов</button></div></div><div id=\"sources\"></div></details>\n<div class=\"toolbar\"><select id=\"filter\" aria-label=\"Статус кандидатов\"><option value=\"new\">Новые</option><option value=\"selected\">Готовятся</option><option value=\"queued\">В очереди</option><option value=\"failed\">Нужна проверка</option><option value=\"skipped\">Пропущены</option></select><button id=\"refresh\">Обновить</button><span class=\"meta\" id=\"zone\"></span></div>\n<div id=\"cards\"></div><div class=\"pager\"><button id=\"prev\">← Назад</button><span id=\"page\"></span><button id=\"next\">Далее →</button></div>\n</main><script nonce=\"__CSP_NONCE__\">\n(()=>{'use strict';const $=id=>document.getElementById(id);let page=0,busy=false,owner=false;\nconst bridge=()=>window.WebApp||window.Max?.WebApp||window.MAX?.WebApp;\nconst hash=new URLSearchParams(location.hash.slice(1));const initData=bridge()?.initData||hash.get('WebAppData')||'';\nfunction status(text,error=false){$('status').textContent=text;$('status').className=error?'error':'';}\nasync function request(action,body={}){const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),25000);try{\nconst r=await fetch('/content/api/'+action,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'omit',cache:'no-store',body:JSON.stringify({initData,channelId:$('channel').value,...body}),signal:ctl.signal});\nconst data=await r.json();if(!r.ok||!data.ok)throw Error(data.message||'Сервис не ответил.');return data;\n}catch(e){if(e.name==='AbortError')throw Error('Ответ задерживается. Обновите список: повторное нажатие «В очередь» не создаст дубль.');throw e;}finally{clearTimeout(timer);}}\nconst el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};\nfunction button(text,action,primary=false){const b=el('button',text,primary?'primary':'');b.addEventListener('click',()=>act(action));return b;}\nasync function act(fn){if(busy)return;busy=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{await fn();}catch(e){status(e.message,true);}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false);$('prev').disabled=page===0;$('next').disabled=!hasMore;}}\nlet hasMore=false;\nfunction date(value){return value?new Date(value).toLocaleString('ru-RU'):'неизвестна';}\nasync function load(){if(!$('channel').value)return;const data=await request('state',{filter:$('filter').value,page});owner=data.owner;hasMore=data.hasMore;\n$('zone').textContent=data.title+' · '+data.timezone;$('sourceControls').hidden=!owner;$('cards').replaceChildren();\nfor(const item of data.items){const card=el('article',undefined,'card');const frame=document.createElement('iframe');frame.loading='lazy';frame.title='Превью ролика '+(item.author||'TikTok');frame.referrerPolicy='no-referrer';\nframe.src='https://www.tiktok.com/player/v1/'+encodeURIComponent(item.remote_id)+'?autoplay=0';frame.allow='fullscreen';card.append(frame);\nconst link=el('a','Открыть оригинал · @'+(item.author||'автор неизвестен'));link.href=item.canonical_url;link.target='_blank';link.rel='noopener noreferrer';card.append(link);\ncard.append(el('p',item.title,'title'));\nconst m=item.metrics||{};card.append(el('div','Дата: '+date(item.published_at)+' · '+(item.duration==null?'длительность неизвестна':Math.round(item.duration)+' сек'),'meta'));\ncard.append(el('div','Просмотры: '+(m.views??'—')+' · Лайки: '+(m.likes??'—')+' · Комментарии: '+(m.comments??'—')+' · Репосты: '+(m.shares??'—'),'meta'));\nif(item.metadata_status!=='verified')card.append(el('p','Стартовый пример. Данные TikTok ещё не проверены.','meta'));\nif(item.last_error)card.append(el('p',item.last_error,'error'));\nif(item.post_id)card.append(el('p','Пост #'+item.post_id+' · '+({scheduled:'в расписании',published:'опубликован',paused:'на паузе',needs_check:'нужна проверка',cancelled:'отменён'}[item.queue_status]||item.queue_status||item.state)+' · '+date(item.queue_due_at||item.due_at),'meta'));\nelse if(['selected','preparing'].includes(item.state))card.append(el('p','Подготовка видео · '+date(item.due_at),'meta'));\nelse{const label=el('label','Время публикации (ваше местное время, необязательно)');const input=document.createElement('input');input.type='datetime-local';label.append(input);card.append(label,el('p','Без выбора: ближайший слот через 10 минут, далее с интервалом 90 минут. Точное время появится после выбора.','meta'));\nconst actions=el('div',undefined,'actions');actions.append(button('В очередь',async()=>{\nif(input.value&&!Number.isFinite(new Date(input.value).getTime()))throw Error('Проверьте дату.');\nconst r=await request('decide',{id:item.id,decision:'queue',dueAt:input.value?new Date(input.value).toISOString():null});await load();status('Ролик выбран на '+date(r.item.due_at)+'. Подготовка видна во вкладке «Готовятся».');},true));\nactions.append(button(item.state==='skipped'?'Вернуть':'Пропустить',async()=>{await request('decide',{id:item.id,decision:item.state==='skipped'?'restore':'skip'});await load();status('Выбор сохранён.');}));card.append(actions);}\n$('cards').append(card);}\nif(!data.items.length)$('cards').append(el('div','Здесь пока нет роликов. Добавьте источники или выберите другой статус.','empty'));\n$('sources').replaceChildren();for(const s of data.sources){const row=el('div',undefined,'source');row.append(el('div',s.url),el('div',(s.enabled?'Включён':'На паузе')+' · Проверка: '+date(s.checked_at),'meta'));if(s.last_error)row.append(el('p',s.last_error,'error'));if(owner)row.append(button(s.enabled?'Пауза':'Включить',async()=>{await request('toggle',{id:s.id,enabled:!s.enabled});await load();}));$('sources').append(row);}\n$('prev').disabled=page===0;$('next').disabled=!hasMore;$('page').textContent='Страница '+(page+1);}\n$('refresh').onclick=()=>act(async()=>{await load();status('Список обновлён.');});\n$('channel').onchange=$('filter').onchange=()=>act(async()=>{page=0;await load();status('');});\n$('prev').onclick=()=>act(async()=>{page=Math.max(0,page-1);await load();});$('next').onclick=()=>act(async()=>{page++;await load();});\n$('add').onclick=()=>act(async()=>{await request('sources',{urls:$('urls').value.split(/\\n/).map(s=>s.trim()).filter(Boolean)});$('urls').value='';await load();status('Источники добавлены. Сбор начнётся автоматически.');});\n$('seed').onclick=()=>act(async()=>{await request('seed');await load();status('Добавлены 9 стартовых примеров и их авторы. Повторное добавление безопасно.');});\nasync function start(){if(!initData){status('Откройте «Контент» через меню EveryPost в MAX.',true);return;}await act(async()=>{const d=await request('channels');for(const c of d.channels){const o=el('option',c.title);o.value=c.id;$('channel').append(o);}if(!d.channels.length){status('Нет каналов с правом создания постов.',true);return;}await load();});}\nstart();})();\n</script></body></html>\n";
+
 async function start() {
   await initDatabase();
   ready = true;
@@ -6141,8 +6379,10 @@ async function start() {
   });
   setInterval(() => void runWorker(), 700).unref();
   setInterval(() => void crossTick(), 10000).unref();
+  setInterval(() => void contentTick(), 10000).unref();
 }
 start().catch(error => {
   console.error("STARTUP ERROR:", error.message);
   process.exit(1);
 });
+
