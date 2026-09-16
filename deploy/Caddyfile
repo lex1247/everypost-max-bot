@@ -1,0 +1,8 @@
+{$MAX_DOMAIN} {
+    reverse_proxy max:3000
+}
+{$TG_DOMAIN} {
+    @migration path /migration/*
+    respond @migration 404
+    reverse_proxy telegram:8080
+}

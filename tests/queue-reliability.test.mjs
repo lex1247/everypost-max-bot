@@ -372,7 +372,7 @@ await test('Published text edit keeps media and requires an explicit save',async
 });
 await test('Read-only bridge retries transient responses and legacy uploads never auto-retry',async()=>{
  const start=source.indexOf('async function crossBridge(payload){'),end=source.indexOf('async function crossAccess',start);
- const isolated=vm.createContext({crypto,Buffer,TOKEN:'fake',Date,JSON,Error,sleep:async()=>{},httpsRequest:async()=>{isolated.calls++;return isolated.calls===1?{status:503,text:'warming'}:{status:200,text:'{"ok":true}'};},calls:0});
+ const isolated=vm.createContext({crypto,Buffer,TOKEN:'fake',BRIDGE_URL:'https://bridge.example/max-crosspost',Date,JSON,Error,sleep:async()=>{},httpsRequest:async()=>{isolated.calls++;return isolated.calls===1?{status:503,text:'warming'}:{status:200,text:'{"ok":true}'};},calls:0});
  vm.runInContext(source.slice(start,end),isolated);assert.equal((await vm.runInContext('crossBridge({action:"trustat_fetch"})',isolated)).ok,true);assert.equal(isolated.calls,2);
  for(const action of ['content_fetch']){
   isolated.calls=0;assert.equal((await vm.runInContext(`crossBridge({action:"${action}"})`,isolated)).ok,true);assert.equal(isolated.calls,2);
@@ -390,7 +390,7 @@ await test('Read-only bridge retries transient responses and legacy uploads neve
 
 await test('TikTok readiness retries without upload; cached preparation retries lost responses safely',async()=>{
  const start=source.indexOf('async function crossBridge(payload){'),end=source.indexOf('async function crossAccess',start);
- const isolated=vm.createContext({crypto,Buffer,TOKEN:'fake',Date,JSON,Error,sleep:async()=>{},health:0,prepares:0,
+ const isolated=vm.createContext({crypto,Buffer,TOKEN:'fake',BRIDGE_URL:'https://bridge.example/max-crosspost',Date,JSON,Error,sleep:async()=>{},health:0,prepares:0,
  httpsRequest:async(url,options)=>{const p=JSON.parse(options.body);
   if(p.action==='content_health'){isolated.health++;return isolated.health===1?{status:200,text:'warming'}:{status:200,text:JSON.stringify({ok:true,service:'everypost-content',version:2})};}
   isolated.prepares++;if(isolated.prepares===1)throw Error('response lost');return {status:200,text:JSON.stringify({ok:true,body:{cached:true}})};

@@ -1,0 +1,9 @@
+[Unit]
+Description=EveryPost encrypted off-server backup
+After=docker.service
+Requires=docker.service
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/everypost/deploy
+ExecStart=/bin/bash /opt/everypost/deploy/backup.sh
+TimeoutStartSec=1800

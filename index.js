@@ -31,7 +31,17 @@ const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.MAX_BOT_TOKEN?.trim();
 const DATABASE_URL = process.env.DATABASE_URL;
 const BOT_USERNAME = "id190206555510_3_bot";
-const WEBHOOK_URL = "https://everypost-max-bot.onrender.com/webhook";
+function serviceOrigin(value, name) {
+  const u = new URL(value);
+  if (u.protocol !== 'https:' || u.username || u.password || u.search || u.hash || u.pathname !== '/')
+    throw new Error(name + ' must be an HTTPS origin without path or credentials');
+  return u.origin;
+}
+const PUBLIC_URL = serviceOrigin(process.env.PUBLIC_URL || 'https://everypost-max-bot.onrender.com', 'PUBLIC_URL');
+const BRIDGE_URL = serviceOrigin(process.env.BRIDGE_URL || 'https://everypost-telegram-bot.onrender.com', 'BRIDGE_URL') + '/max-crosspost';
+const RUN_MODE = process.env.EP_RUN_MODE || 'active';
+if (!['active', 'standby'].includes(RUN_MODE)) throw new Error('Invalid EP_RUN_MODE');
+const WEBHOOK_URL = PUBLIC_URL + '/webhook';
 const API_URL = "https://platform-api2.max.ru";
 
 if (!TOKEN) throw new Error("MAX_BOT_TOKEN is not set");
@@ -55,6 +65,26 @@ app.use(express.json({ limit: "2mb" }));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let ready = false;
 let workerBusy = false;
+let webhookReady = false;
+const workerSeen = { posting: Date.now(), crosspost: Date.now(), content: Date.now() };
+app.use((req, res, next) => {
+  if (RUN_MODE === 'standby' && !['GET', 'HEAD'].includes(req.method))
+    return res.status(503).json({ok: false, message: 'Standby instance'});
+  next();
+});
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query({text: 'SELECT 1', query_timeout: 5000});
+    const now = Date.now();
+    const workers = RUN_MODE === 'standby' || (webhookReady &&
+      now - workerSeen.posting < 10 * 60000 && now - workerSeen.crosspost < 20 * 60000 &&
+      now - workerSeen.content < 30 * 60000);
+    const ok = ready && workers;
+    res.status(ok ? 200 : 503).json({ok, service: 'EveryPost MAX', mode: RUN_MODE});
+  } catch {
+    res.status(503).json({ok: false, service: 'EveryPost MAX', mode: RUN_MODE});
+  }
+});
 let maxAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: true });
 let certificateLoading;
 let apiTail = Promise.resolve();
@@ -4726,6 +4756,7 @@ async function runWorker() {
       workerClient.release(releaseError);
     }
     workerBusy = false;
+    workerSeen.posting = Date.now();
   }
 }
 
@@ -4736,6 +4767,7 @@ async function registerWebhook() {
       update_types: ["message_created", "message_callback", "bot_started", "bot_added", "bot_removed"],
       secret: SECRET
     });
+    webhookReady = true;
     console.log("WEBHOOK READY");
   } catch (error) {
     console.error("WEBHOOK SETUP ERROR:", error.message);
@@ -5825,7 +5857,7 @@ async function crossBridge(payload){
     const stamp=String(Math.floor(Date.now()/1000));
     const signature=crypto.createHmac('sha256',key).update(stamp+'.'+body).digest('hex');
     let response;
-    try{response=await httpsRequest('https://everypost-telegram-bot.onrender.com/max-crosspost',{
+    try{response=await httpsRequest(BRIDGE_URL,{
       method:'POST',headers:{'Content-Type':'application/json','X-EveryPost-Time':stamp,'X-EveryPost-Signature':signature},body,timeout:payload.action==='content_health'?15000:payload.action==='content_prepare'?215000:payload.action==='content_inspect'?175000:65000});}
     catch(e){if(payload.action.startsWith('content_'))console.log('CONTENT BRIDGE TRANSPORT:',payload.action,e.name);if(retryRead&&attempt<2){await sleep(15000);continue;}const err=Error('Обработчик не ответил за отведённое время. Материалы сохранены.');err.safeRetry=retryRead;throw err;}
     if(payload.action.startsWith('content_'))console.log('CONTENT BRIDGE RESPONSE:',payload.action,response.status);
@@ -5987,7 +6019,7 @@ async function crossTick(){
       await client.query('COMMIT');
     }catch(e){await client.query('ROLLBACK').catch(()=>{});await pool.query(`UPDATE ep_cross_routes SET last_error=$2,next_at=NOW()+INTERVAL '5 minutes',
       enabled=CASE WHEN $3 THEN FALSE ELSE enabled END,revision=revision+CASE WHEN $3 THEN 1 ELSE 0 END WHERE id=$1 AND revision=$4`,[route.id,e.message.slice(0,500),e.pause===true,route.revision]);}}
-  }catch(e){console.error('CROSSPOST WORKER ERROR:',e.message);}finally{if(locked)await client.query('SELECT pg_advisory_unlock(19471,2)').catch(()=>{});client?.release();crossBusy=false;}
+  }catch(e){console.error('CROSSPOST WORKER ERROR:',e.message);}finally{if(locked)await client.query('SELECT pg_advisory_unlock(19471,2)').catch(()=>{});client?.release();crossBusy=false;workerSeen.crosspost=Date.now();}
 }
 
 // Editorial controls: source rules, related publications and editing published text.
@@ -6496,7 +6528,7 @@ async function contentTick() {
   }
   if(!row)await contentInspectNext();
  }catch(e){console.error('CONTENT WORKER:',e.message);}finally{
-  if(locked)await client.query('SELECT pg_advisory_unlock(19471,3)').catch(()=>{});client?.release();contentBusy=false;
+  if(locked)await client.query('SELECT pg_advisory_unlock(19471,3)').catch(()=>{});client?.release();contentBusy=false;workerSeen.content=Date.now();
  }
 }
 async function contentMove(channelId,userId,id,revision,dueAt) {
@@ -6580,13 +6612,14 @@ async function start() {
   ready = true;
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`EveryPost ${VERSION} started on port ${PORT}`);
-    void registerWebhook();
-    void registerCommands();
+    if (RUN_MODE === 'active') { void registerWebhook(); void registerCommands(); }
     console.log("CALENDAR UI READY: /calendar");
   });
-  setInterval(() => void runWorker(), 700).unref();
-  setInterval(() => void crossTick(), 10000).unref();
-  setInterval(() => void contentTick(), 10000).unref();
+  if (RUN_MODE === 'active') {
+    setInterval(() => void runWorker(), 700).unref();
+    setInterval(() => void crossTick(), 10000).unref();
+    setInterval(() => void contentTick(), 10000).unref();
+  }
 }
 start().catch(error => {
   console.error("STARTUP ERROR:", error.message);

@@ -1,0 +1,7 @@
+[Unit]
+Description=Check EveryPost once a minute
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=60s
+[Install]
+WantedBy=timers.target

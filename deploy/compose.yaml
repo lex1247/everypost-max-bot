@@ -1,0 +1,104 @@
+name: everypost
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+services:
+  db:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    env_file: ./config/db.env
+    volumes:
+      - pgdata:/var/lib/postgresql
+    shm_size: 128mb
+    mem_limit: 768m
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    logging: *logging
+  max:
+    build:
+      context: ../max
+      dockerfile: ../deploy/Dockerfile.max
+    restart: unless-stopped
+    init: true
+    env_file: ./config/max.env
+    environment:
+      PORT: '3000'
+      EP_RUN_MODE: ${EP_RUN_MODE:-standby}
+    ports: ['127.0.0.1:13000:3000']
+    depends_on:
+      db: {condition: service_healthy}
+    read_only: true
+    tmpfs: [/tmp:size=64m,mode=1777]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    stop_grace_period: 90s
+    healthcheck:
+      test: [CMD, node, -e, 'fetch("http://127.0.0.1:3000/health",{signal:AbortSignal.timeout(8000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging: *logging
+  telegram:
+    build:
+      context: ../telegram
+      dockerfile: ../deploy/Dockerfile.telegram
+    restart: unless-stopped
+    init: true
+    env_file: ./config/telegram.env
+    environment:
+      PORT: '8080'
+      WEB_MODE: '1'
+      DATA_DIR: /data
+      EP_RUN_MODE: ${EP_RUN_MODE:-standby}
+      EP_STRICT_HEALTH: '1'
+    ports: ['127.0.0.1:18080:8080']
+    depends_on:
+      db: {condition: service_healthy}
+    volumes: [telegram-data:/data]
+    read_only: true
+    tmpfs: [/tmp:size=384m,mode=1777]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1536m
+    stop_grace_period: 90s
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8080/health",timeout=8).read()']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging: *logging
+  edge:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    env_file: ./config/domains.env
+    ports: ['80:80', '443:443', '443:443/udp']
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [max, telegram]
+    mem_limit: 192m
+    logging: *logging
+  backup:
+    image: restic/restic:0.19.1
+    profiles: [maintenance]
+    env_file: ./config/backup.env
+    volumes:
+      - ./backups:/backup:ro
+      - ./config:/config:ro
+      - restic-cache:/root/.cache/restic
+    mem_limit: 384m
+volumes:
+  pgdata:
+  telegram-data:
+  caddy-data:
+  caddy-config:
+  restic-cache:
