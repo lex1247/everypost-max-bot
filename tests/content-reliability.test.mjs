@@ -154,7 +154,7 @@ await test('Replacement pauses old media, atomically swaps video and preserves d
  const unchanged=(await sql('SELECT * FROM ep_schedules WHERE id=$1',[q.id])).rows[0];
  assert.equal(unchanged.body_snapshot.attachments.find(a=>a.type==='video').payload.token,'clean-replacement');
 });
-const fp={"version":1,"duration":35,"frames":["80c4c0212733361cfeffff30818183ff","a0c5d063273b1b96fcffff318180c0ff","90e3c34327970b1bfcf9f9e0c0c1c1ff","80c4d07361072b39ffffff39800080df","81cdc0626c263d1cfdffff38060280ff","d0e271f18d971f04fcffff38c04081fe","81c5c0738b8f3326fffffff8410081f7","406160618786938fffffffbdc1c1c1c3"],"colors":[[161,137,133],[167,142,136],[150,121,116],[168,138,129],[169,142,137],[175,148,141],[172,141,132],[179,149,140]]};
+const fp={"version": 1, "duration": 35, "frames": ["80c4c0212733361cfeffff30818183ff", "a0c5d063273b1b96fcffff318180c0ff", "90e3c34327970b1bfcf9f9e0c0c1c1ff", "80c4d07361072b39ffffff39800080df", "81cdc0626c263d1cfdffff38060280ff", "d0e271f18d971f04fcffff38c04081fe", "81c5c0738b8f3326fffffff8410081f7", "406160618786938fffffffbdc1c1c1c3"], "colors": [[161, 137, 133], [167, 142, 136], [150, 121, 116], [168, 138, 129], [169, 142, 137], [175, 148, 141], [172, 141, 132], [179, 149, 140]]};
 await test('Video comparison accepts recompression, rejects different sequence and blank images',async()=>{
  const near=JSON.parse(JSON.stringify(fp));near.frames=near.frames.map(h=>(BigInt('0x'+h)^1n).toString(16).padStart(32,'0'));
  assert.equal(run('sameVideo(a,b)',{a:fp,b:near}),true);
@@ -209,5 +209,13 @@ await test('Background inspection indexes existing posts first and supports chan
  assert.equal(await run('contentInspectNext(true)'),false);
  assert.equal(await run('contentInspectNext()'),true);assert.equal((await get(candidate.id)).scan_state,'ready');
  assert.ok(inspected[1].endsWith('8841'));
+});
+await test('Successful inspection preserves the preparation lease so a restart can reclaim it',async()=>{
+ const row=await make('7888888888888888851');
+ await sql("UPDATE ep_content_candidates SET state='preparing',selected_by=7,due_at=NOW()+INTERVAL '1 day',lease_until=NOW()+INTERVAL '15 minutes' WHERE id=$1",[row.id]);
+ const before=await get(row.id);
+ await run('contentSaveInspection(row,data)',{row:before,data:{content_hash:'8'.repeat(64),fingerprint:{...fp,duration:55}}});
+ const after=await get(row.id);assert.equal(after.state,'preparing');assert.equal(after.scan_state,'ready');
+ assert.equal(+new Date(after.lease_until),+new Date(before.lease_until));
 });
 console.log(`${n} tests passed`);await db.close();
