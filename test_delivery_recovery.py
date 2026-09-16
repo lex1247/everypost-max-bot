@@ -11,6 +11,7 @@ from media import normal_media
 from media_download import download, MediaTemporary
 from public_telegram import PublicTelegram, SourceMissing, parse_preview
 from test_public_telegram import page
+from trustat_source import source_text
 
 
 PHOTO = {'photos': [{'url': 'https://cdn4.telesco.pe/file/new.jpg'}]}
@@ -57,6 +58,11 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PublicMediaTests(unittest.IsolatedAsyncioTestCase):
+    def test_trustat_formatting_becomes_plain_caption_and_keeps_links(self):
+        self.assertEqual(source_text('<b>Причёска</b><br><a href="https://example.org/x">Ссылка</a> &amp; текст'),
+                         'Причёска\nСсылка (https://example.org/x) & текст')
+        self.assertEqual(source_text('Длина < 3 см, цена > 100'), 'Длина < 3 см, цена > 100')
+        self.assertEqual(source_text('<p>Первый</p><p>Второй</p>'), 'Первый\nВторой')
     def test_mixed_album_keeps_order_and_ignores_only_video_fallback(self):
         media = '''<a class="tgme_widget_message_photo_wrap" style="background-image:url('https://cdn4.telesco.pe/a.jpg')"></a>
             <div class="tgme_widget_message_video_player"><video class="blured" src="https://cdn4.telesco.pe/blur.mp4"></video>
@@ -160,12 +166,13 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_trustat_fallback_only_for_hidden_files_and_fresh_check(self):
         with patch.dict(os.environ, {'TRUSTAT_API_KEY': 'test'}):
-            value = {'channel_id': 99, 'message_id': 1, 'source': 'telegram', 'text': 'Подпись',
+            value = {'channel_id': 99, 'message_id': 1, 'source': 'telegram', 'text': '<b>Подпись</b>',
                      'media': {'media_type': 'mediaPhoto', 'file_url': 'https://static1.trustat.ru/a.jpg'}}
             self.app.public_tg.single.return_value = (1, '', 'https://t.me/news_channel/1', {'unsupported': ['скрыто']})
             with patch('trustat_source.Trustat.detail', AsyncMock(return_value=value)) as detail:
                 self.assertEqual((await self.app.recovery.refresh(1))['status'], 'review')
                 detail.assert_awaited_once_with(99, 1, fresh=True)
+                self.assertEqual(json.loads(self.s.rows('SELECT payload FROM delivery_parts')[0][0])['caption'], 'Подпись')
 
     async def test_temporary_download_exhaustion_is_durable_and_bounded(self):
         await self.app.recovery.refresh(1);await self.app.recovery.retry(1)

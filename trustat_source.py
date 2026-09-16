@@ -4,8 +4,30 @@ import os
 import re
 import time
 from urllib.parse import urlparse, quote
+from bs4 import BeautifulSoup
 
 BASE='https://api-public.trustat.me/public/v1'
+
+
+def source_text(value):
+    """Trustat returns Telegram formatting as HTML; our publication plans use plain text."""
+    text = str(value or '')
+    if not re.search(r'</?(?:b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|code|pre|blockquote|br|p|div|tg-emoji)\b', text, re.I):
+        return text
+    soup = BeautifulSoup(text, 'html.parser')
+    for node in soup.select('script,style'):
+        node.decompose()
+    for node in soup.select('br'):
+        node.replace_with('\n')
+    for node in soup.select('img[alt]'):
+        node.replace_with(node.get('alt', ''))
+    for node in soup.select('a[href]'):
+        href, label = node.get('href', ''), node.get_text()
+        if urlparse(href).scheme in ('https', 'http', 'tg', 'mailto') and href != label.strip():
+            node.replace_with(label + ' (' + href + ')')
+    for node in soup.select('p,div,blockquote'):
+        node.append('\n')
+    return soup.get_text().replace('\xa0', ' ').strip()
 
 class TrustatError(Exception):
     def __init__(self,message,*,pause=False,retry_after=300):
@@ -114,7 +136,7 @@ class Trustat:
                 if not result:raise
                 pause_error=e;break
             media=post_media(p)
-            result.append([mid,p.get('text') or '',f'https://t.me/c/{cid}/{mid}',media]);cursor=mid
+            result.append([mid,source_text(p.get('text')),f'https://t.me/c/{cid}/{mid}',media]);cursor=mid
         return {'posts':result,'cursor':cursor,'pause':bool(pause_error and pause_error.pause),
                 'message':str(pause_error) if pause_error else None}
 

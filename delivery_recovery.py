@@ -6,7 +6,7 @@ import re
 import time
 from media import normal_media, publication_parts
 from public_telegram import SourceMissing
-from trustat_source import Trustat, TrustatError, post_media
+from trustat_source import Trustat, TrustatError, post_media, source_text
 
 ATTENTION = ('failed', 'unknown', 'review', 'unavailable', 'subscription_hold', 'repairing')
 STATUS_NAMES = {'failed': 'Ошибка', 'unknown': 'Нужно проверить канал', 'review': 'Готово к повтору',
@@ -45,7 +45,7 @@ class DeliveryRecovery:
         media = post_media(original)
         if media['unsupported']:
             raise ValueError('Trustat не предоставил полный исходный файл. Нужен оригинал или пересылка поста в бота.')
-        return (post[0], original.get('text') or '', post[2], media)
+        return (post[0], source_text(original.get('text')), post[2], media)
 
     async def enrich_batch(self, peer, posts):
         out = []
@@ -166,7 +166,7 @@ class DeliveryRecovery:
     async def batch(self):
         ids = [r['id'] for r in self.s.rows("""SELECT d.id FROM deliveries d JOIN posts p ON p.id=d.post
             JOIN sources s ON s.id=p.source WHERE s.platform='tg' AND d.mode='original'
-            AND d.status='failed' ORDER BY d.id DESC LIMIT 20""")]
+            AND d.status IN ('failed','review') ORDER BY d.id DESC LIMIT 20""")]
         await self.say(f'Проверяю оригиналы: {len(ids)}. В канал пока ничего не отправляется.')
         for id in ids:
             try:
