@@ -9,7 +9,47 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
-from media import normal_media, photo_url
+from media import normal_media, photo_url, video_url
+from media_download import MediaTemporary
+
+
+class SourceMissing(ValueError):
+    pass
+
+
+def widget_media(widget):
+    gallery, unsupported = [], []
+    for node in widget.select('.tgme_widget_message_photo_wrap, .tgme_widget_message_video_player'):
+        if 'tgme_widget_message_photo_wrap' in node.get('class', []):
+            found = re.search(r'background-image\s*:\s*url\([\'\"]?(https://[^\'\"\)]+)', node.get('style', ''))
+            if found:
+                gallery.append({'type': 'photo', 'url': photo_url(found[1]),
+                                'spoiler': 'spoiler' in ' '.join(node.get('class', []))})
+            else:
+                unsupported.append('недоступное фото')
+        else:
+            videos = [v for v in node.select('video') if 'blured' not in v.get('class', [])]
+            urls = list(dict.fromkeys(v.get('src') or (v.select_one('source[src]') or {}).get('src', '') for v in videos))
+            if len(urls) == 1 and urls[0]:
+                gallery.append({'type': 'video', 'url': video_url(urls[0])})
+            else:
+                unsupported.append('видео')
+    if widget.select_one('video') and not widget.select_one('.tgme_widget_message_video_player'):
+        unsupported.append('видео')
+    for selector, label in (('.tgme_widget_message_document_wrap', 'документ'),
+                            ('.tgme_widget_message_voice_player', 'голосовое сообщение'),
+                            ('.tgme_widget_message_audio_player', 'аудио'),
+                            ('.tgme_widget_message_sticker_wrap', 'стикер')):
+        if widget.select_one(selector):
+            unsupported.append(label)
+    # Telegram includes a browser fallback inside every working video player.
+    for hidden in widget.select('.message_media_not_supported'):
+        if not hidden.find_parent(class_='tgme_widget_message_video_player'):
+            unsupported.append('вложение скрыто на публичной странице Telegram')
+    if any(item['type'] == 'video' for item in gallery):
+        return normal_media({'gallery': gallery, 'unsupported': unsupported})
+    return normal_media({'photos': [{k: v for k, v in item.items() if k != 'type'} for item in gallery],
+                         'unsupported': unsupported})
 
 
 @dataclass
@@ -61,22 +101,7 @@ def parse_preview(html, username):
                 if urlparse(href).scheme in ('https', 'http', 'tg', 'mailto') and href != label.strip():
                     link.replace_with(label + ' (' + href + ')')
             text = body.get_text().replace('\xa0', ' ').strip()
-        photos, unsupported = [], []
-        for photo in widget.select('.tgme_widget_message_photo_wrap'):
-            style = photo.get('style', '')
-            found = re.search(r'background-image\s*:\s*url\([\'\"]?(https://[^\'\"\)]+)', style)
-            if found:
-                photos.append({'url': photo_url(found[1]),
-                               'spoiler': 'spoiler' in ' '.join(photo.get('class', []))})
-            else:
-                unsupported.append('недоступное фото')
-        if widget.select_one('video, .tgme_widget_message_video_player'):
-            unsupported.append('видео')
-        if widget.select_one('.tgme_widget_message_document_wrap, .tgme_widget_message_voice_player, '
-                             '.tgme_widget_message_audio_player, .tgme_widget_message_sticker_wrap, '
-                             '.message_media_not_supported'):
-            unsupported.append('другое медиа')
-        media = normal_media({'photos': photos, 'unsupported': unsupported})
+        media = widget_media(widget)
         stamp = widget.select_one('time[datetime]')
         if stamp:
             try:
@@ -93,6 +118,27 @@ def parse_preview(html, username):
 class PublicTelegram:
     def __init__(self, http):
         self.http = http
+
+    async def single(self, username, peer_id, post_id):
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{3,31}', username) or type(post_id) is not int or post_id < 1:
+            raise ValueError('Некорректная ссылка исходного поста.')
+        response = await self.http.get(f'https://t.me/{username}/{post_id}', params={'embed': 1},
+                                       follow_redirects=False, timeout=25)
+        if response.status_code == 429 or response.status_code >= 500:
+            raise MediaTemporary('Telegram временно не отдаёт оригинал. Повтори проверку позже.')
+        if response.status_code != 200 or len(response.content) > 3_000_000:
+            raise ValueError('Не удалось проверить оригинал Telegram.')
+        soup = BeautifulSoup(response.text, 'html.parser')
+        error = soup.select_one('.tgme_widget_message_error')
+        if error and error.get_text(' ', strip=True) == 'Post not found':
+            raise SourceMissing('Telegram не находит оригинал. Для восстановления нужен исходный файл; можно пропустить эту отправку.')
+        preview = parse_preview('<div class="tgme_channel_info_header_title">Telegram</div>' + response.text, username)
+        if preview.peer_id != int(peer_id):
+            raise ValueError('Исходный канал изменился. Восстановление остановлено.')
+        for post in preview.posts:
+            if post[0] == post_id:
+                return post
+        raise ValueError('Telegram вернул другой пост. Восстановление остановлено.')
 
     async def page(self, username, before=None):
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{3,31}', username):

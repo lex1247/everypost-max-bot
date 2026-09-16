@@ -23,6 +23,18 @@ def trustat_video_url(value):
     return value
 
 
+def video_url(value):
+    if not isinstance(value, str):
+        raise ValueError('Некорректная ссылка видео.')
+    u = urlparse(value)
+    host = (u.hostname or '').lower()
+    if (u.scheme != 'https' or u.username or u.password or u.port not in (None, 443)
+            or not (host == 'static1.trustat.ru' or any(host == d or host.endswith('.' + d)
+                    for d in ('telesco.pe', 'telegram-cdn.org')))):
+        raise ValueError('Неподдерживаемый адрес видео Telegram.')
+    return value
+
+
 def normal_media(value):
     if isinstance(value, str):
         value = json.loads(value or '{}')
@@ -61,7 +73,7 @@ def normal_media(value):
         result['gallery'] = []
         for item in gallery:
             if isinstance(item,dict) and item.get('type') in ('photo','video') and 'url' in item:
-                validator=trustat_video_url if item['type']=='video' else photo_url
+                validator=video_url if item['type']=='video' else photo_url
                 result['gallery'].append({'type':item['type'],'url':validator(item['url']),'spoiler':bool(item.get('spoiler'))})
                 continue
             if (not isinstance(item, dict) or item.get('type') not in ('photo', 'video')

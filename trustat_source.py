@@ -79,14 +79,14 @@ class Trustat:
             raise TrustatError('Trustat вернул посты в неожиданном порядке. Курсор сохранён.')
         return posts
 
-    async def detail(self,cid,mid):
+    async def detail(self,cid,mid,*,fresh=False):
         pid=f'{cid}_{mid}'
         cached=self.app.s.rows('SELECT body FROM ts_post_cache WHERE post_id=?',(pid,))
-        if cached:return json.loads(cached[0]['body'])
+        if cached and not fresh:return json.loads(cached[0]['body'])
         p=await self.get('/posts/'+pid,{'source':'telegram'})
         if p.get('channel_id')!=cid or p.get('message_id')!=mid or p.get('source')!='telegram':raise TrustatError('Неверный пост в ответе Trustat.')
         if p.get('text') is not None and not isinstance(p['text'],str):raise TrustatError('Trustat вернул некорректный текст. Курсор сохранён.')
-        self.app.s.run('INSERT INTO ts_post_cache(post_id,body,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING',(pid,json.dumps(p,ensure_ascii=False),time.time()))
+        self.app.s.run('INSERT INTO ts_post_cache(post_id,body,created_at) VALUES(?,?,?) ON CONFLICT(post_id) DO UPDATE SET body=excluded.body,created_at=excluded.created_at',(pid,json.dumps(p,ensure_ascii=False),time.time()))
         return p
 
     async def fetch(self,source,peer,cursor):

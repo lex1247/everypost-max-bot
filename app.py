@@ -15,7 +15,8 @@ from local_model import (LocalModel, RewriteUnavailable, uses_local_model, publi
 from free_cloud import FreeCloud, uses_free_cloud
 from max_transport import max_ssl_context
 from max_source import MaxSource, choose as choose_max_source
-from media import normal_media, photo_url, publication_parts, vk_media, trustat_video_url
+from media import normal_media, photo_url, publication_parts, vk_media, trustat_video_url, video_url
+from media_download import download, MediaTemporary
 from subscriptions import SubscriptionExpired
 
 WELCOME = 'Выбери действие кнопкой ниже. Сначала добавь свой канал, затем источник постов.'
@@ -34,6 +35,7 @@ HELP = '''Настройка автопубликации
 /pause — остановить публикацию (сбор продолжается)
 /resume — продолжить, включая накопленные посты
 /errors — посты и отправки, требующие внимания
+/repair 34 — проверить оригинал и восстановить файлы без публикации
 /retry_post 12 — повторить переписывание поста после ошибки
 /resolve 34 sent — отметить спорную отправку выполненной
 /resolve 34 retry — повторить её, если пост точно не вышел
@@ -46,7 +48,8 @@ HELP = '''Настройка автопубликации
 Для закрытого канала ТГ: «Добавить назначение» → «Выбрать мой канал» или перешли сюда его пост.
 Фотографии и фотоальбомы переносятся вместе с текстом. Ссылка на источник не добавляется.
 Длинный текст в Telegram выходит отдельным сообщением после фотографий.
-Видеопосты и другие неподдерживаемые вложения сохраняются для проверки.'''
+Доступные видео MP4 переносятся вместе с подписью. Для скрытых вложений используется уже настроенный Trustat.
+Недоступные оригиналы сохраняются в разделе ошибок; их можно перепроверить или пропустить.'''
 
 BUTTONS = {'keyboard': [[{'text': 'Постинг'}], [{'text': 'Добавить источник'}, {'text': 'Добавить назначение'}],
                          [{'text': 'Связать'}, {'text': 'Мои настройки'}],
@@ -88,6 +91,8 @@ class App:
         self.free_cloud = FreeCloud(store)
         from editor import Editor
         self.editor = Editor(self)
+        from delivery_recovery import DeliveryRecovery
+        self.recovery = DeliveryRecovery(self)
 
     async def tg(self, method, **payload):
         files = payload.pop('_files', None)
@@ -525,7 +530,7 @@ class App:
                     if self.s.rows("SELECT 1 FROM sources WHERE id=? AND platform='max'",(sid,)):self.s.set_route_mode(sid,did,'original')
                 else:
                     self.s.db.execute('DELETE FROM routes WHERE source=? AND destination=?', (sid, did))
-                    self.s.db.execute("UPDATE deliveries SET status='cancelled' WHERE destination=? AND post IN (SELECT id FROM posts WHERE source=?) AND status IN ('pending','failed')", (did, sid))
+                    self.s.db.execute("UPDATE deliveries SET status='cancelled' WHERE destination=? AND post IN (SELECT id FROM posts WHERE source=?) AND status IN ('pending','failed','review','unavailable','repairing')", (did, sid))
             result = 'Связь включена. Новые обнаруженные посты будут отправляться.' if cmd == '/route' else 'Связь отключена, неотправленные посты отменены.'
         elif cmd == '/list':
             result = self.s.configuration()
@@ -624,7 +629,7 @@ class App:
             self.s.run("UPDATE tg_inbox SET status='processing' WHERE id=?", (row['id'],))
             update = json.loads(row['body'])
             try:
-                if not await self.editor.handle(update):
+                if not await self.recovery.handle(update) and not await self.editor.handle(update):
                     msg = update.get('message', {})
                     if msg.get('from', {}).get('id') == self.owner and msg.get('chat', {}).get('type') == 'private':
                         result = await self.handle_message(msg)
@@ -668,6 +673,7 @@ class App:
             public_name = self.s.get('tg_public:' + source['remote'])
             if public_name:
                 posts, cursor = await self.public_tg.since(public_name, source['remote'], cursor)
+                posts = await self.recovery.enrich_batch(source['remote'], posts)
             else:
                 if self.reader is None:
                     raise ValueError('Для этого источника нужен ранее подключённый аккаунт Telegram. Можно заново добавить публичную ссылку канала.')
@@ -749,15 +755,7 @@ class App:
 
     async def photo_file(self, photo):
         if 'url' in photo:
-            data = bytearray()
-            async with self.http.stream('GET', photo_url(photo['url']), follow_redirects=False, timeout=45) as response:
-                if response.status_code != 200:
-                    raise ValueError('Исходная фотография временно недоступна. Пост сохранён для проверки.')
-                async for chunk in response.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > 10_000_000:
-                        raise ValueError('Фотография превышает 10 МБ. Пост сохранён для проверки.')
-            data = bytes(data)
+            data = await download(self.http, photo_url(photo['url']), 10_000_000, 'Фотография')
         elif 'tg_file_id' in photo:
             data = await self.telegram_file(photo)
         else:
@@ -772,14 +770,9 @@ class App:
         raise ValueError('Формат фотографии пока не поддерживается; нужен JPEG или PNG. Пост сохранён для проверки.')
 
     async def trustat_video_file(self,item):
-        data=bytearray()
-        async with self.http.stream('GET',trustat_video_url(item['url']),follow_redirects=False,timeout=60) as response:
-            if response.status_code!=200:raise ValueError('Trustat не отдал файл видео. Материал сохранён.')
-            async for chunk in response.aiter_bytes():
-                data.extend(chunk)
-                if len(data)>20_000_000:raise ValueError('Видео больше 20 МБ. Нужна ручная публикация.')
-        if data[4:8]!=b'ftyp':raise ValueError('Trustat вернул не MP4. Материал сохранён.')
-        return bytes(data)
+        data = await download(self.http, video_url(item['url']), 20_000_000, 'Видео', timeout=60)
+        if data[4:8]!=b'ftyp':raise ValueError('Источник вернул не MP4. Материал сохранён.')
+        return data
 
     async def telegram_file(self, item):
         metadata = await self.tg('getFile', file_id=item['tg_file_id'])
@@ -788,15 +781,8 @@ class App:
         path = metadata.get('file_path', '')
         if not re.fullmatch(r'[A-Za-z0-9_./-]+', path) or '..' in path or path.startswith('/'):
             raise ValueError('Telegram не вернул доступный файл.')
-        data = bytearray()
-        async with self.http.stream('GET', f"https://api.telegram.org/file/bot{os.environ['TG_BOT_TOKEN']}/{path}", follow_redirects=False) as response:
-            if response.status_code != 200:
-                raise ValueError('Telegram временно не отдаёт вложение. Черновик сохранён.')
-            async for chunk in response.aiter_bytes():
-                data.extend(chunk)
-                if len(data) > 20_000_000:
-                    raise ValueError('Вложение превышает 20 МБ.')
-        return bytes(data)
+        return await download(self.http, f"https://api.telegram.org/file/bot{os.environ['TG_BOT_TOKEN']}/{path}",
+                              20_000_000, 'Файл Telegram')
 
     async def prepare_part(self, platform, target, part):
         files = {}
@@ -940,6 +926,7 @@ class App:
                     self.s.db.execute("UPDATE delivery_parts SET status='sent',remote=? WHERE delivery=? AND part=?",
                                       (json.dumps(remote_ids), delivery['id'], current_part))
                     self.s.db.execute("UPDATE deliveries SET status='pending' WHERE id=?", (delivery['id'],))
+                    self.s.db.execute('UPDATE deliveries SET media_attempts=0 WHERE id=?', (delivery['id'],))
                 posting = False
                 await asyncio.sleep(0.6)
             remote_ids = [item for row in self.s.rows('SELECT remote FROM delivery_parts WHERE delivery=? ORDER BY part', (delivery['id'],))
@@ -957,6 +944,11 @@ class App:
                 status = 'failed'
             elif type(exc) is ValueError:
                 status = 'failed'
+            if isinstance(exc, MediaTemporary) and not posting:
+                attempts = self.s.rows('SELECT media_attempts FROM deliveries WHERE id=?', (delivery['id'],))[0]['media_attempts'] + 1
+                self.s.run('UPDATE deliveries SET media_attempts=? WHERE id=?', (attempts, delivery['id']))
+                status = 'failed' if attempts >= 5 else 'pending'
+                delay = time.time() + max(exc.retry_after, min(1800, 60 * 2 ** (attempts - 1)))
             error = safe_error(exc)
             self.s.run('UPDATE deliveries SET status=?,error=?,next_try=? WHERE id=?', (status, error, delay, delivery['id']))
             if current_part is not None:
@@ -1009,6 +1001,10 @@ class App:
 
 
 def safe_error(exc):
+    from public_telegram import SourceMissing
+    from trustat_source import TrustatError
+    if isinstance(exc, (MediaTemporary, SourceMissing, TrustatError)):
+        return str(exc)[:250]
     if isinstance(exc, SubscriptionExpired):
         return str(exc)[:250]
     if isinstance(exc, RewriteUnavailable):

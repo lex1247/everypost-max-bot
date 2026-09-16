@@ -51,6 +51,36 @@ async def parity_check(s,destination):
         assert len(s.rows("SELECT * FROM ed_posts WHERE origin='crosspost'"))==1
 
 
+async def recovery_check(s):
+    from app import App
+    from media_download import MediaTemporary
+    with patch.dict(os.environ, {'OWNER_ID': '123', 'TG_BOT_TOKEN': 'test', 'FREE_TEST_MODE': '1'}):
+        app = App(s, None)
+        sid = s.add_source('tg', '-1000000000077', 'Проверка восстановления', 0)
+        did = s.add_destination('tg', '-1000000000078', 'Проверка назначения')
+        s.run('INSERT INTO routes VALUES(?,?)', (sid, did));s.set_route_mode(sid, did, 'original')
+        s.set('tg_public:-1000000000077', 'news_channel')
+        s.ingest(sid, [(1, 'Подпись', 'https://t.me/news_channel/1', {'unsupported': ['скрыто']})], 1)
+        id = s.rows('SELECT d.id FROM deliveries d JOIN posts p ON p.id=d.post WHERE p.source=?', (sid,))[0]['id']
+        s.run("UPDATE deliveries SET status='failed' WHERE id=?", (id,))
+        app.public_tg.single = AsyncMock(return_value=(1, 'Подпись', 'https://t.me/news_channel/1', {'photos': [{'url': 'https://cdn4.telesco.pe/a.jpg'}]}))
+        app.photo_file = AsyncMock(return_value=('a.jpg', b'\xff\xd8\xffphoto', 'image/jpeg'))
+        app.editor.access = AsyncMock();app.tg = AsyncMock(return_value={'message_id': 9});app.notify = AsyncMock()
+        assert (await app.recovery.refresh(id))['status'] == 'review'
+        assert len(s.rows('SELECT * FROM delivery_parts WHERE delivery=?', (id,))) == 1
+        assert await app.recovery.retry(id)
+        app.photo_file.side_effect = MediaTemporary('Временно недоступно')
+        await app.deliver({'id': id})
+        row = app.recovery.row(id)
+        assert row['media_attempts'] == 1 and row['status'] == 'pending'
+        app.tg.assert_not_awaited()
+        app.photo_file.side_effect = None
+        with patch('app.asyncio.sleep', AsyncMock()):
+            await app.deliver({'id': id});await app.deliver({'id': id})
+        app.tg.assert_awaited_once()
+        assert app.recovery.row(id)['status'] == 'sent'
+
+
 def main():
     if os.getenv('POSTGRES_TEST_BIN'):
         binary=Path(os.environ['POSTGRES_TEST_BIN'])
@@ -128,9 +158,10 @@ def main():
             finally:
                 for db in competitors: db.db.close()
             asyncio.run(parity_check(s,customer))
+            asyncio.run(recovery_check(s))
             # The test intentionally fails before deployment if migration or lock semantics are wrong.
             s.db.close()
-            print('PostgreSQL check passed: migration, ownership, subscription receipts, concurrent claims/renewals, content review and queue idempotency, folders, batches and crossposting.',flush=True)
+            print('PostgreSQL check passed: migration, ownership, subscription receipts, concurrent claims/renewals, content review and queue idempotency, folders, batches, crossposting, source repair and bounded download retries.',flush=True)
         finally:
             subprocess.run([str(binary/'pg_ctl'),'-D',str(folder),'-m','fast','-w','stop'],check=True,stdout=subprocess.DEVNULL)
 

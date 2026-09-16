@@ -120,6 +120,7 @@ class Editor:
             [button('🎬 Контент · TikTok', 'content')],
             [button('📁 Папки', 'multi:folders'), button('📣 Рассылка', 'multi:start')],
             [button('🔁 Кросспостинг', 'cross:menu'), button('📋 Отчёты рассылок', 'multi:reports')],
+            *([[button('⚠️ Ошибки источников', 'source_errors')]] if actor == self.app.owner else []),
             [button('➕ Подключить канал', 'connect'), button('💳 Подписка', 'sub:list:0')]])
 
     async def quick_command(self, actor, action):
@@ -283,6 +284,9 @@ class Editor:
     async def callback(self,actor,data):
         parts=data.split(':')[1:]; action=parts[0]
         if action=='home': return await self.home(actor)
+        if action=='source_errors':
+            if actor != self.app.owner: raise ValueError('Недоступно.')
+            return await self.app.recovery.menu()
         if action=='content': return await self.content.open(actor)
         if action=='contentadd': return await self.content.accept_link(actor,int(parts[1]),parts[2])
         if action=='multi': return await self.multi.callback(actor,parts[1:])

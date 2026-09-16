@@ -138,7 +138,8 @@ class Store:
         ''')
         for table, column, definition in (
                 ('posts', 'media', "TEXT NOT NULL DEFAULT '{}'"),
-                ('deliveries', 'mode', "TEXT NOT NULL DEFAULT 'ai'")):
+                ('deliveries', 'mode', "TEXT NOT NULL DEFAULT 'ai'"),
+                ('deliveries', 'media_attempts', 'INTEGER NOT NULL DEFAULT 0')):
             if column not in columns(self.db, table):
                 self.db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
         self.db.commit()
@@ -149,6 +150,7 @@ class Store:
         # A crash during a send may happen after the platform accepted it.
         self.db.execute("UPDATE deliveries SET status='unknown',error='Перезапуск во время отправки' WHERE status='sending'")
         self.db.execute("UPDATE delivery_parts SET status='unknown' WHERE status='sending'")
+        self.db.execute("UPDATE deliveries SET status='failed',error='Проверка оригинала прервана перезапуском. Можно повторить проверку.' WHERE status='repairing'")
         self.db.commit()
 
     def rows(self, sql, args=()):
@@ -181,7 +183,7 @@ class Store:
             for post in posts:
                 remote, original, url = post[:3]
                 media = normal_media(post[3] if len(post) > 3 else {})
-                if not original.strip() and not media['photos'] and not media['unsupported']:
+                if not original.strip() and not media['photos'] and not media.get('gallery') and not media['unsupported']:
                     continue
                 result = self.db.execute('INSERT INTO posts(source,remote,original,url,media) VALUES(?,?,?,?,?) ON CONFLICT(source,remote) DO NOTHING',
                                          (source, remote, original, url, json.dumps(media, ensure_ascii=False)))
