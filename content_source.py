@@ -10,6 +10,7 @@ import math
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -20,6 +21,7 @@ MAX_BYTES = 50_000_000
 CLEAN_FORMAT = ('b[ext=mp4][vcodec~="^(avc|h264)"][acodec!=none]'
                 '[format_id!^=download][format_note!*=?watermarked]')
 _gate = asyncio.Semaphore(1)
+_prepare_gate = asyncio.Semaphore(1)
 
 
 def source_url(value):
@@ -112,31 +114,86 @@ async def fetch(source):
     return {'items': items}
 
 
-async def prepare(app, url):
+async def fingerprint(data, duration):
+    """Bounded local decoding; no URLs or credentials reach ffmpeg."""
+    from PIL import Image
+    import imageio_ffmpeg
+    duration = number(duration)
+    if not duration or duration < 3 or duration > 300:
+        raise ValueError('Для проверки повторов нужна длительность видео от 3 до 300 секунд.')
+    with tempfile.TemporaryDirectory(prefix='everypost-frames-') as folder:
+        path = Path(folder) / 'input.mp4'
+        path.write_bytes(data)
+        proc = await asyncio.create_subprocess_exec(
+            imageio_ffmpeg.get_ffmpeg_exe(), '-v', 'error', '-nostdin', '-threads', '1',
+            '-ss', str(duration / 20), '-i', str(path), '-an', '-sn',
+            '-vf', f'fps={8/duration},scale=32:32', '-frames:v', '8',
+            '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            raw, _ = await asyncio.wait_for(proc.communicate(), 25)
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+        if proc.returncode or len(raw) != 8 * 32 * 32 * 3:
+            raise ValueError('Не удалось прочитать все кадры видео для проверки повторов.')
+    frames, colors = [], []
+    for offset in range(0, len(raw), 3072):
+        im = Image.frombytes('RGB', (32, 32), raw[offset:offset+3072]).crop((4, 4, 28, 28))
+        colors.append(list(im.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))))
+        gray = im.convert('L')
+        pixels = list(gray.resize((9, 8), Image.Resampling.LANCZOS).getdata())
+        dh = sum(int(pixels[y*9+x] > pixels[y*9+x+1]) << (y*8+x) for y in range(8) for x in range(8))
+        pixels = list(gray.resize((8, 8), Image.Resampling.LANCZOS).getdata())
+        mean = sum(pixels)/64
+        ah = sum(int(v > mean) << n for n, v in enumerate(pixels))
+        frames.append(f'{dh:016x}{ah:016x}')
+    return {'version': 1, 'duration': duration, 'frames': frames, 'colors': colors}
+
+
+async def inspect(url):
     url = source_url(url)
     if not re.search(r'/video/[0-9]+$', url):
-        raise ValueError('Для загрузки нужна ссылка на один ролик.')
+        raise ValueError('Для проверки нужна ссылка на один ролик.')
     info = await extract(url)
     item = normalize(info, url)
     if item['remote_id'] != url.rsplit('/', 1)[-1]:
         raise ValueError('TikTok вернул другой ролик.')
-    # Let the TikTok extractor preserve its own session headers and cookies.
-    # A raw CDN request can return 403 even when the public video is available.
     data = await download(url)
     if data[4:8] != b'ftyp':
         raise ValueError('TikTok не вернул файл MP4.')
-    digest = hashlib.sha256(data).hexdigest()
-    upload = await app.max_api('POST', '/uploads', params={'type': 'video'})
-    u = urlparse(upload['url'])
-    if u.scheme != 'https' or u.hostname != 'omub.okcdn.ru' or u.username or u.password or u.port not in (None, 443):
-        raise ValueError('MAX вернул неподдерживаемый адрес загрузки.')
-    client = app.max_http if app.max_http is not None else app.http
-    response = await client.post(upload['url'], files={'data': ('video.mp4', bytes(data), 'video/mp4')},
-                                 follow_redirects=False, timeout=45)
-    if response.is_error or response.is_redirect or not upload.get('token'):
-        raise ValueError('MAX не подтвердил загрузку видео. Повторите позже.')
-    return {'body': {'text': '', 'attachments': [{'type': 'video', 'payload': {'token': upload['token']}}]},
-            'content_hash': digest, 'item': item}
+    return data, {'content_hash': hashlib.sha256(data).hexdigest(),
+                  'fingerprint': await fingerprint(data, item['duration']), 'item': item}
+
+
+async def prepare(app, url):
+    url = source_url(url)
+    # Cache successful upload receipts in the existing PostgreSQL-backed store.
+    # A retry after a lost HTTP response reuses this receipt and never publishes.
+    cache_key = 'content_upload_v2:' + hashlib.sha256(url.encode()).hexdigest()
+    async with _prepare_gate:
+        cached = app.s.get(cache_key)
+        if cached:
+            try:
+                saved = json.loads(cached)
+                if time.time() - saved['at'] < 86400:
+                    return saved['result']
+            except (ValueError, KeyError, TypeError):
+                pass
+        data, result = await inspect(url)
+        upload = await app.max_api('POST', '/uploads', params={'type': 'video'})
+        u = urlparse(upload['url'])
+        if u.scheme != 'https' or u.hostname != 'omub.okcdn.ru' or u.username or u.password or u.port not in (None, 443):
+            raise ValueError('MAX вернул неподдерживаемый адрес загрузки.')
+        client = app.max_http if app.max_http is not None else app.http
+        response = await client.post(upload['url'], files={'data': ('video.mp4', bytes(data), 'video/mp4')},
+                                     follow_redirects=False, timeout=45)
+        if response.is_error or response.is_redirect or not upload.get('token'):
+            raise ValueError('MAX не подтвердил загрузку видео. Повторите позже.')
+        result['body'] = {'text': '', 'attachments': [{'type': 'video', 'payload': {'token': upload['token']}}]}
+        app.s.set(cache_key, json.dumps({'at': time.time(), 'result': result}))
+        return result
 
 
 async def download(url):
@@ -173,8 +230,13 @@ async def download(url):
 async def action(app, data):
     if data.get('provider', 'tiktok') != 'tiktok':
         raise ValueError('Этот источник ещё не подключён.')
+    if data['action'] == 'content_health':
+        return {'service': 'everypost-content', 'version': 2}
+    if data['action'] == 'content_inspect':
+        _, result = await asyncio.wait_for(inspect(data.get('url')), 155)
+        return result
     if data['action'] == 'content_fetch':
         return await fetch(data.get('source'))
     if data['action'] == 'content_prepare':
-        return await asyncio.wait_for(prepare(app, data.get('url')), 140)
+        return await asyncio.wait_for(prepare(app, data.get('url')), 195)
     raise ValueError('Неизвестное действие сбора контента.')
