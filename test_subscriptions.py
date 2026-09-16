@@ -378,6 +378,25 @@ class SubscriptionFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.e.delete_due()
         self.assertEqual(self.p.post(post['id'])['state'], 'deleted')
 
+    async def test_configured_discussion_copies_finish_for_already_published_posts(self):
+        d = await self.limited()
+        self.s.run('UPDATE ed_channels SET discussion=? WHERE destination=?',
+                   (packed({'enabled': True, 'target': '-4001'}), d))
+        posts = []
+        for _ in range(2):
+            post = self.p.enqueue(await self.draft(456, d), 456)
+            await self.send(post); posts.append(post)
+        await self.e.tick()
+        self.s.run("UPDATE ed_posts SET state='deleted' WHERE id=?", (posts[1]['id'],))
+        self.expire(d)
+        self.app.tg.reset_mock()
+        for post in posts:
+            copy_id = self.p.post(post['id'])['discussion_delivery']
+            with patch('app.asyncio.sleep', new_callable=AsyncMock):
+                await self.app.deliver({'id': copy_id})
+        self.assertEqual(len(self.publications()), 2)
+        self.assertTrue(all(str(c.kwargs['chat_id']) == '-4001' for c in self.publications()))
+
     async def test_expired_auto_delete_time_on_hold_can_be_disabled_before_resume(self):
         d = await self.limited(); post = self.p.enqueue(await self.draft(456, d), 456)
         self.expire(d); await self.send(post); self.renew(d)

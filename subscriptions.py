@@ -113,7 +113,7 @@ class Subscriptions:
     def _hold_backlog(self, destination, now):
         self.s.db.execute("""UPDATE deliveries SET status='subscription_hold',error=?
             WHERE destination=? AND status='pending'
-              AND NOT EXISTS(SELECT 1 FROM ed_posts e WHERE e.discussion_delivery=deliveries.id AND e.state='sent')""",
+              AND NOT EXISTS(SELECT 1 FROM ed_posts e WHERE e.discussion_delivery=deliveries.id AND e.state IN ('sent','deleted'))""",
             (TERM_ENDED, destination))
         self.s.db.execute("""UPDATE ed_posts SET state='subscription_hold',error=?,revision=revision+1
             WHERE destination=? AND state IN ('queued','failed','unknown')
@@ -123,7 +123,7 @@ class Subscriptions:
 
     def require_delivery(self, delivery):
         # Finish the configured copy of an already sent post, and keep deletion independent of billing.
-        if self.s.rows("SELECT 1 FROM ed_posts WHERE discussion_delivery=? AND state='sent'", (delivery['id'],)):
+        if self.s.rows("SELECT 1 FROM ed_posts WHERE discussion_delivery=? AND state IN ('sent','deleted')", (delivery['id'],)):
             return
         self.require_publication(delivery['destination'])
 
