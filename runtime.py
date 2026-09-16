@@ -58,3 +58,10 @@ async def supervise(*coroutines, stop_event=None):
         await asyncio.gather(*jobs, waiter, return_exceptions=True)
         for sig in installed:
             loop.remove_signal_handler(sig)
+
+
+def run_mode():
+    mode = os.getenv('EP_RUN_MODE', 'active')
+    if mode not in ('active', 'standby'):
+        raise ValueError('Invalid EP_RUN_MODE')
+    return mode

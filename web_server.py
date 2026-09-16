@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from aiohttp import web
 from posting import validated_user, packed, parse_time
 from database import Postgres
+from runtime import run_mode
 
 
 def webhook_secret():
@@ -83,13 +84,28 @@ async def calendar_action(editor, action, body):
 
 
 def create_web(app):
-    server=web.Application(client_max_size=2*1024*1024)
+    @web.middleware
+    async def standby_guard(request, handler):
+        if run_mode() == 'standby' and request.method not in ('GET', 'HEAD'):
+            return web.json_response({'ok':False,'message':'Standby instance'},status=503)
+        return await handler(request)
+    server=web.Application(client_max_size=2*1024*1024, middlewares=[standby_guard])
     from max_bridge import install
     install(server, app)
     async def health(request):
-        # A standby revision is healthy; the old revision can release the worker lock during cutover.
-        app.s.rows('SELECT 1')
-        return web.json_response({'ok':True,'service':'EveryPost Telegram','worker':bool(getattr(app,'worker_ready',False))})
+        try:
+            app.s.rows('SELECT 1')
+            worker = bool(getattr(app,'worker_ready',False))
+            # /health retains Render's rolling-deploy readiness. The VPS probe requires a working publisher.
+            strict = os.getenv('EP_STRICT_HEALTH') == '1'
+            beats = getattr(app, 'runtime_heartbeats', {})
+            progressing = all(name in beats and time.monotonic() - beats[name] < 1800
+                              for name in ('inbox_loop','publish','editor'))
+            ok = run_mode() == 'standby' or not strict or (worker and progressing)
+            return web.json_response({'ok':ok,'service':'EveryPost Telegram','worker':worker,
+                                      'mode':run_mode()},status=200 if ok else 503)
+        except Exception:
+            return web.json_response({'ok':False,'service':'EveryPost Telegram'},status=503)
     async def webhook(request):
         supplied=request.headers.get('X-Telegram-Bot-Api-Secret-Token','')
         if not hmac.compare_digest(supplied,webhook_secret()):
@@ -161,6 +177,8 @@ async def serve(app):
 
 async def cloud_worker(app):
     from runtime import supervise
+    if run_mode() == 'standby':
+        await asyncio.Event().wait()
     if not isinstance(app.s.db,Postgres):
         raise RuntimeError('Render web mode requires PostgreSQL')
     while not app.s.db.claim_worker():
@@ -190,4 +208,3 @@ async def cloud_worker(app):
     finally:
         for job in jobs: job.cancel()
         await asyncio.gather(*jobs,return_exceptions=True)
-

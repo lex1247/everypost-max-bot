@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import httpx
 from core import (Store, source_link, check_rewrite, destination_input, DESTINATION_PROMPT,
                   is_tg_invite, PRIVATE_INVITE_PROMPT, protected_words)
-from runtime import data_folder, reader_session, supervise
+from runtime import data_folder, reader_session, supervise, run_mode
 from public_telegram import PublicTelegram
 from local_model import (LocalModel, RewriteUnavailable, uses_local_model, publishing_enabled,
                          mode_description, managed_local_server, local_base_url)
@@ -81,6 +81,7 @@ class App:
         self.max_http = max_client
         self.owner = int(os.environ['OWNER_ID'])
         self.bot_id = None
+        self.runtime_heartbeats = {}
         self.public_tg = PublicTelegram(client)
         self.local_model = LocalModel()
         self.free_cloud = FreeCloud(store)
@@ -631,6 +632,7 @@ class App:
 
     async def inbox_loop(self):
         while True:
+            self.runtime_heartbeats["inbox_loop"] = time.monotonic()
             await self.process_updates()
             await asyncio.sleep(0.3)
 
@@ -965,6 +967,7 @@ class App:
 
     async def publish(self):
         while True:
+            self.runtime_heartbeats["publish"] = time.monotonic()
             try:
                 if self.s.get('paused') != '1':
                     deliveries = self.s.rows("""SELECT d.id,p.rewritten,p.url,t.platform,t.remote target FROM deliveries d
@@ -1016,6 +1019,9 @@ async def main():
     for key in required:
         if not os.getenv(key):
             raise SystemExit(f'Заполни {key} в .env')
+    standby = run_mode() == 'standby'
+    if standby and os.getenv('WEB_MODE') != '1':
+        raise SystemExit('Standby requires WEB_MODE=1')
     folder = data_folder()
     # Only one process may control a database/session and send deliveries.
     import fcntl
@@ -1025,7 +1031,7 @@ async def main():
     except BlockingIOError:
         raise SystemExit('Этот бот уже запущен.')
     reader = None
-    if os.getenv('TG_API_ID') and os.getenv('TG_API_HASH'):
+    if not standby and os.getenv('TG_API_ID') and os.getenv('TG_API_HASH'):
         from telethon import TelegramClient
         reader = TelegramClient(reader_session(folder), int(os.environ['TG_API_ID']), os.environ['TG_API_HASH'])
         await reader.connect()
@@ -1043,6 +1049,13 @@ async def main():
             if cloud and not database:
                 raise SystemExit('Для Render нужна постоянная PostgreSQL база DATABASE_URL.')
             app = App(Store(database, recover=not cloud), client, reader, max_client)
+            if standby:
+                from web_server import serve
+                try:
+                    await supervise(serve(app))
+                finally:
+                    app.s.db.close()
+                return
             identity = await app.tg('getMe')
             expected = os.getenv('EXPECTED_TG_BOT_USERNAME', '').lstrip('@').lower()
             if expected and identity.get('username', '').lower() != expected:

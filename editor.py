@@ -591,6 +591,7 @@ class Editor:
 
     async def loop(self):
         while True:
+            self.app.runtime_heartbeats["editor"] = time.monotonic()
             try: await self.tick()
             except Exception: print('Сбой редактора: очередь сохранена, повтор через 2 секунды.',flush=True)
             await asyncio.sleep(2)
