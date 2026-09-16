@@ -29,7 +29,7 @@ def authenticate(raw, stamp, signature):
 
 async def action(app, data):
     operation = data.get('action')
-    if operation in ('content_fetch', 'content_prepare'):
+    if operation in ('content_fetch', 'content_prepare', 'content_inspect', 'content_health'):
         from content_source import action as content_action
         return await content_action(app, data)
     if operation in ('vk_resolve','vk_fetch'):
@@ -82,6 +82,7 @@ def install(server, app):
         if not os.getenv('MAX_BOT_TOKEN') or not authenticate(raw,
                 request.headers.get('X-EveryPost-Time'), request.headers.get('X-EveryPost-Signature')):
             return web.json_response({'ok': False}, status=403)
+        data = {}
         try:
             data = json.loads(raw)
             if not isinstance(data, dict):
@@ -92,7 +93,8 @@ def install(server, app):
             return web.json_response({'ok':False,'message':str(exc),'pause':exc.pause,'retry_after':exc.retry_after},status=422 if exc.pause else 503)
         except ValueError as exc:
             return web.json_response({'ok': False, 'message': str(exc)[:500]}, status=422)
-        except Exception:
+        except Exception as exc:
+            print('CONTENT BRIDGE ERROR:', str(data.get('action', 'unknown'))[:40], type(exc).__name__, flush=True)
             # No credentials, upstream request URLs, or source content in errors.
             return web.json_response({'ok': False, 'message': 'Сервис обработки временно недоступен. Повторите позже.'}, status=503)
     server.router.add_post('/max-crosspost', endpoint)
