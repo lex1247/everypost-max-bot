@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from posting import (Posting, EDITABLE, packed, own_media, message_text, styled, parse_buttons,
                      validate_style, parse_time, valid_url)
+from client_onboarding import ChannelConnection
 
 LABELS = {'draft': 'Черновик', 'proposed': 'Предложено', 'held': 'Нужна проверка', 'scheduled': 'Отложен',
           'queued': 'В очереди', 'sent': 'Опубликован', 'deleted': 'Удалён', 'cancelled': 'Отменён',
@@ -19,6 +20,7 @@ QUICK_COMMANDS = (
     ('menu', 'Главное меню'), ('newpost', 'Создать пост'), ('inbox', 'Предложки'),
     ('drafts', 'Черновики'), ('scheduled', 'Отложенные'),
     ('published', 'Опубликованные и автоудаление'), ('channels', 'Мои каналы'),
+    ('addchannel', 'Подключить свой Telegram-канал'),
     ('cancel', 'Отменить текущий ввод'), ('help', 'Помощь и команды'))
 QUICK_DESTINATIONS = {'newpost': 'new', 'inbox': 'proposed', 'drafts': 'draft',
                       'scheduled': 'scheduled', 'published': 'sent', 'channels': 'settings'}
@@ -32,6 +34,7 @@ class Editor:
     def __init__(self, app):
         self.app, self.s = app, app.s
         self.p = Posting(self.s)
+        self.connection = ChannelConnection(self)
 
     async def say(self, actor, text, rows=None):
         kwargs = {'chat_id': actor, 'text': text[:4000], 'link_preview_options': {'is_disabled': True}}
@@ -42,16 +45,23 @@ class Editor:
     def available(self, actor):
         if actor == self.app.owner:
             return self.s.rows('SELECT * FROM destinations ORDER BY id')
-        return self.s.rows('SELECT d.* FROM destinations d JOIN ed_admins a ON a.destination=d.id WHERE a.actor=? ORDER BY d.id', (actor,))
+        return self.s.rows('''SELECT d.* FROM destinations d WHERE
+            EXISTS(SELECT 1 FROM ed_admins a WHERE a.destination=d.id AND a.actor=?) OR
+            EXISTS(SELECT 1 FROM ed_channel_owners o WHERE o.destination=d.id AND o.actor=?) ORDER BY d.id''', (actor, actor))
+
+    def is_owner(self, actor, destination):
+        return actor == self.app.owner or actor == self.p.channel_owner(destination, self.app.owner)
 
     async def access(self, actor, destination, *, publish=False, owner=False):
-        if owner and actor != self.app.owner:
-            raise ValueError('Эта настройка доступна владельцу бота.')
-        if actor != self.app.owner and not self.s.rows('SELECT 1 FROM ed_admins WHERE destination=? AND actor=?', (destination, actor)):
+        if owner and not self.is_owner(actor, destination):
+            raise ValueError('Эта настройка доступна владельцу канала.')
+        if not self.is_owner(actor, destination) and not self.s.rows('SELECT 1 FROM ed_admins WHERE destination=? AND actor=?', (destination, actor)):
             raise ValueError('Доступ к этому каналу не выдан или отозван.')
         channel = self.p.channel(destination)
         if channel['platform'] == 'tg':
             member = await self.app.tg('getChatMember', chat_id=int(channel['remote']), user_id=actor)
+            if owner and actor != self.app.owner and member.get('status') != 'creator':
+                raise ValueError('Для изменения настроек нужно оставаться владельцем Telegram-канала.')
             if member.get('status') != 'creator' and not (member.get('status') == 'administrator' and member.get('can_post_messages')):
                 raise ValueError('Для работы с каналом нужны права администратора Telegram на публикацию.')
         if publish:
@@ -63,28 +73,36 @@ class Editor:
                 member = await self.app.max_api('GET', f"/chats/{channel['remote']}/members/me")
                 if not member.get('is_admin') or not {'write', 'post_edit_delete_message'}.intersection(member.get('permissions') or []):
                     raise ValueError('У бота нет права публиковать в этом канале MAX.')
+        # Telegram checks await the network; a local role may be revoked meanwhile.
+        if not self.is_owner(actor, destination) and not self.s.rows('SELECT 1 FROM ed_admins WHERE destination=? AND actor=?', (destination, actor)):
+            raise ValueError('Доступ к этому каналу не выдан или отозван.')
         return channel
 
     async def post_access(self, actor, id, revision=None):
         post = self.p.post(id)
         await self.access(actor, post['destination'])
-        if actor != self.app.owner and post['creator'] != actor and post['state'] != 'proposed':
-            raise ValueError('Этот пост доступен его редактору и владельцу бота.')
+        if not self.is_owner(actor, post['destination']) and post['creator'] != actor and post['state'] != 'proposed':
+            raise ValueError('Этот пост доступен его редактору и владельцу канала.')
         if revision is not None and post['revision'] != revision:
             raise ValueError('Эта кнопка устарела. Открой пост заново в списке.')
         return post
 
     async def home(self, actor):
+        if self.p.session(actor).get('action') == 'connect':
+            await self.app.tg('sendMessage', chat_id=actor, text='Подключение отменено.', reply_markup={'remove_keyboard': True})
         self.p.session(actor, {})
         if actor == self.app.owner:
             self.s.set('wizard', '')
         if not self.available(actor):
-            return await self.say(actor, 'Для предложки открой ссылку из канала. Для управления каналом владелец должен добавить тебя администратором бота.')
+            return await self.say(actor, 'Подключи свой Telegram-канал, чтобы создавать и планировать посты. '
+                'Для работы редактором попроси владельца выдать доступ. Для предложки открой ссылку из канала.',
+                [[button('➕ Подключить канал', 'connect')]])
         return await self.say(actor, 'Постинг\nВыбери действие.', [
             [button('➕ Создать пост', 'choose:new')],
             [button('📝 Черновики', 'choose:draft'), button('🕒 Отложенные', 'choose:scheduled')],
             [button('📥 Предложки', 'choose:proposed'), button('📁 Мои каналы', 'choose:settings')],
-            [button('📤 Опубликованные', 'choose:sent')]])
+            [button('📤 Опубликованные', 'choose:sent')],
+            [button('➕ Подключить канал', 'connect')]])
 
     async def quick_command(self, actor, action):
         session = self.p.session(actor)
@@ -101,14 +119,18 @@ class Editor:
                     (packed({'ok':True,'state':'cancelled','message':'Выбор времени отменён.'}),
                      actor,session['post'],session['revision'],''))
             return await self.home(actor)
+        if action == 'addchannel':
+            return await self.connection.start(actor)
         if session and session.get('action') != 'proposal':
             return await self.say(actor, 'Сначала заверши текущий ввод или отправь /cancel. '
                 'Текущая правка не потеряна.', [[button('Отменить ввод', 'home')]])
         if not self.available(actor):
+            if action == 'menu':
+                return await self.home(actor)
             if actor == self.app.owner:
                 return await self.say(actor, 'Сначала подключи канал кнопкой «Добавить назначение» или командой /destination.')
-            return await self.say(actor, 'Нет доступных каналов. Для управления владелец должен '
-                'добавить тебя администратором бота. Для предложки используй ссылку из канала.')
+            return await self.say(actor, 'Нет доступных каналов. Подключи свой канал или попроси его владельца '
+                'выдать доступ редактора. Для предложки используй ссылку из канала.', [[button('➕ Подключить канал', 'connect')]])
         self.p.session(actor, {})
         if actor == self.app.owner:
             self.s.set('wizard', '')
@@ -120,6 +142,7 @@ class Editor:
         rows = [[button(f"{c['title'][:40]} · {c['platform'].upper()}", f"channel:{action}:{c['id']}")] for c in self.available(actor)]
         if not rows:
             return await self.home(actor)
+        if action == 'settings': rows.append([button('➕ Подключить канал', 'connect')])
         rows.append([button('← Меню', 'home')])
         await self.say(actor, 'Выбери канал.', rows)
 
@@ -128,7 +151,7 @@ class Editor:
         states = ('draft','held','failed','unknown') if state == 'draft' else ('sent','deleted') if state == 'sent' else (state,)
         query = 'SELECT * FROM ed_posts WHERE destination=? AND state IN ('+','.join('?' for _ in states)+')'
         args = [destination, *states]
-        if actor != self.app.owner and state != 'proposed':
+        if not self.is_owner(actor, destination) and state != 'proposed':
             query += ' AND creator=?'
             args.append(actor)
         posts = self.s.rows(query+' ORDER BY id DESC LIMIT 11 OFFSET ?', (*args, max(0,page)*10))
@@ -190,16 +213,16 @@ class Editor:
         info=(f"{c['title']} · {c['platform'].upper()}\nЧасовой пояс: {c['timezone']}\n"
               f"Подпись: {style['signature'] or 'нет'}\nКнопок: {len(style['buttons'])}\n"
               'Ссылка предложки:\nhttps://t.me/EveryPost_bot?start=propose_'+c['code'])
-        if actor!=self.app.owner:
-            return await self.say(actor,info+'\n\nОбщие настройки меняет владелец бота.',[[button('← Меню','home')]])
+        if not self.is_owner(actor, destination):
+            return await self.say(actor,info+'\n\nОбщие настройки меняет владелец канала.',[[button('← Меню','home')]])
         rows=[[button('Подпись',f'config:signature:{destination}'),button('Кнопки',f'config:buttons:{destination}')],
               [button('Предложка '+('✓' if style['proposal'] else '—'),f'config:proposal:{destination}')],
               [button('Часовой пояс',f'config:timezone:{destination}'),button('Обсуждение',f'config:discussion_url:{destination}')]]
-        if actor==self.app.owner:
+        if self.is_owner(actor, destination):
             discussion=json.loads(c['discussion'])
             rows += [[button('Копия в группу '+('✓' if discussion.get('enabled') else '—'),f'config:discussion:{destination}')],
                      [button('Администраторы',f'admins:{destination}')]]
-        rows.append([button('← Меню','home')])
+        rows.extend([[button('➕ Создать пост', f'channel:new:{destination}')], [button('← Меню','home')]])
         await self.say(actor,info,rows)
 
     async def style_menu(self,actor,p):
@@ -228,6 +251,7 @@ class Editor:
     async def callback(self,actor,data):
         parts=data.split(':')[1:]; action=parts[0]
         if action=='home': return await self.home(actor)
+        if action=='connect': return await self.connection.start(actor)
         if action=='choose': return await self.choose(actor,parts[1])
         if action=='list': return await self.listing(actor,int(parts[1]),parts[2],int(parts[3]))
         if action=='channel':
@@ -253,7 +277,7 @@ class Editor:
         if action=='admins':
             destination=int(parts[1]);await self.access(actor,destination,owner=True)
             admins=self.s.rows('SELECT a.actor,u.name FROM ed_admins a LEFT JOIN ed_users u ON u.actor=a.actor WHERE destination=?',(destination,))
-            rows=[[button('Убрать '+(a['name'] or str(a['actor']))[:30],f"revoke:{destination}:{a['actor']}")] for a in admins]
+            rows=[[button('Убрать '+(a['name'] or str(a['actor']))[:30],f"revoke:{destination}:{a['actor']}")] for a in admins if not self.is_owner(a['actor'], destination)]
             rows.extend([[button('Добавить',f'grant:{destination}')],[button('← Настройки',f'channel:settings:{destination}')]])
             return await self.say(actor,'Администраторы бота для этого канала. В Telegram также нужны права на публикацию в самом канале.',rows)
         if action in ('grant','revoke'):
@@ -262,6 +286,7 @@ class Editor:
                 self.p.session(actor,{'action':'grant','destination':destination})
                 return await self.say(actor,'Попроси администратора открыть этого бота и нажать /id. Пришли его числовой ID сюда.')
             target=int(parts[2])
+            if self.is_owner(target, destination): raise ValueError('Нельзя отозвать доступ владельца канала этой кнопкой.')
             with self.s.db:
                 self.s.db.execute('DELETE FROM ed_admins WHERE destination=? AND actor=?',(destination,target))
                 self.s.db.execute("UPDATE ed_posts SET state='held',error='Доступ редактора отозван',revision=revision+1 WHERE destination=? AND creator=? AND state='scheduled'",(destination,target))
@@ -318,6 +343,7 @@ class Editor:
 
     async def input(self,actor,message,session):
         action=session.get('action');text=message_text(message)
+        if action=='connect': return await self.connection.accept(actor,message,session)
         if action in ('new','proposal','replace'):
             media=own_media(message)
             if action=='replace':
@@ -332,7 +358,7 @@ class Editor:
             if action=='proposal':
                 # Keep proposal mode for the next item, but do not disclose the author's identity in the channel.
                 await self.say(actor,'Предложение отправлено на рассмотрение. Спасибо!')
-                await self.say(self.app.owner,f"Новая предложка #{p['id']} в «{self.p.channel(p['destination'])['title']}».",[[button('Открыть',f"open:{p['id']}")]])
+                await self.say(self.p.channel_owner(p['destination'],self.app.owner),f"Новая предложка #{p['id']} в «{self.p.channel(p['destination'])['title']}».",[[button('Открыть',f"open:{p['id']}")]])
             else:
                 self.p.session(actor,{})
                 await self.card(actor,p['id'],True)
@@ -378,6 +404,8 @@ class Editor:
                         if group.get('type') not in ('group','supergroup'): raise ValueError('Нужна группа Telegram.')
                         bot=await self.app.tg('getChatMember',chat_id=target,user_id=self.app.bot_id)
                         if bot.get('status') not in ('administrator','member'): raise ValueError('Добавь бота в группу с правом отправки сообщений.')
+                        member=await self.app.tg('getChatMember',chat_id=target,user_id=actor)
+                        if member.get('status') not in ('creator','administrator'): raise ValueError('Для копий постов выбери группу, в которой ты администратор.')
                         if group.get('linked_chat_id')==int(c['remote']): raise ValueError('Telegram сам переносит посты в эту связанную группу. Дополнительная копия создала бы дубли. Можно добавить только кнопку обсуждения.')
                     else:
                         group=await self.app.max_api('GET',f'/chats/{target}')
@@ -392,7 +420,7 @@ class Editor:
             try: target=int(text.strip())
             except ValueError: raise ValueError('Пришли числовой ID администратора.') from None
             if not self.s.rows('SELECT 1 FROM ed_users WHERE actor=?',(target,)): raise ValueError('Сначала этот пользователь должен открыть бота и нажать /id.')
-            if target==self.app.owner: raise ValueError('У владельца уже есть доступ.')
+            if self.is_owner(target,destination): raise ValueError('У владельца уже есть доступ.')
             c=self.p.channel(destination)
             if c['platform']=='tg':
                 member=await self.app.tg('getChatMember',chat_id=int(c['remote']),user_id=target)
@@ -407,7 +435,7 @@ class Editor:
         message=callback.get('message',{}) if callback else update.get('message',{})
         user=callback.get('from',{}) if callback else message.get('from',{})
         actor=user.get('id')
-        if not actor or message.get('chat',{}).get('type')!='private': return False
+        if not actor or user.get('is_bot') or message.get('chat',{}).get('type')!='private' or message.get('chat',{}).get('id',actor)!=actor: return False
         self.s.run('INSERT INTO ed_users(actor,name) VALUES(?,?) ON CONFLICT(actor) DO UPDATE SET name=excluded.name',
                    (actor,(user.get('first_name','')+' '+user.get('last_name','')).strip()[:150]))
         if callback:
@@ -429,6 +457,12 @@ class Editor:
             if action in dict(QUICK_COMMANDS):
                 await self.quick_command(actor,action);return True
         if plain and text=='/id': await self.say(actor,f'Твой ID: {actor}');return True
+        if message.get('chat_shared'):
+            session=self.p.session(actor)
+            if session.get('action')=='connect':
+                await self.connection.accept(actor,message,session);return True
+            if actor!=self.app.owner or message['chat_shared'].get('request_id')!=8101:
+                raise ValueError('Кнопка выбора устарела. Начни подключение заново: /addchannel.')
         if not forwarded and text.startswith('/start propose_'):
             code=text.split('propose_',1)[1]
             found=self.s.rows('SELECT destination FROM ed_channels WHERE code=?',(code,))
@@ -477,7 +511,7 @@ class Editor:
                         self.s.db.execute('DELETE FROM ed_albums WHERE actor=? AND album=?',(actor,group['album']))
                 if session['action']=='proposal':
                     await self.say(actor,'Альбом отправлен на рассмотрение.')
-                    await self.say(self.app.owner,f"Новая предложка #{p['id']} — альбом.",[[button('Открыть',f"open:{p['id']}")]])
+                    await self.say(self.p.channel_owner(p['destination'],self.app.owner),f"Новая предложка #{p['id']} — альбом.",[[button('Открыть',f"open:{p['id']}")]])
                 else:
                     self.p.session(actor,{})
                     await self.card(actor,p['id'],True)

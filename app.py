@@ -329,7 +329,8 @@ class App:
         if platform == 'tg' and self.reader is None:
             self.s.set('tg_public:' + remote, ref)
         self.s.set('pending_source', '')
-        destinations = self.s.rows('SELECT id,title FROM destinations')
+        destinations = self.s.rows('''SELECT d.id,d.title FROM destinations d WHERE NOT EXISTS(
+            SELECT 1 FROM ed_channel_owners o WHERE o.destination=d.id AND o.actor!=?)''', (self.owner,))
         if len(destinations) == 1:
             destination = destinations[0]
             self.s.run('INSERT OR IGNORE INTO routes VALUES(?,?)', (sid, destination['id']))
@@ -895,6 +896,12 @@ class App:
                 current = self.s.rows('SELECT status,mode FROM deliveries WHERE id=?', (delivery['id'],))[0]
                 if self.s.get('paused') == '1' or current['status'] != 'pending' or current['mode'] != delivery['mode']:
                     return
+                if delivery['source'] is None:
+                    # Uploading a video can take long enough for an editor to be removed.
+                    await self.editor.authorize_delivery(delivery)
+                    current = self.s.rows('SELECT status,mode FROM deliveries WHERE id=?', (delivery['id'],))[0]
+                    if self.s.get('paused') == '1' or current['status'] != 'pending' or current['mode'] != delivery['mode']:
+                        return
                 with self.s.db:
                     self.s.db.execute('UPDATE delivery_parts SET payload=? WHERE delivery=? AND part=?',
                                       (json.dumps(prepared, ensure_ascii=False), delivery['id'], current_part))
@@ -1104,4 +1111,3 @@ if __name__ == '__main__':
         pass
     except Exception as exc:
         raise SystemExit('Бот остановлен: ' + safe_error(exc)) from None
-

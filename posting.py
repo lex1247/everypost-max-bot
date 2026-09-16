@@ -154,6 +154,8 @@ class Posting:
           style TEXT NOT NULL DEFAULT '{}', timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
           discussion TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS ed_users(actor INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS ed_channel_owners(
+          destination INTEGER PRIMARY KEY REFERENCES destinations(id), actor INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS ed_admins(destination INTEGER REFERENCES destinations(id), actor INTEGER,
           PRIMARY KEY(destination,actor));
         CREATE TABLE IF NOT EXISTS ed_posts(
@@ -190,6 +192,33 @@ class Posting:
         if not rows:
             raise ValueError('Канал больше не подключён.')
         return dict(rows[0])
+
+    def channel_owner(self, destination, service_owner):
+        rows = self.s.rows('SELECT actor FROM ed_channel_owners WHERE destination=?', (destination,))
+        return rows[0]['actor'] if rows else service_owner
+
+    def connect_channel(self, actor, remote, title, service_owner):
+        """Commit a previously verified Telegram channel and its owner together.
+
+        The unique destination key serializes competing claims in PostgreSQL.
+        Existing legacy destinations are never claimed by a new customer.
+        """
+        remote = str(int(remote))
+        with self.s.db:
+            if self.s.rows("SELECT 1 FROM sources WHERE platform='tg' AND remote=?", (remote,)):
+                raise ValueError('Этот канал уже используется как источник. Подключение создало бы цикл.')
+            inserted = self.s.db.execute(
+                "INSERT INTO destinations(platform,remote,title) VALUES('tg',?,?) ON CONFLICT(platform,remote) DO NOTHING",
+                (remote, title))
+            destination = self.s.rows("SELECT id FROM destinations WHERE platform='tg' AND remote=?", (remote,))[0]['id']
+            if inserted.rowcount:
+                self.s.db.execute('INSERT INTO ed_channel_owners(destination,actor) VALUES(?,?)', (destination, actor))
+            elif self.channel_owner(destination, service_owner) != actor:
+                raise ValueError('Канал уже подключён к другому аккаунту сервиса. Попроси его владельца выдать тебе доступ.')
+            self.s.db.execute('INSERT INTO ed_channels(destination,code,style) VALUES(?,?,?) ON CONFLICT(destination) DO NOTHING',
+                             (destination, secrets.token_urlsafe(16), packed(DEFAULT_STYLE)))
+            self.audit(actor, destination, 'connect')
+        return destination
 
     def post(self, id):
         rows = self.s.rows('SELECT * FROM ed_posts WHERE id=?', (id,))
