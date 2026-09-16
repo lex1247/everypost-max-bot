@@ -16,6 +16,7 @@ from free_cloud import FreeCloud, uses_free_cloud
 from max_transport import max_ssl_context
 from max_source import MaxSource, choose as choose_max_source
 from media import normal_media, photo_url, publication_parts, vk_media, trustat_video_url
+from subscriptions import SubscriptionExpired
 
 WELCOME = 'Выбери действие кнопкой ниже. Сначала добавь свой канал, затем источник постов.'
 SOURCE_PROMPT = 'Пришли ссылку на открытый Telegram-канал, откуда брать новые посты.'
@@ -553,13 +554,22 @@ class App:
             return 'Публикация на паузе. Сбор продолжается.' if cmd == '/pause' else 'Публикация включена, накопленная очередь будет отправлена.'
         elif cmd == '/errors':
             rows = self.s.rows("SELECT id,error FROM posts WHERE status='failed' ORDER BY id DESC LIMIT 20")
-            ds = self.s.rows("SELECT d.id,d.status,d.error,p.url,t.title FROM deliveries d JOIN posts p ON p.id=d.post JOIN destinations t ON t.id=d.destination WHERE d.status IN ('failed','unknown') ORDER BY d.id DESC LIMIT 20")
+            ds = self.s.rows("SELECT d.id,d.status,d.error,p.url,t.title FROM deliveries d JOIN posts p ON p.id=d.post JOIN destinations t ON t.id=d.destination WHERE d.status IN ('failed','unknown','subscription_hold') ORDER BY d.id DESC LIMIT 20")
             return '\n'.join([f"Пост {r['id']}: {r['error']}" for r in rows] +
                 [f"Отправка {r['id']} [{r['status']}] → {r['title']}: {r['error']}\n{r['url']}" for r in ds]) or 'Ошибок нет.'
         elif cmd == '/retry_post' and len(args) == 1:
             n = self.s.run("UPDATE posts SET status='new',error='' WHERE id=? AND status='failed'", (int(args[0]),)).rowcount
             return 'Пост поставлен на повторное переписывание.' if n else 'Не найден пост с ошибкой.'
         elif cmd == '/resolve' and len(args) == 2 and args[1] in ('sent', 'retry'):
+            rows = self.s.rows("SELECT d.*,p.source FROM deliveries d JOIN posts p ON p.id=d.post WHERE d.id=?", (int(args[0]),))
+            if rows and rows[0]['status'] == 'subscription_hold':
+                if rows[0]['source'] is None:
+                    return 'Открой пост в разделе «Черновики» и проверь расписание перед продолжением.'
+                if args[1] != 'retry':
+                    return 'Пауза срока не подтверждает публикацию. После проверки используй /resolve ID retry.'
+                self.editor.p.subscriptions.require_publication(rows[0]['destination'])
+                self.s.run("UPDATE deliveries SET status='pending',error='',next_try=0 WHERE id=? AND status='subscription_hold'", (int(args[0]),))
+                return 'Эта отправка возобновлена после проверки. Остальная очередь остаётся на паузе.'
             n = self.s.run("UPDATE deliveries SET status=?,error='',next_try=0 WHERE id=? AND status IN ('failed','unknown')",
                           ('sent' if args[1] == 'sent' else 'pending', int(args[0]))).rowcount
             if n:
@@ -890,6 +900,7 @@ class App:
                 elif not self.s.rows('SELECT 1 FROM routes WHERE source=? AND destination=?', (delivery['source'], delivery['destination'])):
                     self.s.run("UPDATE deliveries SET status='cancelled' WHERE id=?", (delivery['id'],))
                     return
+                self.editor.p.subscriptions.require_delivery(delivery)
                 prepared = json.loads(part['payload'])
                 target = prepared.get('discussion_target', delivery['target']) if delivery['source'] is None else delivery['target']
                 method, payload, files = await self.prepare_part(delivery['platform'], target, prepared)
@@ -902,6 +913,7 @@ class App:
                     current = self.s.rows('SELECT status,mode FROM deliveries WHERE id=?', (delivery['id'],))[0]
                     if self.s.get('paused') == '1' or current['status'] != 'pending' or current['mode'] != delivery['mode']:
                         return
+                self.editor.p.subscriptions.require_delivery(delivery)
                 with self.s.db:
                     self.s.db.execute('UPDATE delivery_parts SET payload=? WHERE delivery=? AND part=?',
                                       (json.dumps(prepared, ensure_ascii=False), delivery['id'], current_part))
@@ -928,6 +940,8 @@ class App:
                           for item in json.loads(row['remote'] or '[]')]
             remote = remote_ids[0] if len(remote_ids) == 1 else json.dumps(remote_ids)
             self.s.run("UPDATE deliveries SET status='sent',remote=?,error='' WHERE id=?", (remote, delivery['id']))
+        except SubscriptionExpired:
+            self.editor.p.subscriptions.hold_delivery(delivery['id'])
         except Exception as exc:
             status = 'unknown' if posting else 'pending'
             delay = 0 if posting else time.time() + 60
@@ -989,6 +1003,8 @@ class App:
 
 
 def safe_error(exc):
+    if isinstance(exc, SubscriptionExpired):
+        return str(exc)[:250]
     if isinstance(exc, RewriteUnavailable):
         return str(exc)[:250]
     if isinstance(exc, APIError):

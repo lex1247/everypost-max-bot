@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from media import normal_media, utf16_len, publication_parts
+from subscriptions import Subscriptions
 
 EDITABLE = ('draft', 'proposed', 'held')
 DEFAULT_STYLE = {'signature': '', 'buttons': [], 'proposal': False, 'discussion_url': ''}
@@ -180,6 +181,7 @@ class Posting:
           status TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL);
         ''')
         self.sync_channels()
+        self.subscriptions = Subscriptions(store)
 
     def sync_channels(self):
         for row in self.s.rows('SELECT id FROM destinations'):
@@ -273,13 +275,14 @@ class Posting:
         if stamp < now+60 or stamp > now+366*86400:
             raise ValueError('Выбери время от минуты до года вперёд.')
         if mode == 'schedule':
+            self.subscriptions.require_publication(post['destination'], stamp)
             if post['state'] not in (*EDITABLE, 'scheduled'):
                 raise ValueError('Этот пост уже отправляется или опубликован.')
             self.validate(post)
             if post['delete_at'] and post['delete_at'] <= stamp+60:
                 raise ValueError('Автоудаление должно быть позже публикации минимум на минуту.')
             return self.change(post, actor, state='scheduled', publish_at=stamp, creator=actor, error='')
-        if mode != 'delete' or post['state'] not in (*EDITABLE, 'scheduled', 'sent'):
+        if mode != 'delete' or post['state'] not in (*EDITABLE, 'scheduled', 'sent', 'subscription_hold'):
             raise ValueError('Сейчас нельзя менять автоудаление этого поста.')
         if self.s.rows("SELECT 1 FROM ed_deletions WHERE post=? AND state!='pending'", (post['id'],)):
             raise ValueError('Удаление уже началось. Проверь его результат в канале.')
@@ -291,6 +294,7 @@ class Posting:
         return self.change(post, actor, delete_at=stamp)
 
     def enqueue(self, post, actor):
+        self.subscriptions.require_publication(post['destination'])
         if post['state'] not in (*EDITABLE, 'scheduled'):
             raise ValueError('Этот пост уже поставлен в очередь или опубликован.')
         channel, text, plan = self.validate(post)

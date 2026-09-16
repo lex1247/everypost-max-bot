@@ -5,7 +5,8 @@ import time
 from database import Postgres, IDENTITIES, columns
 
 TABLES = ('settings','sources','destinations','routes','posts','deliveries','delivery_parts',
-          'ed_channels','ed_users','ed_channel_owners','ed_admins','ed_posts','ed_albums','ed_calendar','ed_deletions','ed_audit','tg_inbox')
+          'ed_channels','ed_users','ed_channel_owners','ed_admins','ed_posts','ed_albums','ed_calendar','ed_deletions','ed_audit','tg_inbox',
+          'ed_subscriptions','ed_subscription_events')
 RESERVED = {'activated','migration_done','posting_version'}
 
 

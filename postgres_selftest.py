@@ -9,6 +9,7 @@ from threading import Barrier
 from core import Store
 from posting import Posting
 from migration import export_data,import_data
+from subscriptions import add_months
 
 
 def main():
@@ -27,12 +28,18 @@ def main():
             did=source.add_destination('tg','-1002','Канал');source.run('INSERT INTO routes VALUES(?,?)',(sid,did))
             source.set_route_mode(sid,did,'original');source.ingest(sid,[(11,'Первый пост','https://example.com')],11)
             source.run("UPDATE deliveries SET status='sent',remote='22'")
-            customer=Posting(source).connect_channel(456,-1003,'Клиент',123)
+            source_posting=Posting(source)
+            customer=source_posting.connect_channel(456,-1003,'Клиент',123)
+            grant=source_posting.subscriptions.change(123,123,customer,'grant',1,'tg:123:100')
+            source_posting.subscriptions.change(123,123,customer,'mode','term','tg:123:101')
             source.db.close()
             s=Store(uri);p=Posting(s);import_data(s,export_data(root/'source.sqlite3'));p.sync_channels()
             assert s.rows('SELECT cursor FROM sources')[0][0]==11
             assert s.rows('SELECT remote FROM deliveries')[0][0]=='22'
             assert p.channel_owner(customer,123)==456
+            assert p.subscriptions.get(customer)['mode']=='term'
+            assert p.subscriptions.get(customer)['expires_at']==grant['expires_at']
+            assert p.subscriptions.change(123,123,customer,'grant',1,'tg:123:100')==grant
             s.ingest(sid,[(12,'Новый пост','https://example.com')],12)
             post=p.new(did,123,'Свой пост',{});p.enqueue(post,123)
             assert len(s.rows('SELECT * FROM deliveries'))==3
@@ -63,11 +70,27 @@ def main():
                 assert p.connect_channel(700+winner,-1009,'Повтор',123)==destination
                 assert len(s.rows("SELECT * FROM destinations WHERE remote='-1009'"))==1
                 assert len(s.rows('SELECT * FROM ed_channel_owners WHERE destination=?',(destination,)))==1
+                barrier=Barrier(2)
+                def renew(index):
+                    barrier.wait(timeout=10)
+                    return claimants[index].subscriptions.change(123,123,customer,'grant',1,'tg:123:102')
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    receipts=list(pool.map(renew,range(2)))
+                assert receipts[0]==receipts[1]
+                assert receipts[0]['expires_at']==add_months(grant['expires_at'],1)
+                assert len(s.rows("SELECT * FROM ed_subscription_events WHERE event='tg:123:102'"))==1
+                barrier=Barrier(2)
+                def independent_renewal(index):
+                    barrier.wait(timeout=10)
+                    return claimants[index].subscriptions.change(123,123,customer,'grant',1,f'tg:123:{103+index}')
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    list(pool.map(independent_renewal,range(2)))
+                assert p.subscriptions.get(customer)['expires_at']==add_months(add_months(receipts[0]['expires_at'],1),1)
             finally:
                 for db in competitors: db.db.close()
             # The test intentionally fails before deployment if migration or lock semantics are wrong.
             s.db.close()
-            print('PostgreSQL check passed: migration with customer ownership, Unicode, sequences, routing, transactions, worker lock and concurrent channel claims.',flush=True)
+            print('PostgreSQL check passed: migration with customer ownership and subscription receipts, Unicode, sequences, routing, transactions, worker lock, concurrent channel claims and renewals.',flush=True)
         finally:
             subprocess.run([str(binary/'pg_ctl'),'-D',str(folder),'-m','fast','-w','stop'],check=True,stdout=subprocess.DEVNULL)
 

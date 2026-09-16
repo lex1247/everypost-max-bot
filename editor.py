@@ -10,8 +10,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from posting import (Posting, EDITABLE, packed, own_media, message_text, styled, parse_buttons,
                      validate_style, parse_time, valid_url)
 from client_onboarding import ChannelConnection
+from subscription_controls import SubscriptionControls
 
 LABELS = {'draft': 'Черновик', 'proposed': 'Предложено', 'held': 'Нужна проверка', 'scheduled': 'Отложен',
+          'subscription_hold': 'Приостановлен: срок доступа',
           'queued': 'В очереди', 'sent': 'Опубликован', 'deleted': 'Удалён', 'cancelled': 'Отменён',
           'failed': 'Ошибка', 'unknown': 'Проверь канал'}
 
@@ -21,6 +23,7 @@ QUICK_COMMANDS = (
     ('drafts', 'Черновики'), ('scheduled', 'Отложенные'),
     ('published', 'Опубликованные и автоудаление'), ('channels', 'Мои каналы'),
     ('addchannel', 'Подключить свой Telegram-канал'),
+    ('subscription', 'Моя подписка и тарифы'),
     ('cancel', 'Отменить текущий ввод'), ('help', 'Помощь и команды'))
 QUICK_DESTINATIONS = {'newpost': 'new', 'inbox': 'proposed', 'drafts': 'draft',
                       'scheduled': 'scheduled', 'published': 'sent', 'channels': 'settings'}
@@ -35,6 +38,7 @@ class Editor:
         self.app, self.s = app, app.s
         self.p = Posting(self.s)
         self.connection = ChannelConnection(self)
+        self.billing = SubscriptionControls(self)
 
     async def say(self, actor, text, rows=None):
         kwargs = {'chat_id': actor, 'text': text[:4000], 'link_preview_options': {'is_disabled': True}}
@@ -102,10 +106,11 @@ class Editor:
             [button('📝 Черновики', 'choose:draft'), button('🕒 Отложенные', 'choose:scheduled')],
             [button('📥 Предложки', 'choose:proposed'), button('📁 Мои каналы', 'choose:settings')],
             [button('📤 Опубликованные', 'choose:sent')],
-            [button('➕ Подключить канал', 'connect')]])
+            [button('➕ Подключить канал', 'connect'), button('💳 Подписка', 'sub:list:0')]])
 
     async def quick_command(self, actor, action):
         session = self.p.session(actor)
+        if action == 'subscription': return await self.billing.listing(actor)
         if action == 'help':
             return await self.say(actor, 'EveryPost · Быстрые команды\n\n' +
                 '\n'.join('/'+name+' — '+description for name,description in QUICK_COMMANDS) +
@@ -148,7 +153,7 @@ class Editor:
 
     async def listing(self, actor, destination, state, page=0):
         await self.access(actor, destination)
-        states = ('draft','held','failed','unknown') if state == 'draft' else ('sent','deleted') if state == 'sent' else (state,)
+        states = ('draft','held','failed','unknown','subscription_hold') if state == 'draft' else ('sent','deleted') if state == 'sent' else (state,)
         query = 'SELECT * FROM ed_posts WHERE destination=? AND state IN ('+','.join('?' for _ in states)+')'
         args = [destination, *states]
         if not self.is_owner(actor, destination) and state != 'proposed':
@@ -200,7 +205,16 @@ class Editor:
                   [button('Автоудаление', 'delete:'+suffix),button('Предпросмотр','preview:'+suffix)]]
         elif p['state']=='sent':
             rows=[[button('⏱ Автоудаление','delete:'+suffix)]]
-        if p['delete_at'] and p['state'] in (*EDITABLE,'scheduled','sent'):
+        elif p['state']=='subscription_hold':
+            parts=self.s.rows('SELECT status,remote FROM delivery_parts WHERE delivery=?',(p['delivery'],))
+            sent=sum(part['status']=='sent' for part in parts)
+            prefix+=f'\nПодтверждённо отправлено частей: {sent} из {len(parts)}. После продления выбери действие.'
+            rows=[[button('💳 Подписка',f'sub:channel:{p["destination"]}')],
+                  [button('Продолжить неотправленное','subscription_resume:'+suffix)]]
+            if not any(part['status']=='sent' or part['remote'] for part in parts):
+                rows.append([button('В черновики — выбрать другое время','subscription_draft:'+suffix)])
+            if p['delete_at']: rows.append([button('Изменить автоудаление','delete:'+suffix)])
+        if p['delete_at'] and p['state'] in (*EDITABLE,'scheduled','sent','subscription_hold'):
             rows.append([button('Отключить автоудаление','undelete:'+suffix)])
         if p['state'] in ('failed','unknown'):
             rows.append([button('Проверить отправку','delivery:'+suffix)])
@@ -234,7 +248,7 @@ class Editor:
              [button('Обсуждение','pstyle:discussion_url:'+suffix)], [button('← К посту','open:'+str(p['id']))]])
 
     async def calendar(self,actor,p,mode):
-        if p['state'] not in (*EDITABLE,'scheduled','sent') or (mode=='schedule' and p['state']=='sent'):
+        if p['state'] not in (*EDITABLE,'scheduled','sent','subscription_hold') or (mode=='schedule' and p['state'] in ('sent','subscription_hold')):
             raise ValueError('Этот пост уже отправляется. Дождись результата.')
         nonce=secrets.token_urlsafe(24)
         self.s.run('INSERT INTO ed_calendar(nonce,actor,post,revision,mode,expires) VALUES(?,?,?,?,?,?)',
@@ -251,6 +265,7 @@ class Editor:
     async def callback(self,actor,data):
         parts=data.split(':')[1:]; action=parts[0]
         if action=='home': return await self.home(actor)
+        if action=='sub': return await self.billing.callback(actor,parts[1:])
         if action=='connect': return await self.connection.start(actor)
         if action=='choose': return await self.choose(actor,parts[1])
         if action=='list': return await self.listing(actor,int(parts[1]),parts[2],int(parts[3]))
@@ -307,12 +322,17 @@ class Editor:
                 'buttons':'Каждая кнопка с новой строки: Название | https://ссылка\nИли - для отключения.',
                 'discussion_url':'Пришли ссылку обсуждения или - для отключения.'}[field])
         id,revision=int(parts[1]),int(parts[2]);p=await self.post_access(actor,id,revision)
+        if action in ('subscription_resume','subscription_draft'):
+            if action=='subscription_resume': await self.access(actor,p['destination'],publish=True)
+            self.p.subscriptions.resume(p,actor,draft=action=='subscription_draft')
+            self.p.audit(actor,p['destination'],action,id)
+            return await self.card(actor,id)
         if action=='preview': return await self.card(actor,id,True)
         if action=='delivery':
             if actor!=self.app.owner: return await self.say(actor,'Владелец проверит доставку и сможет её восстановить.')
             return await self.say(actor,f"Отправка {p['delivery']}. Проверь канал перед повтором.\n/errors — сведения; /resolve {p['delivery']} sent — пост уже вышел; /resolve {p['delivery']} retry — повтор, если точно не вышел.")
         if action=='undelete':
-            if p['state'] not in (*EDITABLE,'scheduled','sent'): raise ValueError('Сейчас нельзя изменить автоудаление.')
+            if p['state'] not in (*EDITABLE,'scheduled','sent','subscription_hold'): raise ValueError('Сейчас нельзя изменить автоудаление.')
             # In-progress removal cannot be revoked as if nothing happened.
             if self.s.rows("SELECT 1 FROM ed_deletions WHERE post=? AND state!='pending'",(id,)):
                 raise ValueError('Удаление уже началось. Проверь результат в списке публикаций.')
@@ -447,6 +467,7 @@ class Editor:
         forwarded = bool(message.get('forward_origin') or message.get('forward_date'))
         # Only a plain, unforwarded command navigates. Captions and forwarded posts remain material.
         plain = not forwarded and not any(message.get(k) for k in ('photo','video','document','audio','animation','media_group_id'))
+        if plain and await self.billing.command(actor,message): return True
         match = re.fullmatch(r'/([a-z_]+|отмена)(?:@([a-z0-9_]+))?', text, re.I) if plain else None
         if match:
             target=match[2]
@@ -555,6 +576,10 @@ class Editor:
                     await self.say(p['creator'],f"Пост #{p['id']}: {LABELS.get(state,state)}.",[[button('Открыть',f"open:{p['id']}")]])
             elif state=='pending' and p['state'] in ('unknown','failed'):
                 self.s.run("UPDATE ed_posts SET state='queued',error='' WHERE id=?",(p['id'],))
+        for row in self.s.rows("SELECT * FROM ed_posts WHERE state='subscription_hold' AND notified!='subscription_hold'"):
+            self.s.run("UPDATE ed_posts SET notified='subscription_hold' WHERE id=?",(row['id'],))
+            await self.say(row['creator'],f"Пост #{row['id']} приостановлен: срок доступа закончился. Пост сохранён; после продления проверь расписание.",
+                           [[button('Открыть',f"open:{row['id']}")]])
         await self.discussion_copies()
         await self.delete_due()
         self.s.run('DELETE FROM ed_calendar WHERE expires<?',(now-86400,))
