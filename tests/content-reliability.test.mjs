@@ -218,4 +218,11 @@ await test('Successful inspection preserves the preparation lease so a restart c
  const after=await get(row.id);assert.equal(after.state,'preparing');assert.equal(after.scan_state,'ready');
  assert.equal(+new Date(after.lease_until),+new Date(before.lease_until));
 });
+await test('A failed preparation retains its reserved slot for the next automatic selection',async()=>{
+ const a=await make('7888888888888888861'),b=await make('7888888888888888862');
+ await run("contentDecide(1,7,id,'queue')",{id:a.id});const before=await get(a.id);
+ await sql("UPDATE ep_content_candidates SET state='failed',last_error='temporary' WHERE id=$1",[a.id]);
+ await run("contentDecide(1,7,id,'queue')",{id:b.id});const after=await get(b.id);
+ assert.equal(+new Date(after.due_at)- +new Date(before.due_at),90*60000);
+});
 console.log(`${n} tests passed`);await db.close();
