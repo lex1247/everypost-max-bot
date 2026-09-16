@@ -15,6 +15,10 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 MAX_BYTES = 50_000_000
+# TikTok's download/download_addr formats may carry its moving username watermark.
+# Require a playable MP4 with audio; never fall back to a download variant.
+CLEAN_FORMAT = ('b[ext=mp4][vcodec~="^(avc|h264)"][acodec!=none]'
+                '[format_id!^=download][format_note!*=?watermarked]')
 _gate = asyncio.Semaphore(1)
 
 
@@ -146,7 +150,7 @@ async def download(url):
                 sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-warnings', '--quiet',
                 '--no-playlist', '--use-extractors', 'tiktok.*', '--max-filesize', str(MAX_BYTES),
                 '--socket-timeout', '12', '--retries', '1', '--extractor-retries', '1',
-                '-f', 'download/b[ext=mp4][vcodec^=avc]/b[ext=mp4]',
+                '-f', CLEAN_FORMAT,
                 '-o', str(target), '--', url,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
             async def monitor():
@@ -158,7 +162,7 @@ async def download(url):
             try:
                 await asyncio.wait_for(monitor(), 80)
                 if proc.returncode or not target.exists() or target.stat().st_size > MAX_BYTES:
-                    raise ValueError('Не удалось скачать доступный MP4 до 50 МБ. Повторите позже.')
+                    raise ValueError('Не удалось получить MP4 без водяного знака TikTok до 50 МБ. Ролик не передан в очередь; требуется проверка.')
                 return target.read_bytes()
             finally:
                 if proc.returncode is None:
