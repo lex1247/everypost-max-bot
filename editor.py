@@ -29,8 +29,8 @@ QUICK_COMMANDS = (
     ('addchannel', 'Подключить свой Telegram-канал'),
     ('subscription', 'Моя подписка и тарифы'),
     ('content', 'TikTok: источники и подборка'),
-    ('folders', 'Папки каналов'), ('multipost', 'Пост в несколько каналов'),
-    ('reports', 'Состояние рассылок'), ('crosspost', 'Кросспостинг и правила'),
+    ('folders', 'Папки каналов'), ('multipost', 'Мультипостинг'),
+    ('reports', 'Отчёты мультипостинга'), ('crosspost', 'Кросспостинг и правила'),
     ('cancel', 'Отменить текущий ввод'), ('help', 'Помощь и команды'))
 QUICK_DESTINATIONS = {'newpost': 'new', 'inbox': 'proposed', 'drafts': 'draft',
                       'scheduled': 'scheduled', 'published': 'sent', 'channels': 'settings'}
@@ -118,8 +118,8 @@ class Editor:
             [button('📥 Предложки', 'choose:proposed'), button('📁 Мои каналы', 'choose:settings')],
             [button('📤 Опубликованные', 'choose:sent')],
             [button('🎬 Контент · TikTok', 'content')],
-            [button('📁 Папки', 'multi:folders'), button('📣 Рассылка', 'multi:start')],
-            [button('🔁 Кросспостинг', 'cross:menu'), button('📋 Отчёты рассылок', 'multi:reports')],
+            [button('📁 Папки', 'multi:folders'), button('📣 Мультипостинг', 'multi:start')],
+            [button('🔁 Кросспостинг', 'cross:menu'), button('📋 Отчёты мультипостинга', 'multi:reports')],
             *([[button('⚠️ Ошибки источников', 'source_errors')]] if actor == self.app.owner else []),
             [button('➕ Подключить канал', 'connect'), button('💳 Подписка', 'sub:list:0')]])
 

@@ -40,7 +40,7 @@ class MultiControls:
 
     async def card(self,actor,id):
         rows=self.s.rows('SELECT * FROM ed_batches WHERE id=? AND actor=?',(id,actor))
-        if not rows: raise ValueError('Рассылка недоступна.')
+        if not rows: raise ValueError('Мультипост недоступен.')
         posts=self.s.rows('SELECT post FROM ed_batch_posts WHERE batch=? ORDER BY destination',(id,))
         buttons=[];lines=[]
         for r in posts:
@@ -49,10 +49,10 @@ class MultiControls:
             buttons.append([{'text':c['title'][:35]+' · Предпросмотр / правка','callback_data':f"ed:preview:{p['id']}:{p['revision']}"}])
         buttons += [[b('Опубликовать во всех',f'publish:{id}'),b('Отложить во всех',f'schedule:{id}')],
                     [b('Вернуть в черновики',f'draft:{id}')],[{'text':'← Меню','callback_data':'ed:home'}]]
-        await self.e.say(actor,'Рассылка #'+str(id)+'\n'+'\n'.join(lines),buttons)
+        await self.e.say(actor,'Мультипост #'+str(id)+'\n'+'\n'.join(lines),buttons)
 
     async def posts(self,actor,id):
-        if not self.s.rows('SELECT 1 FROM ed_batches WHERE id=? AND actor=?',(id,actor)): raise ValueError('Рассылка недоступна.')
+        if not self.s.rows('SELECT 1 FROM ed_batches WHERE id=? AND actor=?',(id,actor)): raise ValueError('Мультипост недоступен.')
         posts=[]
         for row in self.s.rows('SELECT post FROM ed_batch_posts WHERE batch=? ORDER BY destination',(id,)):
             p=await self.e.post_access(actor,row['post']);await self.e.access(actor,p['destination'],publish=True);posts.append(p)
@@ -64,8 +64,8 @@ class MultiControls:
         if action=='start': return await self.start(actor)
         if action in ('folders','pickfolder'): return await self.folders(actor,action=='pickfolder')
         if action=='reports':
-            rows=[[b('Рассылка #'+str(r['id']),'report:'+str(r['id']))] for r in self.s.rows('SELECT id FROM ed_batches WHERE actor=? ORDER BY id DESC LIMIT 30',(actor,))]
-            return await self.e.say(actor,'Последние рассылки',rows)
+            rows=[[b('Мультипост #'+str(r['id']),'report:'+str(r['id']))] for r in self.s.rows('SELECT id FROM ed_batches WHERE actor=? ORDER BY id DESC LIMIT 30',(actor,))]
+            return await self.e.say(actor,'Мультипостинг · последние публикации',rows)
         if action=='report': return await self.card(actor,int(parts[1]))
         if action=='newfolder':
             self.p.session(actor,{'action':'folder_name'});return await self.e.say(actor,'Пришли название папки до 60 символов.')
@@ -82,7 +82,7 @@ class MultiControls:
             current=self.p.session(actor)
             if current.get('action')!='multi_select': current={'action':'multi_select','kind':'multi','name':'','nonce':secrets.token_hex(8),'ids':[]}
             current['ids']=list(dict.fromkeys(current['ids']+ids))
-            if len(current['ids'])>30: raise ValueError('До 30 каналов в одной рассылке.')
+            if len(current['ids'])>30: raise ValueError('До 30 каналов в одном мультипосте.')
             self.p.session(actor,current);return await self.select(actor)
         if action in ('toggle','done'):
             f=self.p.session(actor)
@@ -119,7 +119,7 @@ class MultiControls:
             existing=self.s.rows('SELECT id FROM ed_batches WHERE nonce=?',(session['nonce'],))
             if existing: id=existing[0]['id']
             else:
-                if self.p.session(actor)!=session: raise ValueError('Создание рассылки отменено или изменено. Открой его заново.')
+                if self.p.session(actor)!=session: raise ValueError('Создание мультипоста отменено или изменено. Открой его заново.')
                 result=self.s.db.execute('INSERT INTO ed_batches(actor,nonce,created_at) VALUES(?,?,?)',(actor,session['nonce'],time.time()));id=result.lastrowid
                 for d in session['ids']:
                     p=self.p.new(d,actor,message_text(message),media if media is not None else own_media(message))
