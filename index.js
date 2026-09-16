@@ -5821,12 +5821,14 @@ async function crossBridge(payload){
   const key=crypto.createHmac('sha256',TOKEN).update('EveryPost MAX crosspost bridge v1').digest();
   const retryRead=['resolve','fetch','trustat_resolve','trustat_fetch','vk_resolve','vk_fetch','content_fetch','content_health','content_inspect','content_prepare'].includes(payload.action);
   for(let attempt=0;attempt<(retryRead?3:1);attempt++){
+    if(payload.action.startsWith('content_'))console.log('CONTENT BRIDGE REQUEST:',payload.action,attempt+1);
     const stamp=String(Math.floor(Date.now()/1000));
     const signature=crypto.createHmac('sha256',key).update(stamp+'.'+body).digest('hex');
     let response;
     try{response=await httpsRequest('https://everypost-telegram-bot.onrender.com/max-crosspost',{
       method:'POST',headers:{'Content-Type':'application/json','X-EveryPost-Time':stamp,'X-EveryPost-Signature':signature},body,timeout:payload.action==='content_health'?15000:payload.action==='content_prepare'?215000:payload.action==='content_inspect'?175000:65000});}
-    catch(e){if(retryRead&&attempt<2){await sleep(15000);continue;}const err=Error('Обработчик не ответил за отведённое время. Материалы сохранены.');err.safeRetry=retryRead;throw err;}
+    catch(e){if(payload.action.startsWith('content_'))console.log('CONTENT BRIDGE TRANSPORT:',payload.action,e.name);if(retryRead&&attempt<2){await sleep(15000);continue;}const err=Error('Обработчик не ответил за отведённое время. Материалы сохранены.');err.safeRetry=retryRead;throw err;}
+    if(payload.action.startsWith('content_'))console.log('CONTENT BRIDGE RESPONSE:',payload.action,response.status);
     if(retryRead&&attempt<2&&[502,503,504].includes(response.status)){await sleep(15000);continue;}
     let data;try{data=JSON.parse(response.text);}catch{
       if(retryRead&&attempt<2&&[200,502,503,504].includes(response.status)){await sleep(15000);continue;}
@@ -6304,7 +6306,8 @@ async function contentDecide(channelId,userId,id,decision,dueAt) {
    else {
     const latest=(await client.query(`SELECT MAX(due_at) AS due FROM (
      SELECT due_at FROM ep_schedules q JOIN ep_posts p ON p.id=q.post_id WHERE p.channel_id=$1 AND q.status IN ('scheduled','sending')
-     UNION ALL SELECT due_at FROM ep_content_candidates WHERE channel_id=$1 AND state IN ('selected','preparing')) slots`,[channelId])).rows[0].due;
+     UNION ALL SELECT due_at FROM ep_content_candidates WHERE channel_id=$1 AND state IN ('selected','preparing','failed')
+      AND selected_by IS NOT NULL AND scan_state<>'duplicate') slots`,[channelId])).rows[0].due;
     due=new Date(Math.max(Date.now()+10*60000,latest?new Date(latest).getTime()+90*60000:0));
    }
    await client.query(`UPDATE ep_content_candidates SET state='selected',selected_by=$3,due_at=$4,last_error=NULL,prepare_attempts=0,prepare_next_at=NOW(),updated_at=NOW()
@@ -6453,9 +6456,11 @@ async function contentInspectNext(existingOnly=false){
   AND (c.post_id IS NOT NULL OR (NOT $1 AND c.state='new' AND (NOT COALESCE(pref.hair_only,FALSE) OR c.hair_relevance='match')))
   ORDER BY (c.post_id IS NOT NULL) DESC,c.published_at DESC NULLS LAST,c.id LIMIT 1`,[existingOnly])).rows[0];
  if(!scan)return false;
+ console.log('CONTENT INSPECTION START:',scan.id);
  try{
   const data=await crossBridge({action:'content_inspect',provider:scan.provider,url:scan.canonical_url});
   await contentSaveInspection(scan,data);
+  console.log('CONTENT INSPECTION DONE:',scan.id);
  }catch(e){await pool.query(`UPDATE ep_content_candidates SET scan_state=$2,scan_error=$3,scan_attempts=scan_attempts+1,
    scan_next_at=NOW()+INTERVAL '5 minutes' WHERE id=$1`,[scan.id,e.safeRetry&&scan.scan_attempts<3?'retry':'failed',String(e.message).slice(0,500)]);}
  return true;
@@ -6477,6 +6482,7 @@ async function contentTick() {
   const row=(await pool.query(`UPDATE ep_content_candidates SET state='preparing',lease_until=NOW()+INTERVAL '15 minutes'
    WHERE id=(SELECT id FROM ep_content_candidates WHERE state='selected' AND prepare_next_at<=NOW() ORDER BY due_at,id LIMIT 1) RETURNING *`)).rows[0];
   if(row)try{
+   console.log('CONTENT PREPARATION START:',row.id);
    await contentAccess(row.channel_id,row.selected_by);
    const data=await crossBridge({action:CONTENT_PROVIDERS[row.provider].prepare,provider:row.provider,url:row.canonical_url});
    await contentSaveInspection(row,data);
