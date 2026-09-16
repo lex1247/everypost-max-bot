@@ -5815,7 +5815,7 @@ function crossUsername(value){
 async function crossBridge(payload){
   const body=JSON.stringify(payload);
   const key=crypto.createHmac('sha256',TOKEN).update('EveryPost MAX crosspost bridge v1').digest();
-  const retryRead=['resolve','fetch','trustat_resolve','trustat_fetch','vk_resolve','vk_fetch'].includes(payload.action);
+  const retryRead=['resolve','fetch','trustat_resolve','trustat_fetch','vk_resolve','vk_fetch','content_fetch'].includes(payload.action);
   for(let attempt=0;attempt<(retryRead?3:1);attempt++){
     const stamp=String(Math.floor(Date.now()/1000));
     const signature=crypto.createHmac('sha256',key).update(stamp+'.'+body).digest('hex');
@@ -5823,6 +5823,7 @@ async function crossBridge(payload){
     try{response=await httpsRequest('https://everypost-telegram-bot.onrender.com/max-crosspost',{
       method:'POST',headers:{'Content-Type':'application/json','X-EveryPost-Time':stamp,'X-EveryPost-Signature':signature},body,timeout:payload.action==='content_prepare'?160000:65000});}
     catch(e){if(retryRead&&attempt<2){await sleep(15000);continue;}throw Error('Сервис чтения не ответил. Повторим позже; материалы сохранены.');}
+    if(retryRead&&attempt<2&&[502,503,504].includes(response.status)){await sleep(15000);continue;}
     let data;try{data=JSON.parse(response.text);}catch{
       if(retryRead&&attempt<2&&[200,502,503,504].includes(response.status)){await sleep(15000);continue;}
       throw Error('Сервис обработки запускается. Повторите через минуту.');
