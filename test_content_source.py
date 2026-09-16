@@ -8,6 +8,20 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
 class ContentTests(unittest.IsolatedAsyncioTestCase):
+    def test_clean_format_selection(self):
+        from yt_dlp import YoutubeDL
+        def fmt(fid,note=None,codec='h264',audio='aac',height=720):
+            return {'format_id':fid,'format_note':note,'ext':'mp4','vcodec':codec,
+                    'acodec':audio,'height':height,'url':'https://example.com/video.mp4'}
+        with YoutubeDL({'quiet':True}) as ydl:
+            select=ydl.build_format_selector(m.CLEAN_FORMAT)
+            def choose(formats):
+                return [x['format_id'] for x in select({'formats':formats,'has_merged_format':False,'incomplete_formats':False})]
+            self.assertEqual(choose([fmt('play'),fmt('download','watermarked',height=1080)]),['play'])
+            for formats in [[fmt('download')],[fmt('download_addr-0')],[fmt('other','Download video, watermarked')],[fmt('play',audio='none')],[fmt('play',codec='bytevc2')]]:
+                self.assertEqual(choose(formats),[])
+            self.assertEqual(choose([fmt('h264_1080p'),fmt('download','watermarked')]),['h264_1080p'])
+
     def test_sources(self):
         self.assertEqual(m.source_url('@miaoloo'), 'https://www.tiktok.com/@miaoloo')
         for u in ['http://tiktok.com/@x','https://localhost/@x','https://www.tiktok.com.evil/@x','https://www.tiktok.com:444/@x','https://www.tiktok.com/redirect']:
