@@ -6425,7 +6425,7 @@ async function contentSaveInspection(row,data){
  // Existing posts keep their schedule. Only unqueued repeats are held.
  const duplicate=match&&!fresh.post_id;
  await client.query(`UPDATE ep_content_candidates SET scan_hash=$2,fingerprint=$3::jsonb,scan_state=$4,duplicate_of=$5,
-  scan_error=NULL,scan_attempts=0,lease_until=NULL,updated_at=NOW() WHERE id=$1`,
+  scan_error=NULL,scan_attempts=0,lease_until=CASE WHEN $4='duplicate' THEN NULL ELSE lease_until END,updated_at=NOW() WHERE id=$1`,
   [row.id,data.content_hash,JSON.stringify(data.fingerprint),duplicate?'duplicate':'ready',duplicate?match.id:null]);
  if(duplicate&&['selected','preparing','failed'].includes(fresh.state))await client.query("UPDATE ep_content_candidates SET state='failed',last_error=$2 WHERE id=$1",[row.id,'Повтор ролика #'+match.id+'. Проверьте вкладку «Повторы».']);
  await client.query('COMMIT');
@@ -6463,7 +6463,7 @@ async function contentInspectNext(existingOnly=false){
 async function contentTick() {
  if(!ready||contentBusy)return;contentBusy=true;let client,locked=false;
  try{client=await pool.connect();locked=(await client.query('SELECT pg_try_advisory_lock(19471,3) acquired')).rows[0].acquired;if(!locked)return;
-  await pool.query("UPDATE ep_content_candidates SET refresh_state='pending',lease_until=NULL WHERE refresh_state='preparing' AND lease_until<NOW()");
+  await pool.query("UPDATE ep_content_candidates SET refresh_state='pending',lease_until=NULL WHERE refresh_state='preparing' AND (lease_until IS NULL OR lease_until<NOW())");
   const replacement=(await pool.query(`UPDATE ep_content_candidates SET refresh_state='preparing',lease_until=NOW()+INTERVAL '15 minutes'
    WHERE id=(SELECT id FROM ep_content_candidates WHERE refresh_state='pending' ORDER BY due_at,id LIMIT 1) RETURNING *`)).rows[0];
   if(replacement){try{
@@ -6473,7 +6473,7 @@ async function contentTick() {
   }catch(e){await pool.query("UPDATE ep_content_candidates SET refresh_state='failed',refresh_error=$2,lease_until=NULL WHERE id=$1",[replacement.id,String(e.message).slice(0,500)]);}return;}
   // Build identities for existing posts before accepting new videos after migration.
   if(await contentInspectNext(true))return;
-  await pool.query("UPDATE ep_content_candidates SET state='selected',lease_until=NULL WHERE state='preparing' AND lease_until<NOW() AND post_id IS NULL");
+  await pool.query("UPDATE ep_content_candidates SET state='selected',lease_until=NULL WHERE state='preparing' AND (lease_until IS NULL OR lease_until<NOW()) AND post_id IS NULL");
   const row=(await pool.query(`UPDATE ep_content_candidates SET state='preparing',lease_until=NOW()+INTERVAL '15 minutes'
    WHERE id=(SELECT id FROM ep_content_candidates WHERE state='selected' AND prepare_next_at<=NOW() ORDER BY due_at,id LIMIT 1) RETURNING *`)).rows[0];
   if(row)try{
