@@ -16,7 +16,7 @@ import tls from "node:tls";
 // Основа: formatting-1. Автоподписи и URL-кнопки сохранены.
 // Исходный материал и оформленный body хранятся отдельно. Отложенные сохраняют снимок.
 // Основа: schedule-2. Системный планировщик работает только при запущенном процессе.
-// На Free нет гарантии отправки в срок. Просроченные >5 минут задания удерживаются.
+// На Free нет гарантии отправки в срок. После пробуждения отправляем просроченную очередь.
 // Черновики сохраняются в PostgreSQL. Медиа остаются вложениями MAX по токенам;
 // эта версия не создаёт собственную бессрочную резервную копию медиафайлов.
 // Оригинальная предложка не удаляется при сохранении или удалении её черновика.
@@ -3532,9 +3532,8 @@ async function handleSavedDraftCallback(update) {
 
 // ---------- Отложенные публикации: выбор в боте, время в PostgreSQL ----------
 // Нет внешнего пингера. На Render Free фоновые задачи выполняются только пока
-// процесс активен. Опоздание больше 5 минут удерживает материал, а не публикует его.
+// процесс активен. После запуска просроченные задания отправляются по due_at,id.
 // При сетевой неопределённости публикацию автоматически не повторяем.
-const SCHEDULE_GRACE_MS = 5 * 60 * 1000;
 const SCHEDULE_HORIZON_DAYS = 366;
 const CHANNEL_ZONES = [
   ["Europe/Kaliningrad", "Калининград"], ["Europe/Moscow", "Москва"],
@@ -3673,7 +3672,7 @@ function schedulePickerBody(session, title, now = Date.now()) {
       if (choiceValid(session, now)) rows.push([b("confirm",
         `🕒 Отложить на ${session.day_key.slice(6,8)}.${session.day_key.slice(4,6)}, ${pad2(session.hour)}:${pad2(session.minute)}`)]);
       else text += "\n\n⚠️ Это время уже прошло или слишком близко. Выберите другое.";
-      text += "\n\nЕсли сервис опоздает больше 5 минут, пост будет удержан для проверки.";
+      text += "\n\nЕсли сервер спит, пост выйдет после его пробуждения. Пропущенные посты отправляются по очереди.";
     }
     rows.push([b("days", "📅 Изменить дату")]);
   }
@@ -4041,9 +4040,6 @@ async function dispatchScheduled(q) {
        !access||access.version!==Number(q.access_version)) {
       const e=new Error("Права или состояние изменились до отправки.");e.deliveryNotStarted=true;throw e;
     }
-    if(Date.now()-new Date(q.due_at).getTime()>SCHEDULE_GRACE_MS){
-      const e=new Error("Публикация опоздала больше чем на 5 минут. Нужен новый выбор времени.");e.deliveryNotStarted=true;throw e;
-    }
     if(!q.body_snapshot||Object.hasOwn(q.body_snapshot,"link")||Object.hasOwn(q.body_snapshot,"sender")){
       const e=new Error("Небезопасный формат публикации. Отправка остановлена.");e.deliveryNotStarted=true;throw e;
     }
@@ -4068,7 +4064,6 @@ async function processOneScheduled() {
     await holdScheduled(q,q.dispatch_started_at?"Процесс остановился во время отправки. Проверьте канал; автоматический повтор запрещён.":
       "Процесс остановился до отправки. Материал сохранён; назначьте время заново.",q.dispatch_started_at?"needs_check":"paused");return;
   }
-  if(Date.now()-new Date(q.due_at).getTime()>SCHEDULE_GRACE_MS){await holdScheduled(q,"Сервис опоздал больше чем на 5 минут. Пост НЕ опубликован; выберите новое время.");return;}
   let access;
   try{access=await scheduleAccess(q,q.scheduled_by);}
   catch(e){await holdScheduled(q,"Не удалось проверить права в MAX. Публикация удержана.");console.error("SCHEDULE RIGHTS ERROR:",e.message);return;}
@@ -4118,7 +4113,9 @@ async function processOneScheduled() {
     console.error("SCHEDULE PUBLISH ERROR:",e.message);return;
   }
   console.log("SCHEDULED POST PUBLISHED:",q.post_id);
-  await scheduledNotice(q,`✅ Отложенный пост #${q.post_id} опубликован в канале «${shortTitle(q.title)}».`);
+  const lateMinutes=Math.floor((Date.now()-new Date(q.due_at).getTime())/60000);
+  await scheduledNotice(q,`✅ Отложенный пост #${q.post_id} опубликован в канале «${shortTitle(q.title)}».`+
+    (lateMinutes>=1?`\nОпоздание: ${lateMinutes} мин. Пост отправлен после возобновления обработки очереди.`:""));
 }
 
 async function handleUpdate(update) {
