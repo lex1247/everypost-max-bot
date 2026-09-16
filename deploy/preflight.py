@@ -39,8 +39,8 @@ from content_source import inspect
 with psycopg.connect(os.environ['DATABASE_URL']) as db:
     row=db.execute('SELECT canonical_url FROM public.ep_content_candidates ORDER BY id LIMIT 1').fetchone()
 if not row: raise SystemExit('No saved seed video')
-data=asyncio.run(inspect(row[0]))
-assert data.get('content_hash') and data.get('fingerprint')
+video, inspection=asyncio.run(inspect(row[0]))
+assert video and inspection.get('content_hash') and inspection.get('fingerprint')
 print('TikTok: download and video fingerprint passed')
 """
     result=subprocess.run(['docker','compose','exec','-T','telegram','python','-c',code],
