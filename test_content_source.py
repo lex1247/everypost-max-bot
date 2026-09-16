@@ -7,6 +7,11 @@ spec = importlib.util.spec_from_file_location('content_source', Path(__file__).w
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
+class MemoryStore:
+    def __init__(self): self.data = {}
+    def get(self, key): return self.data.get(key, '')
+    def set(self, key, value): self.data[key] = value
+
 class ContentTests(unittest.IsolatedAsyncioTestCase):
     def test_clean_format_selection(self):
         from yt_dlp import YoutubeDL
@@ -51,7 +56,7 @@ class ContentTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError): await m.fetch('@miaoloo')
 
     async def test_wrong_video_never_uploads(self):
-        app=type('App',(),{'max_api':AsyncMock()})()
+        app=type('App',(),{'s':MemoryStore(),'max_api':AsyncMock()})()
         with patch.object(m,'extract',AsyncMock(return_value={'id':'7221888273554181418'})):
             with self.assertRaises(ValueError): await m.prepare(app,'https://www.tiktok.com/@miaoloo/video/7221888273554181419')
         app.max_api.assert_not_called()
@@ -67,12 +72,29 @@ class ContentTests(unittest.IsolatedAsyncioTestCase):
         class HTTP:
             def stream(self,*args,**kwargs): return Stream()
             post=AsyncMock(return_value=type('Response',(),{'is_error':False,'is_redirect':False})())
-        app=type('App',(),{'http':HTTP(),'max_http':None,'max_api':AsyncMock(return_value={'url':'https://omub.okcdn.ru/upload','token':'test-video'})})()
+        app=type('App',(),{'s':MemoryStore(),'http':HTTP(),'max_http':None,'max_api':AsyncMock(return_value={'url':'https://omub.okcdn.ru/upload','token':'test-video'})})()
         info={'id':'7221888273554181419','formats':[{'ext':'mp4','vcodec':'h264','acodec':'aac','protocol':'https','url':'https://a.tiktokcdn.com/v','height':720}]}
-        with patch.object(m,'extract',AsyncMock(return_value=info)), patch.object(m,'download',AsyncMock(return_value=data)):
+        with patch.object(m,'extract',AsyncMock(return_value=info)), patch.object(m,'download',AsyncMock(return_value=data)), patch.object(m,'fingerprint',AsyncMock(return_value={'version':1})):
             result=await m.prepare(app,'https://www.tiktok.com/@miaoloo/video/7221888273554181419')
+            again=await m.prepare(app,'https://www.tiktok.com/@miaoloo/video/7221888273554181419')
+            self.assertEqual(again,result)
         self.assertEqual(result['content_hash'],hashlib.sha256(data).hexdigest())
         self.assertEqual(result['body']['text'],'')
+        app.http.post.assert_awaited_once()
         app.max_api.assert_awaited_once_with('POST','/uploads',params={'type':'video'})
+
+    async def test_health_does_not_download_or_upload(self):
+        with patch.object(m,'download',AsyncMock()) as download:
+            data=await m.action(None,{'action':'content_health'})
+        self.assertEqual(data['version'],2)
+        download.assert_not_called()
+
+    async def test_inspection_never_uploads(self):
+        data=b'\x00\x00\x00\x18ftypmp42video'
+        info={'id':'7221888273554181419','duration':35}
+        with patch.object(m,'extract',AsyncMock(return_value=info)),patch.object(m,'download',AsyncMock(return_value=data)),patch.object(m,'fingerprint',AsyncMock(return_value={'version':1})):
+            r=await m.action(None,{'action':'content_inspect','url':'https://www.tiktok.com/@miaoloo/video/7221888273554181419'})
+        self.assertNotIn('body',r)
+        self.assertEqual(len(r['content_hash']),64)
 
 if __name__=='__main__': unittest.main()
