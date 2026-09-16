@@ -92,6 +92,8 @@ def create_web(app):
     server=web.Application(client_max_size=2*1024*1024, middlewares=[standby_guard])
     from max_bridge import install
     install(server, app)
+    from content_web import install as install_content
+    install_content(server, app)
     async def health(request):
         try:
             app.s.rows('SELECT 1')
@@ -100,7 +102,7 @@ def create_web(app):
             strict = os.getenv('EP_STRICT_HEALTH') == '1'
             beats = getattr(app, 'runtime_heartbeats', {})
             progressing = all(name in beats and time.monotonic() - beats[name] < 1800
-                              for name in ('inbox_loop','publish','editor'))
+                              for name in ('inbox_loop','publish','editor','content','crosspost'))
             ok = run_mode() == 'standby' or not strict or (worker and progressing)
             return web.json_response({'ok':ok,'service':'EveryPost Telegram','worker':worker,
                                       'mode':run_mode()},status=200 if ok else 503)
@@ -186,6 +188,7 @@ async def cloud_worker(app):
     app.s.recover()
     app.s.run("UPDATE tg_inbox SET status='unknown',error='Перезапуск во время обработки. Повтори действие после проверки.' WHERE status='processing'")
     app.s.run("UPDATE ed_deletions SET state='unknown',error='Перезапуск во время удаления' WHERE state='sending'")
+    app.s.run("UPDATE ed_publication_edits SET state='unknown',error='Перезапуск во время изменения. Проверь текст в канале.' WHERE state='sending'")
     while os.getenv('REQUIRE_MIGRATION')=='1' and app.s.get('activated')!='1':
         await asyncio.sleep(1)
     base=os.getenv('PUBLIC_URL',os.getenv('RENDER_EXTERNAL_URL','')).rstrip('/')
@@ -195,12 +198,17 @@ async def cloud_worker(app):
     await app.tg('setWebhook',url=base+'/telegram/webhook',secret_token=webhook_secret(),
                  allowed_updates=['message','callback_query'],drop_pending_updates=False)
     app.worker_ready=True
+    from editor import QUICK_COMMANDS
+    try:
+        await app.tg('setMyCommands',commands=[{'command':name,'description':description} for name,description in QUICK_COMMANDS])
+    except Exception:
+        print('Telegram command menu update deferred; inline controls remain available.',flush=True)
     if app.s.get('posting_version')!='1':
         await app.notify('EveryPost работает на Render. Нажми «Постинг»: свои посты, черновики, предложка, календарь и оформление.\nБесплатный сервер может засыпать. Просроченные более чем на 5 минут публикации попадут в черновики для проверки.')
         app.s.set('posting_version','1')
     print('Telegram webhook ready. Posting worker active.',flush=True)
     # The outer supervisor handles process signals and closes this connection after cancelling all workers.
-    jobs=[asyncio.create_task(c) for c in (app.inbox_loop(),app.editor.loop(),app.collect(),app.rewrite_queue(),app.publish())]
+    jobs=[asyncio.create_task(c) for c in (app.inbox_loop(),app.editor.loop(),app.editor.content.loop(),app.editor.cross.loop(),app.collect(),app.rewrite_queue(),app.publish())]
     try:
         done,_=await asyncio.wait(jobs,return_when=asyncio.FIRST_COMPLETED)
         for job in done: job.result()

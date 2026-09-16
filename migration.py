@@ -6,7 +6,8 @@ from database import Postgres, IDENTITIES, columns
 
 TABLES = ('settings','sources','destinations','routes','posts','deliveries','delivery_parts',
           'ed_channels','ed_users','ed_channel_owners','ed_admins','ed_posts','ed_albums','ed_calendar','ed_deletions','ed_audit','tg_inbox',
-          'ed_subscriptions','ed_subscription_events')
+          'ed_subscriptions','ed_subscription_events','ed_content_sources','ed_content_items',
+          'ed_folders','ed_batches','ed_batch_posts','ed_cross_routes','ed_cross_items','ed_publication_edits')
 RESERVED = {'activated','migration_done','posting_version'}
 
 

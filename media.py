@@ -125,7 +125,6 @@ def publication_parts(platform, text, media):
             raise ValueError('Смешанные способы хранения вложений не поддерживаются.')
         gallery = media['gallery']
         if platform == 'tg':
-            if any('url' in x for x in gallery):raise ValueError('Этот источник медиа подготовлен для MAX.')
             caption = text if utf16_len(text) <= 1024 else ''
             parts = [{'kind': 'gallery', 'items': gallery[i:i+10], 'caption': caption if i == 0 else ''}
                      for i in range(0, len(gallery), 10)]
@@ -164,4 +163,3 @@ def publication_parts(platform, text, media):
     else:
         raise ValueError('Неподдерживаемая площадка публикации.')
     return result
-

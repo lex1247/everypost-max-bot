@@ -1,0 +1,71 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EveryPost · Контент</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style nonce="__CSP_NONCE__">
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#17151b;color:#f5f1f7}*{box-sizing:border-box}body{margin:0}main{max-width:1120px;margin:auto;padding:24px 16px}h1{font-size:26px;margin:8px 0}h2{font-size:18px}p{line-height:1.5;color:#bdb5c6}button,select,input,textarea{font:inherit;color:inherit;background:#322c39;border:1px solid #51465b;border-radius:10px;padding:11px}button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}button.primary{background:#b92e77;border-color:#b92e77}a{color:#eea7d6}header,.toolbar,.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.toolbar{margin:20px 0}select{max-width:100%}#cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(275px,1fr));gap:16px}.card,details{border:1px solid #443b4b;background:#231e29;border-radius:16px;padding:16px}.card{min-width:0}.card iframe{width:100%;height:420px;border:0;border-radius:10px;background:#100f13}.meta{font-size:13px;color:#bdb5c6;line-height:1.7;overflow-wrap:anywhere}.title{white-space:pre-wrap;overflow-wrap:anywhere;max-height:88px;overflow:auto}.actions{margin-top:14px}.error{color:#ffb2bd;white-space:pre-wrap}#status{min-height:26px;white-space:pre-wrap}textarea{width:100%;min-height:100px;margin:12px 0}.source{border-top:1px solid #443b4b;padding:14px 0;overflow-wrap:anywhere}.source button{margin:8px 0}.pager{display:flex;gap:12px;justify-content:center;margin:24px}label{font-size:13px;display:grid;gap:6px}.card input{width:100%}summary{cursor:pointer;font-weight:650}details{margin-bottom:18px}.empty{padding:35px 12px;text-align:center;border:1px dashed #51465b;border-radius:16px}[hidden]{display:none!important}
+</style></head><body><main><header><h1>🎬 Контент</h1><select id="channel" aria-label="Канал Telegram"></select></header>
+<p>Посмотрите ролики и выберите подходящие. Они появятся в «Отложенных» вашего EveryPost после подготовки видео.</p>
+<div id="status" role="status" aria-live="polite"></div>
+<details id="sourcesPanel"><summary>Источники TikTok</summary><p>Добавьте несколько аккаунтов или ссылок на ролики — по одному на строку. Проверка доступных источников каждые 2 часа; ошибки видны ниже.</p>
+<div id="sourceControls"><button id="hairPolicy">Только причёски: выключено</button><p>Фильтр проверяет описание: макияж и посторонние темы отсеиваются. Неясные ролики скрыты в «Отсеяны по теме». Тема определяется по описанию; для поиска повторов сравниваются кадры видео.</p><textarea id="urls" aria-label="Ссылки TikTok" placeholder="@имя_автора&#10;https://www.tiktok.com/@имя/video/..."></textarea><div class="actions"><button id="add">Добавить источники</button><button id="seed">Добавить 9 примеров и их авторов</button></div></div><div id="sources"></div></details>
+<div class="toolbar"><select id="filter" aria-label="Статус кандидатов"><option value="excluded">Отсеяны по теме</option><option value="new" selected>Новые</option><option value="checking">Проверяются</option><option value="duplicates">Повторы</option><option value="selected">Готовятся</option><option value="queued">В очереди</option><option value="failed">Нужна проверка</option><option value="skipped">Пропущены</option></select><button id="refresh">Обновить</button><button id="recover">Повторить незавершённую подготовку</button><span class="meta" id="zone"></span></div>
+<div id="cards"></div><div class="pager"><button id="prev">← Назад</button><span id="page"></span><button id="next">Далее →</button></div>
+</main><script nonce="__CSP_NONCE__">
+(()=>{'use strict';const $=id=>document.getElementById(id);let page=0,busy=false,owner=false;
+const bridge=()=>window.Telegram?.WebApp;
+const hash=new URLSearchParams(location.hash.slice(1));const initData=bridge()?.initData||hash.get('tgWebAppData')||'';
+function status(text,error=false){$('status').textContent=text;$('status').className=error?'error':'';}
+async function request(action,body={}){const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),25000);try{
+const r=await fetch('/content/api/'+action,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'omit',cache:'no-store',body:JSON.stringify({initData,channelId:$('channel').value,...body}),signal:ctl.signal});
+const data=await r.json();if(!r.ok||!data.ok)throw Error(data.message||'Сервис не ответил.');return data;
+}catch(e){if(e.name==='AbortError')throw Error('Ответ задерживается. Обновите список: повторное нажатие «В очередь» не создаст дубль.');throw e;}finally{clearTimeout(timer);}}
+const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
+function button(text,action,primary=false){const b=el('button',text,primary?'primary':'');b.addEventListener('click',()=>act(action));return b;}
+async function act(fn){if(busy)return;busy=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{await fn();}catch(e){status(e.message,true);}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false);$('prev').disabled=page===0;$('next').disabled=!hasMore;}}
+let hasMore=false,hairOnly=false;
+function date(value){return value?new Date(value).toLocaleString('ru-RU'):'неизвестна';}
+async function load(){if(!$('channel').value)return;const data=await request('state',{filter:$('filter').value,page});owner=data.owner;hairOnly=data.hairOnly;$('hairPolicy').textContent='Только причёски: '+(hairOnly?'включено':'выключено');hasMore=data.hasMore;
+$('zone').textContent=data.title+' · '+data.timezone;$('sourceControls').hidden=!owner;$('recover').hidden=!owner;$('cards').replaceChildren();
+for(const item of data.items){const card=el('article',undefined,'card');const frame=document.createElement('iframe');frame.loading='lazy';frame.title='Превью ролика '+(item.author||'TikTok');frame.referrerPolicy='no-referrer';
+frame.src='https://www.tiktok.com/player/v1/'+encodeURIComponent(item.remote_id)+'?autoplay=0';frame.allow='fullscreen';card.append(frame);
+const link=el('a','Открыть оригинал · @'+(item.author||'автор неизвестен'));link.href=item.canonical_url;link.target='_blank';link.rel='noopener noreferrer';card.append(link);
+card.append(el('p',item.title,'title'));
+const m=item.metrics||{};card.append(el('div','Дата: '+date(item.published_at)+' · '+(item.duration==null?'длительность неизвестна':Math.round(item.duration)+' сек'),'meta'));
+card.append(el('div','Просмотры: '+(m.views??'—')+' · Лайки: '+(m.likes??'—')+' · Комментарии: '+(m.comments??'—')+' · Репосты: '+(m.shares??'—'),'meta'));
+if(item.metadata_status!=='verified')card.append(el('p','Стартовый пример. Данные TikTok ещё не проверены.','meta'));
+if(item.scan_error)card.append(el('p','Проверка повторов: '+item.scan_error,'error'));
+if(item.last_error)card.append(el('p',item.last_error,'error'));
+if(item.post_id){card.append(el('p','Пост #'+item.post_id+' · '+({scheduled:'в расписании',published:'опубликован',paused:'на паузе',needs_check:'нужна проверка',cancelled:'отменён'}[item.queue_status]||item.queue_status||item.state)+' · '+date(item.queue_due_at||item.due_at),'meta'));
+if(item.refresh_state)card.append(el('p',({pending:'Замена видео: в очереди',preparing:'Скачивается версия без водяного знака',complete:'Видео заменено новой загрузкой',failed:'Замена не удалась. Публикация оставлена на паузе.'}[item.refresh_state]||item.refresh_state),'meta'));
+if(item.refresh_error)card.append(el('p',item.refresh_error,'error'));
+if(['scheduled','paused'].includes(item.queue_status)&&!['pending','preparing'].includes(item.refresh_state)){
+ card.append(button('Заменить видео без водяного знака',async()=>{await request('replace',{id:item.id,revision:Number(item.queue_revision)});await load();status('Замена начата. До завершения публикация на паузе. Дата и подпись сохраняются.');}));
+ const label=el('label','Новая дата и время (ваше местное время)');const input=document.createElement('input');input.type='datetime-local';
+ const current=new Date(item.queue_due_at||item.due_at);input.value=new Date(current.getTime()-current.getTimezoneOffset()*60000).toISOString().slice(0,16);
+ label.append(input);const controls=el('div',undefined,'actions');controls.hidden=true;controls.append(label,button('Сохранить дату и время',async()=>{
+ const due=new Date(input.value);if(!input.value||!Number.isFinite(due.getTime()))throw Error('Выберите дату и время.');
+ await request('move',{id:item.id,revision:Number(item.queue_revision),dueAt:due.toISOString()});await load();status('Дата и время публикации сохранены.');},true));
+ card.append(button('Изменить дату и время',async()=>{controls.hidden=!controls.hidden;}),controls);
+ }
+ }
+else if(['selected','preparing'].includes(item.state))card.append(el('p','Подготовка видео · '+date(item.due_at),'meta'));
+else if(item.scan_state==='duplicate'){card.append(el('p','Похож на ролик #'+item.duplicate_of+'. В очередь не добавлен.','error'));card.append(button('Считать отдельным роликом',async()=>{await request('decide',{id:item.id,decision:'distinct'});await load();}));}
+else if($('filter').value==='checking'){card.append(el('p',item.scan_state==='failed'?'Проверка остановлена: требуется внимание.':'Сравниваем кадры с другими роликами. После проверки появится в «Новые».','meta'));}
+else{const label=el('label','Время публикации (ваше местное время, необязательно)');const input=document.createElement('input');input.type='datetime-local';if(item.due_at){const saved=new Date(item.due_at);input.value=new Date(saved.getTime()-saved.getTimezoneOffset()*60000).toISOString().slice(0,16);card.append(el('p','Сохранённое время: '+date(item.due_at),'meta'));}label.append(input);card.append(label,el('p','Без выбора: ближайший слот через 10 минут, далее с интервалом 90 минут. Точное время появится после выбора.','meta'));
+const actions=el('div',undefined,'actions');if($('filter').value!=='excluded')actions.append(button('В очередь',async()=>{
+if(input.value&&!Number.isFinite(new Date(input.value).getTime()))throw Error('Проверьте дату.');
+const chosen=input.value?new Date(input.value).toISOString():null;const saved=item.state==='failed'&&item.due_at&&chosen&&new Date(chosen).getTime()===Math.floor(new Date(item.due_at).getTime()/60000)*60000;const r=await request('decide',{id:item.id,decision:'queue',dueAt:saved?null:chosen});await load();status('Ролик выбран на '+date(r.item.due_at)+'. Подготовка видна во вкладке «Готовятся».');},true));
+actions.append(button(item.state==='skipped'?'Вернуть':'Пропустить',async()=>{await request('decide',{id:item.id,decision:item.state==='skipped'?'restore':'skip'});await load();status('Выбор сохранён.');}));card.append(actions);}
+$('cards').append(card);}
+if(!data.items.length)$('cards').append(el('div','Здесь пока нет роликов. Добавьте источники или выберите другой статус.','empty'));
+$('sources').replaceChildren();for(const s of data.sources){const row=el('div',undefined,'source');row.append(el('div',s.url),el('div',(s.enabled?'Включён':'На паузе')+' · Проверка: '+date(s.checked_at),'meta'));if(s.last_error)row.append(el('p',s.last_error,'error'));if(owner)row.append(button(s.enabled?'Пауза':'Включить',async()=>{await request('toggle',{id:s.id,enabled:!s.enabled});await load();}));$('sources').append(row);}
+$('prev').disabled=page===0;$('next').disabled=!hasMore;$('page').textContent='Страница '+(page+1);}
+$('hairPolicy').onclick=()=>act(async()=>{await request('hair-policy',{enabled:!hairOnly});page=0;await load();status('Фильтр темы сохранён.');});
+$('recover').onclick=()=>act(async()=>{const r=await request('recover');await load();status('Возобновлена подготовка: '+r.recovered+'. Выбранные даты сохранены.');});
+$('refresh').onclick=()=>act(async()=>{await load();status('Список обновлён.');});
+$('channel').onchange=$('filter').onchange=()=>act(async()=>{page=0;await load();status('');});
+$('prev').onclick=()=>act(async()=>{page=Math.max(0,page-1);await load();});$('next').onclick=()=>act(async()=>{page++;await load();});
+$('add').onclick=()=>act(async()=>{await request('sources',{urls:$('urls').value.split(/\n/).map(s=>s.trim()).filter(Boolean)});$('urls').value='';await load();status('Источники добавлены. Сбор начнётся автоматически.');});
+$('seed').onclick=()=>act(async()=>{await request('seed');await load();status('Добавлены 9 стартовых примеров и их авторы. Повторное добавление безопасно.');});
+async function start(){if(!initData){status('Откройте «Контент» через меню EveryPost в Telegram.',true);return;}await act(async()=>{const d=await request('channels');for(const c of d.channels){const o=el('option',c.title);o.value=c.id;$('channel').append(o);}if(!d.channels.length){status('Нет каналов с правом создания постов.',true);return;}await load();});}
+start();})();
+</script></body></html>

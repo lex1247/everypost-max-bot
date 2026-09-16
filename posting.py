@@ -182,6 +182,14 @@ class Posting:
         ''')
         self.sync_channels()
         self.subscriptions = Subscriptions(store)
+        from content_library import schema as content_schema
+        content_schema(store)
+        from multi_controls import schema as multi_schema
+        from cross_controls import schema as cross_schema
+        from publication_controls import schema as publication_schema
+        multi_schema(store)
+        cross_schema(store)
+        publication_schema(store)
 
     def sync_channels(self):
         for row in self.s.rows('SELECT id FROM destinations'):
@@ -209,6 +217,8 @@ class Posting:
         with self.s.db:
             if self.s.rows("SELECT 1 FROM sources WHERE platform='tg' AND remote=?", (remote,)):
                 raise ValueError('Этот канал уже используется как источник. Подключение создало бы цикл.')
+            if self.s.rows("SELECT 1 FROM ed_cross_routes WHERE kind IN ('public','trustat') AND peer=?",(remote,)):
+                raise ValueError('Этот канал уже используется как источник кросспостинга. Подключение создало бы цикл.')
             inserted = self.s.db.execute(
                 "INSERT INTO destinations(platform,remote,title) VALUES('tg',?,?) ON CONFLICT(platform,remote) DO NOTHING",
                 (remote, title))

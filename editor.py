@@ -11,6 +11,10 @@ from posting import (Posting, EDITABLE, packed, own_media, message_text, styled,
                      validate_style, parse_time, valid_url)
 from client_onboarding import ChannelConnection
 from subscription_controls import SubscriptionControls
+from content_library import ContentLibrary
+from multi_controls import MultiControls
+from cross_controls import CrossControls
+from publication_controls import PublicationControls
 
 LABELS = {'draft': 'Черновик', 'proposed': 'Предложено', 'held': 'Нужна проверка', 'scheduled': 'Отложен',
           'subscription_hold': 'Приостановлен: срок доступа',
@@ -24,6 +28,9 @@ QUICK_COMMANDS = (
     ('published', 'Опубликованные и автоудаление'), ('channels', 'Мои каналы'),
     ('addchannel', 'Подключить свой Telegram-канал'),
     ('subscription', 'Моя подписка и тарифы'),
+    ('content', 'TikTok: источники и подборка'),
+    ('folders', 'Папки каналов'), ('multipost', 'Пост в несколько каналов'),
+    ('reports', 'Состояние рассылок'), ('crosspost', 'Кросспостинг и правила'),
     ('cancel', 'Отменить текущий ввод'), ('help', 'Помощь и команды'))
 QUICK_DESTINATIONS = {'newpost': 'new', 'inbox': 'proposed', 'drafts': 'draft',
                       'scheduled': 'scheduled', 'published': 'sent', 'channels': 'settings'}
@@ -39,6 +46,10 @@ class Editor:
         self.p = Posting(self.s)
         self.connection = ChannelConnection(self)
         self.billing = SubscriptionControls(self)
+        self.content = ContentLibrary(self)
+        self.multi = MultiControls(self)
+        self.cross = CrossControls(self)
+        self.publications = PublicationControls(self)
 
     async def say(self, actor, text, rows=None):
         kwargs = {'chat_id': actor, 'text': text[:4000], 'link_preview_options': {'is_disabled': True}}
@@ -106,11 +117,15 @@ class Editor:
             [button('📝 Черновики', 'choose:draft'), button('🕒 Отложенные', 'choose:scheduled')],
             [button('📥 Предложки', 'choose:proposed'), button('📁 Мои каналы', 'choose:settings')],
             [button('📤 Опубликованные', 'choose:sent')],
+            [button('🎬 Контент · TikTok', 'content')],
+            [button('📁 Папки', 'multi:folders'), button('📣 Рассылка', 'multi:start')],
+            [button('🔁 Кросспостинг', 'cross:menu'), button('📋 Отчёты рассылок', 'multi:reports')],
             [button('➕ Подключить канал', 'connect'), button('💳 Подписка', 'sub:list:0')]])
 
     async def quick_command(self, actor, action):
         session = self.p.session(actor)
         if action == 'subscription': return await self.billing.listing(actor)
+        if action == 'content': return await self.content.open(actor)
         if action == 'help':
             return await self.say(actor, 'EveryPost · Быстрые команды\n\n' +
                 '\n'.join('/'+name+' — '+description for name,description in QUICK_COMMANDS) +
@@ -129,6 +144,8 @@ class Editor:
         if session and session.get('action') != 'proposal':
             return await self.say(actor, 'Сначала заверши текущий ввод или отправь /cancel. '
                 'Текущая правка не потеряна.', [[button('Отменить ввод', 'home')]])
+        if action in ('folders','multipost','reports'): return await self.multi.callback(actor,[{'multipost':'start'}.get(action,action)])
+        if action == 'crosspost': return await self.cross.menu(actor)
         if not self.available(actor):
             if action == 'menu':
                 return await self.home(actor)
@@ -205,6 +222,7 @@ class Editor:
                   [button('Автоудаление', 'delete:'+suffix),button('Предпросмотр','preview:'+suffix)]]
         elif p['state']=='sent':
             rows=[[button('⏱ Автоудаление','delete:'+suffix)]]
+            if c['platform']=='tg': rows.append([button('✏️ Изменить опубликованный текст','pubedit:'+suffix)])
         elif p['state']=='subscription_hold':
             parts=self.s.rows('SELECT status,remote FROM delivery_parts WHERE delivery=?',(p['delivery'],))
             sent=sum(part['status']=='sent' for part in parts)
@@ -265,6 +283,14 @@ class Editor:
     async def callback(self,actor,data):
         parts=data.split(':')[1:]; action=parts[0]
         if action=='home': return await self.home(actor)
+        if action=='content': return await self.content.open(actor)
+        if action=='contentadd': return await self.content.accept_link(actor,int(parts[1]),parts[2])
+        if action=='multi': return await self.multi.callback(actor,parts[1:])
+        if action=='cross': return await self.cross.callback(actor,parts[1:])
+        if action=='pubedit': return await self.publications.start(actor,int(parts[1]),int(parts[2]))
+        if action=='pubapply': return await self.publications.apply(actor,parts[1])
+        if action in ('recoverretry','recovercancel'):
+            return await self.publications.recovery(actor,int(parts[1]),int(parts[2]),'retry' if action=='recoverretry' else 'cancel')
         if action=='sub': return await self.billing.callback(actor,parts[1:])
         if action=='connect': return await self.connection.start(actor)
         if action=='choose': return await self.choose(actor,parts[1])
@@ -329,8 +355,7 @@ class Editor:
             return await self.card(actor,id)
         if action=='preview': return await self.card(actor,id,True)
         if action=='delivery':
-            if actor!=self.app.owner: return await self.say(actor,'Владелец проверит доставку и сможет её восстановить.')
-            return await self.say(actor,f"Отправка {p['delivery']}. Проверь канал перед повтором.\n/errors — сведения; /resolve {p['delivery']} sent — пост уже вышел; /resolve {p['delivery']} retry — повтор, если точно не вышел.")
+            return await self.publications.recovery(actor,id,revision)
         if action=='undelete':
             if p['state'] not in (*EDITABLE,'scheduled','sent','subscription_hold'): raise ValueError('Сейчас нельзя изменить автоудаление.')
             # In-progress removal cannot be revoked as if nothing happened.
@@ -363,6 +388,13 @@ class Editor:
 
     async def input(self,actor,message,session):
         action=session.get('action');text=message_text(message)
+        if action in ('folder_name','multi_material','multi_time'): return await self.multi.input(actor,message,session)
+        if action in ('cross_add','cross_rules','cross_edit'): return await self.cross.input(actor,message,session)
+        if action=='published_text': return await self.publications.input(actor,message,session)
+        if action=='new' and re.fullmatch(r'https://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+',text.strip()):
+            await self.content.add_sources(actor,session['destination'],[text.strip()])
+            self.p.session(actor,{})
+            return await self.content.open(actor)
         if action=='connect': return await self.connection.accept(actor,message,session)
         if action in ('new','proposal','replace'):
             media=own_media(message)
@@ -498,8 +530,10 @@ class Editor:
             self.p.session(actor,{})
             return False
         session=self.p.session(actor)
+        if not session and not forwarded and re.fullmatch(r'https://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+',text):
+            await self.content.link(actor,text);return True
         if session and (forwarded or not text.startswith('/')):
-            if message.get('media_group_id') and session.get('action') in ('new','proposal','replace'):
+            if message.get('media_group_id') and session.get('action') in ('new','proposal','replace','multi_material'):
                 self.s.run('INSERT INTO ed_albums VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING',
                     (actor,str(message['media_group_id']),message['message_id'],packed(message),packed(session),time.time()))
             else: await self.input(actor,message,session)
@@ -519,6 +553,10 @@ class Editor:
                 messages=[json.loads(r['body']) for r in rows]
                 text='\n'.join(message_text(m) for m in messages if message_text(m))
                 media={'photos':[],'unsupported':[],'gallery':[item for m in messages for item in own_media(m)['gallery']]}
+                if session['action']=='multi_material':
+                    await self.multi.material(actor,{'text':text},session,media)
+                    self.s.run('DELETE FROM ed_albums WHERE actor=? AND album=?',(actor,group['album']))
+                    continue
                 if session['action']=='replace':
                     p=await self.post_access(actor,session['post'],session['revision'])
                     if p['state'] not in EDITABLE: raise ValueError('Пост уже изменён.')

@@ -36,7 +36,7 @@ class ServerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             async with TestClient(TestServer(create_web(self.app))) as client:
                 self.assertEqual((await client.get('/health')).status,503)
                 self.app.worker_ready=True
-                self.app.runtime_heartbeats={key:time.monotonic() for key in ['publish','inbox_loop','editor']}
+                self.app.runtime_heartbeats={key:time.monotonic() for key in ['publish','inbox_loop','editor','content','crosspost']}
                 self.assertEqual((await client.get('/health')).status,200)
                 self.app.runtime_heartbeats['publish']-=1801
                 self.assertEqual((await client.get('/health')).status,503)

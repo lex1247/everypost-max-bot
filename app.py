@@ -808,6 +808,12 @@ class App:
             key = 'photo' + str(index)
             files[key] = await self.photo_file(photo)
             return 'attach://' + key
+        async def tg_item(item,index):
+            if 'tg_file_id' in item: return item['tg_file_id']
+            if item['type']=='photo': return await tg_photo(item,index)
+            key='video'+str(index)
+            files[key]=('video.mp4',await self.trustat_video_file(item),'video/mp4')
+            return 'attach://'+key
         if platform == 'tg':
             if part['kind'] == 'text':
                 return 'sendMessage', {'chat_id': target, 'text': part['text'],
@@ -820,10 +826,10 @@ class App:
                 if len(items) == 1:
                     item = items[0]
                     return ('sendVideo' if item['type'] == 'video' else 'sendPhoto'), {
-                        'chat_id': target, item['type']: item['tg_file_id'], 'caption': part['caption'],
+                        'chat_id': target, item['type']: await tg_item(item,0), 'caption': part['caption'],
                         'has_spoiler': item.get('spoiler', False), **markup}, files
                 return 'sendMediaGroup', {'chat_id': target, 'media': [
-                    {'type': item['type'], 'media': item['tg_file_id'], 'caption': part['caption'] if i == 0 else '',
+                    {'type': item['type'], 'media': await tg_item(item,i), 'caption': part['caption'] if i == 0 else '',
                      'has_spoiler': item.get('spoiler', False)} for i, item in enumerate(items)]}, files
             album = []
             for index, photo in enumerate(part['photos']):
@@ -1111,7 +1117,7 @@ async def main():
             greeting += '\n' + mode_description()
             await app.notify(greeting)
             try:
-                await supervise(app.control(), app.inbox_loop(), app.editor.loop(), app.collect(), app.rewrite_queue(), app.publish())
+                await supervise(app.control(), app.inbox_loop(), app.editor.loop(), app.editor.content.loop(), app.editor.cross.loop(), app.collect(), app.rewrite_queue(), app.publish())
             finally:
                 app.s.db.close()
     finally:
