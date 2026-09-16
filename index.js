@@ -2568,7 +2568,7 @@ function adminMenuBody(canCreate = true) {
       [button("📝 Черновики", "menu_drafts_0"), button("🕒 Отложенные", "menu_scheduled_all_0")],
       [button("📥 Предложки", "menu_inbox_0"), button("⚙️ Настройки каналов", "menu_channels_0")],
       [button("📤 Опубликованные", "publist_0")],
-      [button("📂 Мои каналы", "folders_0"),button("📣 Рассылки", "multilist_0")],
+      [button("📂 Мои каналы", "folders_0"),button("📣 Мультипостинг", "multilist_0")],
       [button("🎬 Контент", "content_open"), button("🔁 Кросспостинг", "xc_0")],
       [button("💳 Моя подписка", "sub_list_0")]
     ])
@@ -5785,7 +5785,7 @@ async function queueMultiNow(session,post,callbackId) {
     }
     await client.query('COMMIT');
   }catch(e){await client.query('ROLLBACK').catch(()=>{});throw e;}finally{client.release();}
-  if(!saved){await notify(userId,'Эта отправка уже обработана. Откройте «Рассылки».');return;}
+  if(!saved){await notify(userId,'Эта отправка уже обработана. Откройте «Мультипостинг».');return;}
   await answerCallback(callbackId,'Отправка поставлена в очередь. Результат будет отдельным для каждого канала.',true);
   await showMultiReport(post.id,userId);
 }
@@ -5805,15 +5805,15 @@ async function showMultiReport(root,userId,page=0) {
       ((r.post_error||(!r.post_id?r.last_error:null))?` — ${(r.post_error||r.last_error).slice(0,180)}`:''));
     if(r.status==='draft' && r.post_id)buttons.push([button(`✏️ ${shortTitle(r.title)}`,`dopen_${r.post_id}`)]);
   }
-  await sendToUser(userId,{text:`📣 Рассылка #${root}\n${lines.join('\n')}\n\nПосле постановки в очередь каждый канал управляется отдельно в «Отложенных» и «Опубликованных».`,
+  await sendToUser(userId,{text:`📣 Мультипост #${root}\n${lines.join('\n')}\n\nПосле постановки в очередь каждый канал управляется отдельно в «Отложенных» и «Опубликованных».`,
     attachments:keyboard([...buttons,...(page>0?[[button('◀️ Назад',`mreport_${root}_${page-1}`)]]:[]),...(rows.length>(page+1)*6?[[button('Далее ▶️',`mreport_${root}_${page+1}`)]]:[]),[button('🔄 Обновить результат',`mreport_${root}_${page}`)],[button('🕒 Отложенные','menu_scheduled_all_0')],[button('↩️ Меню','menu_main')]])});
 }
 async function listMultiReports(userId,page=0) {
   page=pageNumber(page);
   const rows=(await pool.query(`SELECT id FROM ep_posts WHERE author_user_id=$1 AND multi_expanded=TRUE ORDER BY id DESC LIMIT $2 OFFSET $3`,
     [userId,ADMIN_PAGE_SIZE+1,page*ADMIN_PAGE_SIZE])).rows;
-  await sendToUser(userId,{text:'📣 Рассылки по нескольким каналам',attachments:keyboard([
-    ...rows.slice(0,ADMIN_PAGE_SIZE).map(r=>[button(`Рассылка #${r.id}`,`mreport_${r.id}`)]),
+  await sendToUser(userId,{text:'📣 Мультипостинг · один пост в несколько каналов',attachments:keyboard([
+    ...rows.slice(0,ADMIN_PAGE_SIZE).map(r=>[button(`Мультипост #${r.id}`,`mreport_${r.id}`)]),
     ...(page>0?[[button('◀️ Назад',`multilist_${page-1}`)]]:[]),
     ...(rows.length>ADMIN_PAGE_SIZE?[[button('Далее ▶️',`multilist_${page+1}`)]]:[]),[button('↩️ Меню','menu_main')]
   ])});
