@@ -33,7 +33,7 @@ services:
     depends_on:
       db: {condition: service_healthy}
     read_only: true
-    tmpfs: [/tmp:size=64m,mode=1777]
+    tmpfs: ['/tmp:size=64m,mode=1777']
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: 512m
@@ -63,7 +63,7 @@ services:
       db: {condition: service_healthy}
     volumes: [telegram-data:/data]
     read_only: true
-    tmpfs: [/tmp:size=384m,mode=1777]
+    tmpfs: ['/tmp:size=384m,mode=1777']
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: 1536m
