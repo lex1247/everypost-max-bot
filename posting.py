@@ -149,6 +149,7 @@ def parse_time(text, zone):
 class Posting:
     def __init__(self, store):
         self.s = store
+        self.authorize_create = None
         store.db.executescript('''
         CREATE TABLE IF NOT EXISTS ed_channels(
           destination INTEGER PRIMARY KEY REFERENCES destinations(id), code TEXT UNIQUE NOT NULL,
@@ -190,6 +191,8 @@ class Posting:
         multi_schema(store)
         cross_schema(store)
         publication_schema(store)
+        from channel_controls import schema as channel_schema
+        channel_schema(store)
 
     def sync_channels(self):
         for row in self.s.rows('SELECT id FROM destinations'):
@@ -248,6 +251,8 @@ class Posting:
         return json.loads(self.s.get(key, '{}'))
 
     def new(self, destination, actor, text, media, origin='own', author=None):
+        if origin != 'proposal' and self.authorize_create:
+            self.authorize_create(actor, destination)
         channel = self.channel(destination)
         media = normal_media(media)
         if not text.strip() and not media['photos'] and not media.get('gallery'):
@@ -285,6 +290,7 @@ class Posting:
         if stamp < now+60 or stamp > now+366*86400:
             raise ValueError('Выбери время от минуты до года вперёд.')
         if mode == 'schedule':
+            self.require_creation(post, actor)
             self.subscriptions.require_publication(post['destination'], stamp)
             if post['state'] not in (*EDITABLE, 'scheduled'):
                 raise ValueError('Этот пост уже отправляется или опубликован.')
@@ -304,6 +310,7 @@ class Posting:
         return self.change(post, actor, delete_at=stamp)
 
     def enqueue(self, post, actor):
+        self.require_creation(post, actor)
         self.subscriptions.require_publication(post['destination'])
         if post['state'] not in (*EDITABLE, 'scheduled'):
             raise ValueError('Этот пост уже поставлен в очередь или опубликован.')
@@ -323,3 +330,7 @@ class Posting:
             self.s.db.execute('UPDATE ed_posts SET delivery=? WHERE id=?', (delivery.lastrowid, post['id']))
             self.audit(actor, post['destination'], 'enqueue', post['id'])
         return self.post(post['id'])
+
+    def require_creation(self, post, actor):
+        if post['origin'] != 'proposal' and self.authorize_create:
+            self.authorize_create(actor, post['destination'])

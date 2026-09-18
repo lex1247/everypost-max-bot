@@ -26,11 +26,14 @@ class PublicationControls:
               [[{'text':'Проверено: недостающих частей в канале нет — повторить','callback_data':'ed:recoverretry:'+suffix}],
                [{'text':'Завершить без повторной отправки','callback_data':'ed:recovercancel:'+suffix}]])
         await self.e.access(actor,p['destination'],publish=True)
-        if decision=='retry':self.p.subscriptions.require_publication(p['destination'])
+        if decision=='retry':
+            self.p.require_creation(p,actor)
+            self.p.subscriptions.require_publication(p['destination'])
         with self.s.db:
             row=self.s.rows('SELECT status FROM deliveries WHERE id=?',(p['delivery'],))[0]
             if row['status'] not in ('unknown','failed'):raise ValueError('Состояние уже изменилось. Обнови карточку.')
-            self.p.change(p,actor,state='queued' if decision=='retry' else 'cancelled',error='')
+            self.p.change(p,actor,state='queued' if decision=='retry' else 'cancelled',error='',
+                **({'creator':actor} if decision=='retry' else {}))
             self.s.db.execute('UPDATE deliveries SET status=?,error=?,next_try=0 WHERE id=?',
                 ('pending' if decision=='retry' else 'cancelled','' if decision=='retry' else 'Завершено пользователем без повтора',p['delivery']))
             if decision=='retry':self.s.db.execute("UPDATE delivery_parts SET status='pending' WHERE delivery=? AND status IN ('unknown','failed','pending')",(p['delivery'],))
@@ -88,8 +91,10 @@ class PublicationControls:
                 full,_=styled(f['text'],json.loads(p['style']),'https://t.me/EveryPost_bot?start=propose_'+self.p.channel(p['destination'])['code'])
                 self.s.db.execute('UPDATE posts SET original=?,rewritten=? WHERE id=(SELECT post FROM deliveries WHERE id=?)',(full,full,p['delivery']))
                 self.s.db.execute("UPDATE ed_publication_edits SET state='done' WHERE nonce=?",(nonce,))
+                self.p.audit(actor,p['destination'],'publication_edit',p['id'])
                 self.p.session(actor,{})
             return await self.e.card(actor,p['id'])
         except Exception:
             self.s.run("UPDATE ed_publication_edits SET state='unknown',error='Проверь текст в канале: ответ Telegram не подтверждён. Автоматический повтор отключён.' WHERE nonce=?",(nonce,))
+            self.p.audit(actor,p['destination'],'publication_edit_unknown',p['id'])
             raise ValueError('Изменение не подтверждено. Проверь текст в канале перед новой правкой.')

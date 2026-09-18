@@ -3,6 +3,7 @@ import json
 import secrets
 import time
 from posting import packed, own_media, message_text, EDITABLE, parse_time
+from database import columns
 
 
 def schema(s):
@@ -14,6 +15,8 @@ def schema(s):
     CREATE TABLE IF NOT EXISTS ed_batch_posts(batch INTEGER REFERENCES ed_batches(id),
       destination INTEGER REFERENCES destinations(id),post INTEGER UNIQUE REFERENCES ed_posts(id),PRIMARY KEY(batch,destination));
     ''')
+    if 'version' not in columns(s.db,'ed_folders'):
+        s.run("ALTER TABLE ed_folders ADD COLUMN version TEXT NOT NULL DEFAULT ''")
 
 
 def b(text,value): return {'text':text,'callback_data':'ed:multi:'+value}
@@ -29,9 +32,14 @@ class MultiControls:
     async def select(self,actor):
         f=self.p.session(actor)
         if f.get('action')!='multi_select': raise ValueError('Выбор устарел. Начни заново.')
-        rows=[[b(('✓ ' if c['id'] in f['ids'] else '')+c['title'][:35],f"toggle:{f['nonce']}:{c['id']}")] for c in self.e.available(actor)]
-        rows += [[b('Папки','pickfolder')],[b('Готово',f"done:{f['nonce']}")],[{'text':'Отмена','callback_data':'ed:home'}]]
-        await self.e.say(actor,'Выбери каналы (до 30). Для каждого сохранятся его подпись и кнопки.',rows)
+        available=[c for c in self.e.available(actor) if f['kind']!='multi' or self.e.can_create(actor,c['id'])]
+        rows=[[b(('✓ ' if c['id'] in f['ids'] else '')+c['title'][:35],f"toggle:{f['nonce']}:{c['id']}")] for c in available]
+        visible={c['id'] for c in available}
+        rows += [[b(f'✓ Недоступный канал #{d} · убрать',f"toggle:{f['nonce']}:{d}")] for d in f['ids'] if d not in visible]
+        if f['kind']=='multi': rows.append([b('Папки','pickfolder')])
+        rows += [[b('Сохранить папку' if f['kind']=='folder' else 'Готово',f"done:{f['nonce']}")],[{'text':'Отмена','callback_data':'ed:home'}]]
+        await self.e.say(actor,('Папка «'+f['name']+'». Отметь нужные каналы; повторное нажатие убирает канал.' if f['kind']=='folder' else
+            'Выбери каналы (до 30). Для каждого сохранятся его подпись и кнопки. Показаны каналы с разрешением на свои посты.'),rows)
 
     async def folders(self,actor,pick=False):
         rows=[[b(f['name'][:40],('usefolder:' if pick else 'folder:')+str(f['id']))] for f in self.s.rows('SELECT * FROM ed_folders WHERE actor=? ORDER BY name',(actor,))]
@@ -69,16 +77,27 @@ class MultiControls:
         if action=='report': return await self.card(actor,int(parts[1]))
         if action=='newfolder':
             self.p.session(actor,{'action':'folder_name'});return await self.e.say(actor,'Пришли название папки до 60 символов.')
-        if action in ('folder','usefolder','deletefolder'):
+        if action in ('folder','editfolder','usefolder','deletefolder'):
             rows=self.s.rows('SELECT * FROM ed_folders WHERE actor=? AND id=?',(actor,int(parts[1])))
             if not rows: raise ValueError('Папка недоступна.')
             f=dict(rows[0])
             if action=='deletefolder':
                 self.s.run('DELETE FROM ed_folders WHERE actor=? AND id=?',(actor,f['id']));return await self.folders(actor)
             if action=='folder':
-                return await self.e.say(actor,f['name'],[[b('Создать пост для папки','usefolder:'+str(f['id']))],[b('Удалить папку','deletefolder:'+str(f['id']))]])
+                ids=json.loads(f['channels']);names={c['id']:c['title'] for c in self.e.available(actor)}
+                return await self.e.say(actor,f['name']+'\nКаналов: '+str(len(ids))+'\n'+'\n'.join(names.get(d,f'Недоступный канал #{d}')[:70] for d in ids),
+                    [[b('Создать пост для папки','usefolder:'+str(f['id']))],[b('Изменить каналы','editfolder:'+str(f['id']))],
+                     [b('Удалить папку','deletefolder:'+str(f['id']))],[b('← Папки','folders')]])
+            if action=='editfolder':
+                if not f['version']:
+                    self.s.run("UPDATE ed_folders SET version=? WHERE id=? AND actor=? AND version=''",(secrets.token_hex(16),f['id'],actor))
+                    f=dict(self.s.rows('SELECT * FROM ed_folders WHERE id=? AND actor=?',(f['id'],actor))[0])
+                self.p.session(actor,{'action':'multi_select','kind':'folder','name':f['name'],'ids':json.loads(f['channels']),
+                    'folder':f['id'],'version':f['version'],'nonce':secrets.token_hex(8)})
+                return await self.select(actor)
             ids=json.loads(f['channels'])
-            for d in ids: await self.e.access(actor,d)
+            if not ids: raise ValueError('В папке нет каналов. Сначала нажми «Изменить каналы».')
+            for d in ids: await self.e.access(actor,d,create=True)
             current=self.p.session(actor)
             if current.get('action')!='multi_select': current={'action':'multi_select','kind':'multi','name':'','nonce':secrets.token_hex(8),'ids':[]}
             current['ids']=list(dict.fromkeys(current['ids']+ids))
@@ -88,15 +107,27 @@ class MultiControls:
             f=self.p.session(actor)
             if f.get('action')!='multi_select' or f.get('nonce')!=parts[1]: raise ValueError('Выбор устарел.')
             if action=='toggle':
-                d=int(parts[2]);await self.e.access(actor,d)
+                d=int(parts[2])
+                if d not in f['ids']: await self.e.access(actor,d,create=f['kind']=='multi')
+                if self.p.session(actor)!=f: raise ValueError('Выбор устарел.')
                 f['ids']=([x for x in f['ids'] if x!=d] if d in f['ids'] else f['ids']+[d])
                 if len(f['ids'])>30: raise ValueError('До 30 каналов.')
                 self.p.session(actor,f);return await self.select(actor)
-            if not f['ids']: raise ValueError('Выбери хотя бы один канал.')
-            for d in f['ids']: await self.e.access(actor,d)
+            if not f['ids'] and not f.get('folder'): raise ValueError('Выбери хотя бы один канал.')
+            for d in f['ids']: await self.e.access(actor,d,create=f['kind']=='multi')
+            if self.p.session(actor)!=f: raise ValueError('Выбор устарел.')
+            if not set(f['ids']) <= {c['id'] for c in self.e.available(actor)}: raise ValueError('Доступ к одному из каналов отозван. Обнови выбор.')
             if f['kind']=='folder':
-                self.s.run('INSERT INTO ed_folders(actor,name,channels) VALUES(?,?,?) ON CONFLICT(actor,name) DO UPDATE SET channels=excluded.channels',(actor,f['name'],packed(f['ids'])))
-                self.p.session(actor,{});return await self.folders(actor)
+                with self.s.db:
+                    if f.get('folder'):
+                        result=self.s.db.execute('UPDATE ed_folders SET channels=?,version=? WHERE id=? AND actor=? AND version=?',
+                            (packed(f['ids']),secrets.token_hex(16),f['folder'],actor,f['version']))
+                    else:
+                        result=self.s.db.execute('INSERT INTO ed_folders(actor,name,channels,version) VALUES(?,?,?,?) ON CONFLICT(actor,name) DO NOTHING',
+                            (actor,f['name'],packed(f['ids']),secrets.token_hex(16)))
+                    if not result.rowcount: raise ValueError('Папка уже изменена, удалена или такое название занято. Открой список папок заново.')
+                    self.p.session(actor,{})
+                return await self.folders(actor)
             f['action']='multi_material';self.p.session(actor,f)
             return await self.e.say(actor,'Пришли текст, фото, видео или альбом. Сначала будут созданы черновики для проверки в каждом канале.')
         if action=='schedule':
@@ -114,7 +145,7 @@ class MultiControls:
         raise ValueError('Открой раздел заново.')
 
     async def material(self,actor,message,session,media=None):
-        for d in session['ids']: await self.e.access(actor,d)
+        for d in session['ids']: await self.e.access(actor,d,create=True)
         with self.s.db:
             existing=self.s.rows('SELECT id FROM ed_batches WHERE nonce=?',(session['nonce'],))
             if existing: id=existing[0]['id']

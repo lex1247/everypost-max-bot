@@ -264,6 +264,7 @@ class CustomerFlowTests(unittest.IsolatedAsyncioTestCase):
         self.roles[-1001, 321] = {'status': 'administrator', 'can_post_messages': True}
         await self.e.callback(456, f'ed:grant:{d}')
         await self.e.handle(self.message(456, '321'))
+        await self.e.channels.callback(456,['rights',str(d),'321','1','1'])
         post = await self.draft(321, d)
         await self.e.post_access(456, post['id'])
         self.p.set_time(post, 321, 'schedule', time.time() + 3600)

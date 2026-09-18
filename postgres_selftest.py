@@ -81,6 +81,40 @@ async def recovery_check(s):
         assert app.recovery.row(id)['status'] == 'sent'
 
 
+async def owner_controls_check(s,destination):
+    from app import App
+    with patch.dict(os.environ,{'OWNER_ID':'123','TG_BOT_TOKEN':'test','FREE_TEST_MODE':'1'}):
+        app=App(s,None);app.bot_id=999;e=app.editor
+        app.tg=AsyncMock(return_value={'status':'administrator','can_post_messages':True})
+        async def tg(method,**data):
+            return {'status':'administrator','can_post_messages':True} if data.get('user_id') in (999,321) else {'status':'creator'}
+        app.tg.side_effect=tg;e.say=AsyncMock()
+        s.run('INSERT INTO ed_users(actor,name) VALUES(321,?) ON CONFLICT DO NOTHING',('Редактор проверки',))
+        await e.input(456,{'text':'321'},{'action':'grant','destination':destination})
+        assert not e.can_create(321,destination)
+        await e.channels.callback(456,['rights',str(destination),'321','1','1'])
+        p=e.p.new(destination,321,'Проверка прав',{})
+        e.p.set_time(p,321,'schedule',time.time()+600)
+        await e.channels.callback(456,['rights',str(destination),'321','0','2'])
+        assert e.p.post(p['id'])['state']=='held'
+        await e.callback(456,f'ed:revoke:{destination}:321')
+        await e.input(456,{'text':'321'},{'action':'grant','destination':destination})
+        assert e.channels.rights(destination,321)['revision']==5 and not e.can_create(321,destination)
+        await e.channels.callback(456,['notify',str(destination),'0'])
+        e.say.reset_mock();await e.channels.notify(456,destination,'Успех')
+        e.say.assert_not_awaited()
+        await e.channels.notify(456,destination,'Ошибка',critical=True);e.say.assert_awaited_once()
+        await e.channels.history(456,destination)
+        assert 'Редактор' in str(e.say.call_args) or 'редактор' in str(e.say.call_args)
+        folder=s.run('INSERT INTO ed_folders(actor,name,channels) VALUES(?,?,?)',(456,'Редактирование папки',json.dumps([destination])))
+        await e.multi.callback(456,['editfolder',str(folder.lastrowid)])
+        f=e.p.session(456)
+        await e.multi.callback(456,['toggle',f['nonce'],str(destination)])
+        await e.multi.callback(456,['done',f['nonce']])
+        assert s.rows('SELECT channels FROM ed_folders WHERE id=?',(folder.lastrowid,))[0][0]=='[]'
+        print('PostgreSQL owner controls passed: editor rights, revocation/regrant, held schedules, notifications, history, folder editing.',flush=True)
+
+
 def main():
     if os.getenv('POSTGRES_TEST_BIN'):
         binary=Path(os.environ['POSTGRES_TEST_BIN'])
@@ -159,6 +193,7 @@ def main():
                 for db in competitors: db.db.close()
             asyncio.run(parity_check(s,customer))
             asyncio.run(recovery_check(s))
+            asyncio.run(owner_controls_check(s,customer))
             # The test intentionally fails before deployment if migration or lock semantics are wrong.
             s.db.close()
             print('PostgreSQL check passed: migration, ownership, subscription receipts, concurrent claims/renewals, content review and queue idempotency, folders, batches, crossposting, source repair and bounded download retries.',flush=True)

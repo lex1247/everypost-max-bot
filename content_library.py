@@ -170,6 +170,7 @@ class ContentLibrary:
                 if post['revision']!=body.get('revision'): raise ValueError('Пост изменился. Обнови подборку.')
                 self.p.set_time(post,actor,'schedule',stamp(body.get('dueAt'))); return {}
             if action=='replace':
+                self.e.require_create(actor,destination)
                 if post['revision']!=body.get('revision') or post['state']!='scheduled': raise ValueError('Сначала обнови подборку или верни пост в расписание.')
                 with self.s.db:
                     self.p.change(post,actor,state='held',error='Готовится замена видео')
@@ -180,7 +181,7 @@ class ContentLibrary:
         if action!='decide': raise ValueError('Неизвестное действие.')
         decision=body.get('decision')
         if decision=='queue':
-            await self.e.access(actor,destination,publish=True)
+            await self.e.access(actor,destination,publish=True,create=True)
             with self.s.db:
                 self.lock(destination); row=self.item(destination,row['id'])
                 if row['state'] in ('selected','preparing','queued'): return {'item':{'due_at':iso(row['due_at'])}}
@@ -221,7 +222,7 @@ class ContentLibrary:
                 if row['state'] in ('selected','preparing','failed'): item['refresh_state']={'selected':'pending','preparing':'preparing','failed':'failed'}[row['state']]
             rows.append(item)
         sources=[{**dict(s),'enabled':bool(s['enabled']),'checked_at':iso(s['checked_at'])} for s in self.s.rows('SELECT * FROM ed_content_sources WHERE destination=? ORDER BY id',(destination,))]
-        return {'title':channel['title'],'timezone':channel['timezone'],'owner':self.e.is_owner(actor,destination),'hairOnly':self.hair_only(destination),'items':rows[page*12:page*12+12],'hasMore':len(rows)>(page+1)*12,'sources':sources}
+        return {'title':channel['title'],'timezone':channel['timezone'],'owner':self.e.is_owner(actor,destination),'canCreate':self.e.can_create(actor,destination),'hairOnly':self.hair_only(destination),'items':rows[page*12:page*12+12],'hasMore':len(rows)>(page+1)*12,'sources':sources}
 
     def inspection(self,row,data):
         if not re.fullmatch('[a-f0-9]{64}',str(data.get('content_hash',''))) or not valid_fingerprint(data.get('fingerprint')): raise ValueError('Не удалось проверить кадры.')
@@ -237,11 +238,11 @@ class ContentLibrary:
 
     async def prepare(self,row):
         actor=row['selected_by'];d=row['destination']
-        await self.e.access(actor,d,publish=True)
+        await self.e.access(actor,d,publish=True,create=True)
         if not self.relevant(row): raise ValueError('Ролик отсеян по теме канала.')
         data,result=await PROVIDERS[row['provider']].inspect(json.loads(row['metadata'])['canonical_url'])
         if self.inspection(row,result): raise ValueError('Найден повтор ролика. Проверь вкладку «Повторы».')
-        await self.e.access(actor,d,publish=True)
+        await self.e.access(actor,d,publish=True,create=True)
         if not self.relevant(self.item(d,row['id'])): raise ValueError('Ролик отсеян по теме канала.')
         file_id=row['file_id']
         if not file_id:
@@ -251,7 +252,7 @@ class ContentLibrary:
             file_id=sent.get('video',{}).get('file_id')
             if not file_id: raise ValueError('Telegram не подтвердил сохранение видео.')
             self.s.run('UPDATE ed_content_items SET file_id=? WHERE id=?',(file_id,row['id']))
-        await self.e.access(actor,d,publish=True)
+        await self.e.access(actor,d,publish=True,create=True)
         with self.s.db:
             self.lock(d);fresh=self.item(d,row['id'])
             if fresh['state']!='preparing': return

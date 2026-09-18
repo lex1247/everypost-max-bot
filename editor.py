@@ -15,6 +15,7 @@ from content_library import ContentLibrary
 from multi_controls import MultiControls
 from cross_controls import CrossControls
 from publication_controls import PublicationControls
+from channel_controls import ChannelControls
 
 LABELS = {'draft': 'Черновик', 'proposed': 'Предложено', 'held': 'Нужна проверка', 'scheduled': 'Отложен',
           'subscription_hold': 'Приостановлен: срок доступа',
@@ -50,6 +51,8 @@ class Editor:
         self.multi = MultiControls(self)
         self.cross = CrossControls(self)
         self.publications = PublicationControls(self)
+        self.channels = ChannelControls(self)
+        self.p.authorize_create = self.require_create
 
     async def say(self, actor, text, rows=None):
         kwargs = {'chat_id': actor, 'text': text[:4000], 'link_preview_options': {'is_disabled': True}}
@@ -67,11 +70,21 @@ class Editor:
     def is_owner(self, actor, destination):
         return actor == self.app.owner or actor == self.p.channel_owner(destination, self.app.owner)
 
-    async def access(self, actor, destination, *, publish=False, owner=False):
+    def can_create(self, actor, destination):
+        return self.is_owner(actor,destination) or (bool(self.s.rows(
+            'SELECT 1 FROM ed_admins WHERE destination=? AND actor=?',(destination,actor)))
+            and bool(self.channels.rights(destination,actor)['can_create']))
+
+    def require_create(self, actor, destination):
+        if not self.can_create(actor,destination):
+            raise ValueError('Свои посты в этом канале запрещены. Попроси владельца разрешить их в разделе «Редакторы». Предложки остаются доступны.')
+
+    async def access(self, actor, destination, *, publish=False, owner=False, create=False):
         if owner and not self.is_owner(actor, destination):
             raise ValueError('Эта настройка доступна владельцу канала.')
         if not self.is_owner(actor, destination) and not self.s.rows('SELECT 1 FROM ed_admins WHERE destination=? AND actor=?', (destination, actor)):
             raise ValueError('Доступ к этому каналу не выдан или отозван.')
+        if create: self.require_create(actor,destination)
         channel = self.p.channel(destination)
         if channel['platform'] == 'tg':
             member = await self.app.tg('getChatMember', chat_id=int(channel['remote']), user_id=actor)
@@ -89,8 +102,11 @@ class Editor:
                 if not member.get('is_admin') or not {'write', 'post_edit_delete_message'}.intersection(member.get('permissions') or []):
                     raise ValueError('У бота нет права публиковать в этом канале MAX.')
         # Telegram checks await the network; a local role may be revoked meanwhile.
+        if owner and not self.is_owner(actor,destination):
+            raise ValueError('Эта настройка доступна владельцу канала.')
         if not self.is_owner(actor, destination) and not self.s.rows('SELECT 1 FROM ed_admins WHERE destination=? AND actor=?', (destination, actor)):
             raise ValueError('Доступ к этому каналу не выдан или отозван.')
+        if create: self.require_create(actor,destination)
         return channel
 
     async def post_access(self, actor, id, revision=None):
@@ -113,7 +129,7 @@ class Editor:
                 'Для работы редактором попроси владельца выдать доступ. Для предложки открой ссылку из канала.',
                 [[button('➕ Подключить канал', 'connect')]])
         return await self.say(actor, 'Постинг\nВыбери действие.', [
-            [button('➕ Создать пост', 'choose:new')],
+            *([[button('➕ Создать пост', 'choose:new')]] if any(self.can_create(actor,c['id']) for c in self.available(actor)) else []),
             [button('📝 Черновики', 'choose:draft'), button('🕒 Отложенные', 'choose:scheduled')],
             [button('📥 Предложки', 'choose:proposed'), button('📁 Мои каналы', 'choose:settings')],
             [button('📤 Опубликованные', 'choose:sent')],
@@ -162,8 +178,10 @@ class Editor:
         return await self.choose(actor, QUICK_DESTINATIONS[action])
 
     async def choose(self, actor, action):
-        rows = [[button(f"{c['title'][:40]} · {c['platform'].upper()}", f"channel:{action}:{c['id']}")] for c in self.available(actor)]
+        rows = [[button(f"{c['title'][:40]} · {c['platform'].upper()}", f"channel:{action}:{c['id']}")] for c in self.available(actor)
+                if action != 'new' or self.can_create(actor,c['id'])]
         if not rows:
+            if action == 'new': return await self.say(actor,'Нет каналов с разрешением на свои посты. Попроси владельца выдать его в разделе «Редакторы».',[[button('← Меню','home')]])
             return await self.home(actor)
         if action == 'settings': rows.append([button('➕ Подключить канал', 'connect')])
         rows.append([button('← Меню', 'home')])
@@ -254,7 +272,8 @@ class Editor:
         if self.is_owner(actor, destination):
             discussion=json.loads(c['discussion'])
             rows += [[button('Копия в группу '+('✓' if discussion.get('enabled') else '—'),f'config:discussion:{destination}')],
-                     [button('Администраторы',f'admins:{destination}')]]
+                     [button('Редакторы',f'admins:{destination}')],
+                     [button('История действий',f'channelctl:history:{destination}:0'),button('Уведомления',f'channelctl:notifications:{destination}')]]
         rows.extend([[button('➕ Создать пост', f'channel:new:{destination}')], [button('← Меню','home')]])
         await self.say(actor,info,rows)
 
@@ -267,6 +286,7 @@ class Editor:
              [button('Обсуждение','pstyle:discussion_url:'+suffix)], [button('← К посту','open:'+str(p['id']))]])
 
     async def calendar(self,actor,p,mode):
+        if mode=='schedule': self.p.require_creation(p,actor)
         if p['state'] not in (*EDITABLE,'scheduled','sent','subscription_hold') or (mode=='schedule' and p['state'] in ('sent','subscription_hold')):
             raise ValueError('Этот пост уже отправляется. Дождись результата.')
         nonce=secrets.token_urlsafe(24)
@@ -283,6 +303,7 @@ class Editor:
 
     async def callback(self,actor,data):
         parts=data.split(':')[1:]; action=parts[0]
+        if action=='channelctl': return await self.channels.callback(actor,parts[1:])
         if action=='home': return await self.home(actor)
         if action=='source_errors':
             if actor != self.app.owner: raise ValueError('Недоступно.')
@@ -300,7 +321,7 @@ class Editor:
         if action=='choose': return await self.choose(actor,parts[1])
         if action=='list': return await self.listing(actor,int(parts[1]),parts[2],int(parts[3]))
         if action=='channel':
-            what,destination=parts[1],int(parts[2]); await self.access(actor,destination)
+            what,destination=parts[1],int(parts[2]); await self.access(actor,destination,create=what=='new')
             if what=='new':
                 self.p.session(actor,{'action':'new','destination':destination})
                 return await self.say(actor,'Пришли текст, фото, видео или один альбом. Пост сначала появится в черновиках.',[[button('Отмена','home')]])
@@ -311,6 +332,7 @@ class Editor:
             if field=='proposal':
                 style=validate_style(json.loads(c['style']));style['proposal']=not style['proposal']
                 self.s.run('UPDATE ed_channels SET style=? WHERE destination=?',(packed(style),destination))
+                self.p.audit(actor,destination,'setting:proposal')
                 return await self.settings(actor,destination)
             self.p.session(actor,{'action':'config','field':field,'destination':destination})
             prompts={'signature':'Пришли подпись (до 700 символов) или - для отключения.',
@@ -320,11 +342,7 @@ class Editor:
                      'discussion':'Пришли числовой ID группы для копий новых постов этого канала. Бот должен состоять в ней. Для отключения пришли -. Копия в группе останется при автоудалении поста из канала.'}
             return await self.say(actor,prompts[field],[[button('Отмена','home')]])
         if action=='admins':
-            destination=int(parts[1]);await self.access(actor,destination,owner=True)
-            admins=self.s.rows('SELECT a.actor,u.name FROM ed_admins a LEFT JOIN ed_users u ON u.actor=a.actor WHERE destination=?',(destination,))
-            rows=[[button('Убрать '+(a['name'] or str(a['actor']))[:30],f"revoke:{destination}:{a['actor']}")] for a in admins if not self.is_owner(a['actor'], destination)]
-            rows.extend([[button('Добавить',f'grant:{destination}')],[button('← Настройки',f'channel:settings:{destination}')]])
-            return await self.say(actor,'Администраторы бота для этого канала. В Telegram также нужны права на публикацию в самом канале.',rows)
+            return await self.channels.editors(actor,int(parts[1]))
         if action in ('grant','revoke'):
             destination=int(parts[1]); await self.access(actor,destination,owner=True)
             if action=='grant':
@@ -334,6 +352,8 @@ class Editor:
             if self.is_owner(target, destination): raise ValueError('Нельзя отозвать доступ владельца канала этой кнопкой.')
             with self.s.db:
                 self.s.db.execute('DELETE FROM ed_admins WHERE destination=? AND actor=?',(destination,target))
+                # Keep and advance the revision so old permission buttons cannot affect a later grant.
+                self.s.db.execute('INSERT INTO ed_editor_rights(destination,actor,can_create) VALUES(?,?,0) ON CONFLICT(destination,actor) DO UPDATE SET can_create=0,revision=ed_editor_rights.revision+1',(destination,target))
                 self.s.db.execute("UPDATE ed_posts SET state='held',error='Доступ редактора отозван',revision=revision+1 WHERE destination=? AND creator=? AND state='scheduled'",(destination,target))
             self.p.audit(actor,destination,'revoke:'+str(target))
             return await self.callback(actor,f'ed:admins:{destination}')
@@ -353,7 +373,9 @@ class Editor:
                 'discussion_url':'Пришли ссылку обсуждения или - для отключения.'}[field])
         id,revision=int(parts[1]),int(parts[2]);p=await self.post_access(actor,id,revision)
         if action in ('subscription_resume','subscription_draft'):
-            if action=='subscription_resume': await self.access(actor,p['destination'],publish=True)
+            if action=='subscription_resume':
+                await self.access(actor,p['destination'],publish=True)
+                self.p.require_creation(p,actor)
             self.p.subscriptions.resume(p,actor,draft=action=='subscription_draft')
             self.p.audit(actor,p['destination'],action,id)
             return await self.card(actor,id)
@@ -409,12 +431,12 @@ class Editor:
                 p=self.p.change(p,actor,text=text,media=packed(normalized(media)))
             else:
                 destination=session['destination']
-                if action=='new': await self.access(actor,destination)
+                if action=='new': await self.access(actor,destination,create=True)
                 p=self.p.new(destination,actor,text,media,origin='proposal' if action=='proposal' else 'own')
             if action=='proposal':
                 # Keep proposal mode for the next item, but do not disclose the author's identity in the channel.
                 await self.say(actor,'Предложение отправлено на рассмотрение. Спасибо!')
-                await self.say(self.p.channel_owner(p['destination'],self.app.owner),f"Новая предложка #{p['id']} в «{self.p.channel(p['destination'])['title']}».",[[button('Открыть',f"open:{p['id']}")]])
+                await self.channels.notify(self.p.channel_owner(p['destination'],self.app.owner),p['destination'],f"Новая предложка #{p['id']} в «{self.p.channel(p['destination'])['title']}».",[[button('Открыть',f"open:{p['id']}")]])
             else:
                 self.p.session(actor,{})
                 await self.card(actor,p['id'],True)
@@ -482,8 +504,13 @@ class Editor:
                 member=await self.app.tg('getChatMember',chat_id=int(c['remote']),user_id=target)
                 if member.get('status')!='creator' and not (member.get('status')=='administrator' and member.get('can_post_messages')):
                     raise ValueError('Сначала дай этому пользователю право публикации в самом Telegram-канале.')
-            self.s.run('INSERT INTO ed_admins VALUES(?,?) ON CONFLICT DO NOTHING',(destination,target));self.p.session(actor,{})
-            self.p.audit(actor,destination,'grant:'+str(target))
+            await self.access(actor,destination,owner=True)
+            with self.s.db:
+                inserted=self.s.db.execute('INSERT INTO ed_admins VALUES(?,?) ON CONFLICT DO NOTHING',(destination,target))
+                if inserted.rowcount:
+                    self.s.db.execute('INSERT INTO ed_editor_rights(destination,actor,can_create) VALUES(?,?,0) ON CONFLICT(destination,actor) DO UPDATE SET can_create=0,revision=ed_editor_rights.revision+1',(destination,target))
+                    self.p.audit(actor,destination,'grant:'+str(target))
+                self.p.session(actor,{})
             return await self.callback(actor,f'ed:admins:{destination}')
 
     async def handle(self,update):
@@ -568,13 +595,13 @@ class Editor:
                         p=self.p.change(p,actor,text=text,media=packed(normalized(media)))
                         self.s.db.execute('DELETE FROM ed_albums WHERE actor=? AND album=?',(actor,group['album']))
                 else:
-                    if session['action']=='new': await self.access(actor,session['destination'])
+                    if session['action']=='new': await self.access(actor,session['destination'],create=True)
                     with self.s.db:
                         p=self.p.new(session['destination'],actor,text,media,origin='proposal' if session['action']=='proposal' else 'own')
                         self.s.db.execute('DELETE FROM ed_albums WHERE actor=? AND album=?',(actor,group['album']))
                 if session['action']=='proposal':
                     await self.say(actor,'Альбом отправлен на рассмотрение.')
-                    await self.say(self.p.channel_owner(p['destination'],self.app.owner),f"Новая предложка #{p['id']} — альбом.",[[button('Открыть',f"open:{p['id']}")]])
+                    await self.channels.notify(self.p.channel_owner(p['destination'],self.app.owner),p['destination'],f"Новая предложка #{p['id']} — альбом.",[[button('Открыть',f"open:{p['id']}")]])
                 else:
                     self.p.session(actor,{})
                     await self.card(actor,p['id'],True)
@@ -587,6 +614,7 @@ class Editor:
         rows=self.s.rows('SELECT * FROM ed_posts WHERE delivery=? OR discussion_delivery=?',(delivery['id'],delivery['id']))
         if not rows: raise ValueError('У ручной отправки отсутствует подтверждённый пост.')
         p=dict(rows[0]);await self.access(p['creator'],p['destination'],publish=True)
+        if p['delivery']==delivery['id']: self.p.require_creation(p,p['creator'])
         if p['delivery']==delivery['id'] and p['state'] in ('failed','unknown') and delivery['status']=='pending':
             self.s.run("UPDATE ed_posts SET state='queued',error='' WHERE id=?",(p['id'],))
             p['state']='queued'
@@ -615,7 +643,8 @@ class Editor:
                 self.s.run('UPDATE ed_posts SET state=?,sent_at=?,error=? WHERE id=?',(state,stamp,p['delivery_error'],p['id']))
                 if p['notified']!=state:
                     self.s.run('UPDATE ed_posts SET notified=? WHERE id=?',(state,p['id']))
-                    await self.say(p['creator'],f"Пост #{p['id']}: {LABELS.get(state,state)}.",[[button('Открыть',f"open:{p['id']}")]])
+                    self.p.audit(p['creator'],p['destination'],state,p['id'])
+                    await self.channels.notify(p['creator'],p['destination'],f"Пост #{p['id']}: {LABELS.get(state,state)}.",[[button('Открыть',f"open:{p['id']}")]],critical=state!='sent')
             elif state=='pending' and p['state'] in ('unknown','failed'):
                 self.s.run("UPDATE ed_posts SET state='queued',error='' WHERE id=?",(p['id'],))
         for row in self.s.rows("SELECT * FROM ed_posts WHERE state='subscription_hold' AND notified!='subscription_hold'"):
@@ -680,7 +709,8 @@ class Editor:
                 pending=self.s.rows("SELECT state FROM ed_deletions WHERE post=? AND state!='done'",(p['id'],))
                 if jobs and not pending:
                     self.s.run("UPDATE ed_posts SET state='deleted',error='',revision=revision+1 WHERE id=?",(p['id'],))
-                    await self.say(p['creator'],f"Пост #{p['id']} удалён из канала «{c['title']}».")
+                    self.p.audit(p['creator'],p['destination'],'deleted',p['id'])
+                    await self.channels.notify(p['creator'],p['destination'],f"Пост #{p['id']} удалён из канала «{c['title']}».")
                 elif any(j['state'] in ('unknown','sending') for j in pending) and p['notified']!='delete_unknown':
                     self.s.run("UPDATE ed_posts SET error='Не удалось подтвердить удаление. Проверь канал.',notified='delete_unknown' WHERE id=?",(p['id'],))
                     await self.say(p['creator'],f"Проверь удаление поста #{p['id']}: ответ площадки не подтверждён.")
