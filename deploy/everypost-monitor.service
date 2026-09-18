@@ -1,0 +1,9 @@
+[Unit]
+Description=EveryPost health and recovery
+After=docker.service
+Requires=docker.service
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/everypost/deploy
+ExecStart=/usr/bin/python3 /opt/everypost/deploy/monitor.py
+TimeoutStartSec=240
