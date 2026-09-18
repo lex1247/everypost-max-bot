@@ -9,6 +9,16 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
+QUEUE_SQL = """
+SELECT count(*) FROM public.ep_schedules
+ WHERE status='scheduled' AND due_at < NOW()-INTERVAL '5 minutes' AND next_at<=NOW();
+SELECT count(*) FROM public.ep_schedules WHERE status='needs_check';
+SELECT count(*) FROM repost_bot.ed_posts
+ WHERE state='scheduled' AND publish_at < EXTRACT(EPOCH FROM NOW())-300;
+SELECT count(*) FROM repost_bot.deliveries WHERE status IN ('unknown','failed','review','unavailable');
+"""
+QUEUE_LABELS = ('MAX: overdue posts', 'MAX: delivery needs review',
+                'Telegram: overdue posts', 'Telegram: delivery needs review')
 
 
 def env_file(path):
@@ -78,16 +88,10 @@ def check(state, now):
     try:
         # Read-only, does not retry publication of any ambiguous sends.
         counts = command(['docker','compose','exec','-T','db','sh','-c',
-            'exec psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'],input="""
-SELECT count(*) FROM public.ep_schedules
- WHERE status='scheduled' AND due_at < NOW()-INTERVAL '5 minutes' AND next_at<=NOW();
-SELECT count(*) FROM public.ep_schedules WHERE status='needs_check';
-SELECT count(*) FROM repost_bot.deliveries WHERE status IN ('unknown','failed');
-""").splitlines()
-        if len(counts)!=3 or any(not c.isdigit() for c in counts):
+            'exec psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'],input=QUEUE_SQL).splitlines()
+        if len(counts)!=len(QUEUE_LABELS) or any(not c.isdigit() for c in counts):
             raise ValueError('Unexpected probe result')
-        labels = ['MAX: overdue posts','MAX: delivery needs review','Telegram: delivery needs review']
-        problems += [labels[i] for i,c in enumerate(counts) if int(c)>0]
+        problems += [QUEUE_LABELS[i] for i,c in enumerate(counts) if int(c)>0]
     except Exception:
         problems.append('Queue status unavailable')
     backup = ROOT/'state/backup-success'
